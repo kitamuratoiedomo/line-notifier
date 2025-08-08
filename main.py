@@ -1,12 +1,16 @@
+import os, requests, datetime as dt
 
-from rakuten_fetcher import get_today_races
-from strategy_checker import match_strategies
-from notify_line import notify_if_match
+ACCESS_TOKEN = os.getenv("LINE_ACCESS_TOKEN")
+USER_ID = os.getenv("LINE_USER_ID")
 
-races = get_today_races()
+def line(message: str):
+    url = "https://api.line.me/v2/bot/message/push"
+    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
+    payload = {"to": USER_ID, "messages": [{"type": "text", "text": message}]}
+    r = requests.post(url, headers=headers, json=payload, timeout=10)
+    print("LINE status:", r.status_code, r.text)
 
-for race in races:
-    if race['is_6min_before_deadline']:
-        matched = match_strategies(race)
-        if matched:
-            notify_if_match(race, matched)
+if __name__ == "__main__":
+    now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{now}] heartbeat")
+    line(f"heartbeat at {now}")
