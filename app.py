@@ -1,76 +1,110 @@
-# app.py －－－ 診断②：リンク抽出（個別レース/オッズのパターンを掴む）
-import os, sys, re, datetime as dt
+import os
+import json
+import time
+import logging
+from pathlib import Path
+from typing import List, Dict, Any
+
 import requests
-from bs4 import BeautifulSoup
 
-TARGET = "https://keiba.rakuten.co.jp/race_card/list/RACEID/202508070000000000?bmode=1"
+# ====== 設定 ======
+LINE_ACCESS_TOKEN = os.getenv("LINE_ACCESS_TOKEN", "").strip()
+LINE_USER_ID      = os.getenv("LINE_USER_ID", "").strip()
 
-def log(s): 
-    print(f"[{dt.datetime.now():%Y-%m-%d %H:%M:%S}] {s}", flush=True)
+# 通知済みレースの記録（重複通知防止）
+NOTIFIED_PATH = Path("/tmp/notified_races.json")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+
+def send_line_message(text: str) -> None:
+    """LINE Push API にメッセージ送信"""
+    if not LINE_ACCESS_TOKEN or not LINE_USER_ID:
+        logging.warning("LINE 環境変数が未設定のため送信しません。")
+        return
+    url = "https://api.line.me/v2/bot/message/push"
+    headers = {
+        "Authorization": f"Bearer {LINE_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "to": LINE_USER_ID,
+        "messages": [{"type": "text", "text": text}],
+    }
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=10)
+        if r.status_code != 200:
+            logging.warning("LINE送信失敗 status=%s body=%s", r.status_code, r.text)
+        else:
+            logging.info("LINE送信OK")
+    except Exception as e:
+        logging.exception("LINE送信で例外: %s", e)
+
+def _load_notified() -> Dict[str, Any]:
+    if NOTIFIED_PATH.exists():
+        try:
+            return json.loads(NOTIFIED_PATH.read_text())
+        except Exception:
+            return {}
+    return {}
+
+def _save_notified(obj: Dict[str, Any]) -> None:
+    try:
+        NOTIFIED_PATH.write_text(json.dumps(obj, ensure_ascii=False))
+    except Exception as e:
+        logging.warning("通知済み保存に失敗: %s", e)
+
+# ============= ここから本番ロジックの土台 =============
+# - 「戦略に合致したレースを見つけたら」だけ通知する
+# - まだ楽天オッズのスクレイピング実装は入れていません（このあと実装）
+# - まずは heartbeat を完全に止め、無駄な通知を出さない状態へ
+
+def find_strategy_matches() -> List[Dict[str, Any]]:
+    """
+    ここで『対象レース抽出＋人気/オッズ解析→戦略判定』を行い、
+    ヒットしたレースを返す。今はダミーで空配列を返す。
+    次のステップで楽天オッズのパーサを実装していきます。
+    返却フォーマット例:
+      {
+        "race_id": "202508072726110300-10R",
+        "venue": "園田",
+        "race_no": "10R",
+        "start_at": "15:10",
+        "strategy": "②",
+        "message": "（LINEに投げる本文）"
+      }
+    """
+    # TODO: 楽天『単・複オッズ』ページから人気/オッズを取得し戦略①〜④を判定
+    return []
 
 def main():
-    log("=== リンク抽出テスト開始 ===")
-    log(f"TARGET: {TARGET}")
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/125.0.0.0 Safari/537.36"
-        )
-    }
-    r = requests.get(TARGET, headers=headers, timeout=25)
-    log(f"HTTP status: {r.status_code}")
-    ctype = r.headers.get("Content-Type", "")
-    log(f"Content-Type: {ctype}")
-    html = r.text
-    log(f"取得サイズ: {len(html)} bytes")
+    logging.info("ジョブ開始（本番モード）")
 
-    soup = BeautifulSoup(html, "html.parser")
+    notified = _load_notified()
 
-    # 1) ページタイトル
-    title = (soup.title.string.strip() if soup.title and soup.title.string else "")
-    log(f"page <title>: {title}")
+    hits = find_strategy_matches()
+    if not hits:
+        logging.info("戦略一致なし（通知なし）")
+        return
 
-    # 2) すべてのリンクを抽出
-    links = []
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        text = a.get_text(strip=True)
-        links.append((href, text))
+    for h in hits:
+        key = f"{h.get('race_id','')}_{h.get('strategy','')}"
+        if notified.get(key):
+            logging.info("重複通知を回避: %s", key)
+            continue
 
-    log(f"aタグ総数: {len(links)}")
+        msg = h.get("message", "").strip()
+        if not msg:
+            logging.info("message空のためスキップ: %s", key)
+            continue
 
-    # 3) race_card / odds を含むリンクを分類表示
-    def pick(pattern, name, limit=40):
-        found = [(h, t) for h, t in links if pattern in h]
-        log(f"--- {name} ({len(found)}件) ---")
-        for h, t in found[:limit]:
-            log(f"{name}: href={h} | text='{t}'")
-        return found
+        send_line_message(msg)
+        notified[key] = int(time.time())
 
-    race_card_links = pick("/race_card/", "race_card_link")
-    odds_links      = pick("/odds",       "odds_link")
-
-    # 4) 絶対URLに補正（相対パスなら）
-    def abs_url(href):
-        if href.startswith("http"):
-            return href
-        if href.startswith("/"):
-            return "https://keiba.rakuten.co.jp" + href
-        # 相対→一旦基底からの単純連結（必要に応じて厳密化）
-        return "https://keiba.rakuten.co.jp/" + href
-
-    # サンプルとして race_card/odds の先頭数件を絶対URLで出す
-    log("--- 代表URL（上位5件） ---")
-    for kind, arr in [("race_card", race_card_links), ("odds", odds_links)]:
-        for i, (h, t) in enumerate(arr[:5], 1):
-            log(f"{kind}[{i}]: {abs_url(h)} | text='{t}'")
-
-    log("✅ 診断②完了：href パターンが見えたら、次は個別ページの中身を解析して『人気・オッズ・締切』を取りに行きます。")
+    _save_notified(notified)
+    logging.info("ジョブ終了")
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        log(f"例外: {e}")
-        sys.exit(1)
+    main()
