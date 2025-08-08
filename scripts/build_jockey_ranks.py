@@ -1,157 +1,186 @@
-# scripts/build_jockey_ranks.py
-# --- 概要 -----------------------------------------------------------
-# netkeiba 地方（NAR）リーディングの複勝率から
-# 騎手ランク CSV を生成します。
-# A: 複勝率 30%以上 / B: 20%以上30%未満 / C: 20%未満
-# 出力: data/jockey_ranks.csv
-# ------------------------------------------------------------------
+# -*- coding: utf-8 -*-
+"""
+scripts/build_jockey_ranks.py
+netkeiba 地方(NAR)ジョッキー リーディングから複勝率を取得して
+data/jockey_ranks.csv を生成します。
+
+ランク:
+  A: 複勝率 >= 30
+  B: 20 <= 複勝率 < 30
+  C: 10 <= 複勝率 < 20
+  D: 複勝率 < 10
+"""
 
 import os
-
-OUT = "data/jockey_ranks.csv"
-os.makedirs(os.path.dirname(OUT), exist_ok=True)
-with open(OUT, "w", encoding="utf-8", newline="") as f:
-    ...
+import re
 import sys
 import time
-import re
+import csv
 import requests
-import pandas as pd
 from bs4 import BeautifulSoup
 
 URL = "https://db.netkeiba.com/jockey/jockey_leading_nar.html"
-UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
 
 OUT_DIR = "data"
 OUT_PATH = os.path.join(OUT_DIR, "jockey_ranks.csv")
 
-def fetch_html(url: str, retry: int = 3, sleep_sec: float = 1.5) -> str:
-    """HTML を取得（軽いリトライ付き）"""
-    last_err = None
-    for i in range(retry):
+
+def fetch_html(url: str, retry: int = 3, sleep_sec: float = 1.2) -> str:
+    last = None
+    for _ in range(retry):
         try:
-            r = requests.get(url, headers={"User-Agent": UA}, timeout=20)
+            r = requests.get(url, headers={"User-Agent": UA}, timeout=15)
             r.raise_for_status()
-            # 一部ページは charset 指定が曖昧なので、requests の推定に任せる
-            r.encoding = r.apparent_encoding
+            # netkeibaはUTF-8
+            r.encoding = "utf-8"
             return r.text
         except Exception as e:
-            last_err = e
+            last = e
             time.sleep(sleep_sec)
-    raise RuntimeError(f"fetch_html failed: {last_err}")
+    raise RuntimeError(f"failed to GET {url}: {last}")
 
-def parse_table(html: str) -> pd.DataFrame:
-    """
-    netkeiba の表をパースして DataFrame にする。
-    カラムは状況により増減することがあるため、名前解決を柔軟に行う。
-    """
-    soup = BeautifulSoup(html, "lxml")  # lxml が無ければ bs4 の html.parser でも動きます
-    table = soup.select_one("table.db_main_s")
-    if table is None:
-        raise RuntimeError("table not found (selector: table.db_main_s)")
 
-    # ヘッダー
-    headers = [th.get_text(strip=True) for th in table.select("thead tr th")]
-    # tbody行
-    rows = []
-    for tr in table.select("tbody tr"):
-        tds = [td.get_text(strip=True) for td in tr.select("td")]
-        if tds:
-            rows.append(tds)
-
-    if not headers and rows:
-        # ヘッダが取れないケースは列数から推測（フォールバック）
-        # 代表的な並びに合わせる
-        # 例: 順位, 騎手名, 所属, 騎乗数, 勝数, 連対数, 3着内数, 勝率, 連対率, 複勝率, 獲得賞金
-        n = max(len(r) for r in rows)
-        guessed = [
-            "順位","騎手名","所属","騎乗数","勝数","連対数","3着内数",
-            "勝率","連対率","複勝率","獲得賞金"
-        ]
-        headers = guessed[:n]
-
-    df = pd.DataFrame(rows, columns=headers[:len(rows[0])])
-
-    # 重要列の正規化（列名が微妙に変わっても拾えるようにする）
-    def find_col(patterns):
-        for p in patterns:
-            for c in df.columns:
-                if re.search(p, c):
-                    return c
+def normalize_percent(txt: str) -> float | None:
+    if not txt:
+        return None
+    # 半角全角の%と空白を除去
+    s = re.sub(r"[％%]", "", txt)
+    s = re.sub(r"\s", "", s)
+    # 例: '31.4' / '31' / '-' を想定
+    try:
+        return float(s)
+    except Exception:
         return None
 
-    col_name = find_col(["騎手名"])
-    col_place = find_col(["所属"])
-    col_fukusho = find_col(["複勝率"])
-    col_n_rides = find_col(["騎乗数"])
 
-    keep_cols = []
-    if col_name: keep_cols.append(col_name)
-    if col_place: keep_cols.append(col_place)
-    if col_n_rides: keep_cols.append(col_n_rides)
-    if col_fukusho: keep_cols.append(col_fukusho)
+def detect_table(soup: BeautifulSoup):
+    """
+    1) <table>を総当たり
+    2) thead / tr のヘッダ文字列を拾う
+    3) '騎手' か '騎手名' を含み、かつ '複勝率' を含むテーブルを採用
+    """
+    candidates = []
+    for tbl in soup.find_all("table"):
+        # 全ヘッダ文字列
+        headers = []
+        thead = tbl.find("thead")
+        if thead:
+            for th in thead.find_all("th"):
+                headers.append(th.get_text(strip=True))
+        if not headers:
+            # theadがない場合もあるので最初の行を見出し扱い
+            first_tr = tbl.find("tr")
+            if first_tr:
+                for th in first_tr.find_all(["th", "td"]):
+                    headers.append(th.get_text(strip=True))
 
-    if not col_name or not col_fukusho:
-        raise RuntimeError(f"必要列が見つかりません（騎手名 or 複勝率）。columns={list(df.columns)}")
+        joined = " ".join(headers)
+        if re.search(r"騎手|騎手名", joined) and ("複勝率" in joined):
+            candidates.append((tbl, headers))
 
-    df = df[keep_cols].copy()
-    df.rename(columns={
-        col_name: "騎手名",
-        col_place: "所属" if col_place else "所属",
-        col_n_rides: "騎乗数" if col_n_rides else "騎乗数",
-        col_fukusho: "複勝率"
-    }, inplace=True)
+    if not candidates:
+        return None, None
+    # 一番列数が多いものを優先
+    candidates.sort(key=lambda x: len(x[1]), reverse=True)
+    return candidates[0]
 
-    # 複勝率 → float（%を削除）
-    df["複勝率"] = (
-        df["複勝率"]
-        .astype(str)
-        .str.replace("%", "", regex=False)
-        .str.replace(",", "", regex=False)
-        .astype(float)
-    )
 
-    # 騎乗数がある場合は数値化
-    if "騎乗数" in df.columns:
-        df["騎乗数"] = (
-            df["騎乗数"]
-            .astype(str)
-            .str.replace(",", "", regex=False)
-            .replace("", 0)
-        )
-        # 数値化に失敗した行は 0 に
-        df["騎乗数"] = pd.to_numeric(df["騎乗数"], errors="coerce").fillna(0).astype(int)
-
-    # ランク付け
-    def to_rank(x: float) -> str:
-        if x >= 30.0:
-            return "A"
-        if x >= 20.0:
-            return "B"
+def rank_by_place(place_pct: float | None) -> str:
+    if place_pct is None:
+        return ""
+    if place_pct >= 30.0:
+        return "A"
+    if place_pct >= 20.0:
+        return "B"
+    if place_pct >= 10.0:
         return "C"
+    return "D"
 
-    df["ランク"] = df["複勝率"].apply(to_rank)
 
-    # 出力に使う順序
-    out_cols = ["騎手名", "所属", "騎乗数", "複勝率", "ランク"]
-    # 無い列は除外して出力
-    out_cols = [c for c in out_cols if c in df.columns]
-    df = df[out_cols].copy()
+def parse_rows(tbl, headers):
+    # 欄名インデックス
+    def idx(keyword, alt=None):
+        for i, h in enumerate(headers):
+            if keyword in h:
+                return i
+        if alt:
+            for i, h in enumerate(headers):
+                if alt in h:
+                    return i
+        return -1
 
-    # 騎手名重複をまとめたいならここで groupby 等しても可
-    return df
+    jname_i = idx("騎手", "騎手名")
+    place_i = idx("複勝率")
+
+    # 予備: あると便利な列（なくてもOK）
+    starts_i = idx("騎乗", "出走")
+    win_i = idx("勝率")
+
+    if jname_i < 0 or place_i < 0:
+        raise RuntimeError("table headers not recognized: " + " / ".join(headers))
+
+    data = []
+    # tbody のみ対象（なければ全 tr）
+    body = tbl.find("tbody") or tbl
+    for tr in body.find_all("tr"):
+        tds = tr.find_all("td")
+        if not tds:
+            continue
+        # 列数が足りない行はスキップ
+        if max(jname_i, place_i, starts_i, win_i) >= len(tds):
+            # 最低限必要な2列があるかだけ確認
+            if max(jname_i, place_i) >= len(tds):
+                continue
+
+        jname = tds[jname_i].get_text(strip=True)
+        place_txt = tds[place_i].get_text(strip=True)
+        starts_txt = tds[starts_i].get_text(strip=True) if 0 <= starts_i < len(tds) else ""
+        win_txt = tds[win_i].get_text(strip=True) if 0 <= win_i < len(tds) else ""
+
+        place = normalize_percent(place_txt)
+        win_pct = normalize_percent(win_txt)
+
+        data.append(
+            {
+                "jockey_name": jname,
+                "place_pct": place,
+                "win_pct": win_pct,
+                "starts": starts_txt,
+                "rank": rank_by_place(place),
+            }
+        )
+    return data
+
 
 def main():
     html = fetch_html(URL)
-    df = parse_table(html)
+    soup = BeautifulSoup(html, "html.parser")
+
+    tbl, headers = detect_table(soup)
+    if not tbl:
+        # デバッグ用に先頭2KBを出力して失敗させる
+        preview = re.sub(r"\s+", " ", html[:2000])
+        raise RuntimeError(f"table not found. preview: {preview}")
+
+    rows = parse_rows(tbl, headers)
+    if not rows:
+        raise RuntimeError("parsed 0 rows.")
 
     os.makedirs(OUT_DIR, exist_ok=True)
-    df.to_csv(OUT_PATH, index=False, encoding="utf-8-sig")
-    print(f"[OK] wrote: {OUT_PATH}  rows={len(df)}")
+    with open(OUT_PATH, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["jockey_name", "place_pct", "win_pct", "starts", "rank"])
+        for r in rows:
+            w.writerow(
+                [r["jockey_name"], r["place_pct"], r["win_pct"], r["starts"], r["rank"]]
+            )
+
+    print(f"✅ wrote {OUT_PATH} ({len(rows)} rows)")
+
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        print(f"[ERROR] {e}", file=sys.stderr)
-        sys.exit(1)
+    main()
