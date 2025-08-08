@@ -7,6 +7,11 @@
 # ------------------------------------------------------------------
 
 import os
+
+OUT = "data/jockey_ranks.csv"
+os.makedirs(os.path.dirname(OUT), exist_ok=True)
+with open(OUT, "w", encoding="utf-8", newline="") as f:
+    ...
 import sys
 import time
 import re
