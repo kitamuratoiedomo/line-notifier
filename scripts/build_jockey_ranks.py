@@ -1,108 +1,152 @@
 # scripts/build_jockey_ranks.py
-import csv
-import re
-import time
-import sys
-from typing import List, Tuple
+# --- 概要 -----------------------------------------------------------
+# netkeiba 地方（NAR）リーディングの複勝率から
+# 騎手ランク CSV を生成します。
+# A: 複勝率 30%以上 / B: 20%以上30%未満 / C: 20%未満
+# 出力: data/jockey_ranks.csv
+# ------------------------------------------------------------------
 
+import os
+import sys
+import time
+import re
 import requests
+import pandas as pd
 from bs4 import BeautifulSoup
 
-BASE_URL = "https://db.netkeiba.com/jockey/jockey_leading_nar.html"
+URL = "https://db.netkeiba.com/jockey/jockey_leading_nar.html"
+UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
-        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1"
-    ),
-    "Accept-Language": "ja,en;q=0.8",
-}
+OUT_DIR = "data"
+OUT_PATH = os.path.join(OUT_DIR, "jockey_ranks.csv")
 
-def pick_table(soup: BeautifulSoup):
-    """ヘッダに '騎手' と '複勝' を含むテーブルを1つ選ぶ"""
-    tables = soup.find_all("table")
-    for tbl in tables:
-        ths = [th.get_text(strip=True) for th in tbl.find_all("th")]
-        if not ths:
-            continue
-        if any("騎手" in h or "騎手名" in h for h in ths) and any("複勝" in h for h in ths):
-            return tbl
-    return None
+def fetch_html(url: str, retry: int = 3, sleep_sec: float = 1.5) -> str:
+    """HTML を取得（軽いリトライ付き）"""
+    last_err = None
+    for i in range(retry):
+        try:
+            r = requests.get(url, headers={"User-Agent": UA}, timeout=20)
+            r.raise_for_status()
+            # 一部ページは charset 指定が曖昧なので、requests の推定に任せる
+            r.encoding = r.apparent_encoding
+            return r.text
+        except Exception as e:
+            last_err = e
+            time.sleep(sleep_sec)
+    raise RuntimeError(f"fetch_html failed: {last_err}")
 
-def parse_table(tbl) -> List[Tuple[str, float]]:
-    """(騎手名, 複勝率[0-1]) のリストに変換"""
-    out = []
-    for tr in tbl.find_all("tr"):
-        tds = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
-        if len(tds) < 5:
-            continue
-        # 想定：順位, 騎手名, 所属, 乗鞍, 勝率, 連対率, 複勝率, ...
-        text_row = " ".join(tds)
-        if "騎手" in text_row and "複勝" in text_row:
-            # ヘッダー行をスキップ
-            continue
+def parse_table(html: str) -> pd.DataFrame:
+    """
+    netkeiba の表をパースして DataFrame にする。
+    カラムは状況により増減することがあるため、名前解決を柔軟に行う。
+    """
+    soup = BeautifulSoup(html, "lxml")  # lxml が無ければ bs4 の html.parser でも動きます
+    table = soup.select_one("table.db_main_s")
+    if table is None:
+        raise RuntimeError("table not found (selector: table.db_main_s)")
 
-        jockey = tds[1]  # 2番目が騎手名の想定
-        # 右側から%が入るセルを探す（列ズレ耐性）
-        fuku_cell = None
-        for td in tds[::-1]:
-            if "%" in td:
-                fuku_cell = td
-                break
-        if not fuku_cell:
-            continue
-        m = re.search(r"(\d+(?:\.\d+)?)\s*%", fuku_cell)
-        if not m:
-            continue
-        rate = float(m.group(1)) / 100.0
-        out.append((jockey, rate))
-    return out
+    # ヘッダー
+    headers = [th.get_text(strip=True) for th in table.select("thead tr th")]
+    # tbody行
+    rows = []
+    for tr in table.select("tbody tr"):
+        tds = [td.get_text(strip=True) for td in tr.select("td")]
+        if tds:
+            rows.append(tds)
 
-def rank(rate: float) -> str:
-    # 指定の基準：A=30%以上 / B=20〜29.9% / C=19.9%以下
-    if rate >= 0.30:
-        return "A"
-    if rate >= 0.20:
-        return "B"
-    return "C"
+    if not headers and rows:
+        # ヘッダが取れないケースは列数から推測（フォールバック）
+        # 代表的な並びに合わせる
+        # 例: 順位, 騎手名, 所属, 騎乗数, 勝数, 連対数, 3着内数, 勝率, 連対率, 複勝率, 獲得賞金
+        n = max(len(r) for r in rows)
+        guessed = [
+            "順位","騎手名","所属","騎乗数","勝数","連対数","3着内数",
+            "勝率","連対率","複勝率","獲得賞金"
+        ]
+        headers = guessed[:n]
 
-def fetch_all_pages() -> List[Tuple[str, float]]:
-    """ページング対応 (?page=2 ...)。表が無くなれば終了。"""
-    results: List[Tuple[str, float]] = []
-    for page in range(1, 11):  # 予備で10ページまで
-        url = BASE_URL if page == 1 else f"{BASE_URL}?page={page}"
-        r = requests.get(url, headers=HEADERS, timeout=30)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-        tbl = pick_table(soup)
-        if not tbl:
-            break
-        rows = parse_table(tbl)
-        if not rows:
-            break
-        results.extend(rows)
-        time.sleep(1.0)  # マナー
-    # 重複名があれば先勝ちでユニーク化
-    uniq = {}
-    for name, rate in results:
-        uniq.setdefault(name, rate)
-    return [(k, v) for k, v in uniq.items()]
+    df = pd.DataFrame(rows, columns=headers[:len(rows[0])])
+
+    # 重要列の正規化（列名が微妙に変わっても拾えるようにする）
+    def find_col(patterns):
+        for p in patterns:
+            for c in df.columns:
+                if re.search(p, c):
+                    return c
+        return None
+
+    col_name = find_col(["騎手名"])
+    col_place = find_col(["所属"])
+    col_fukusho = find_col(["複勝率"])
+    col_n_rides = find_col(["騎乗数"])
+
+    keep_cols = []
+    if col_name: keep_cols.append(col_name)
+    if col_place: keep_cols.append(col_place)
+    if col_n_rides: keep_cols.append(col_n_rides)
+    if col_fukusho: keep_cols.append(col_fukusho)
+
+    if not col_name or not col_fukusho:
+        raise RuntimeError(f"必要列が見つかりません（騎手名 or 複勝率）。columns={list(df.columns)}")
+
+    df = df[keep_cols].copy()
+    df.rename(columns={
+        col_name: "騎手名",
+        col_place: "所属" if col_place else "所属",
+        col_n_rides: "騎乗数" if col_n_rides else "騎乗数",
+        col_fukusho: "複勝率"
+    }, inplace=True)
+
+    # 複勝率 → float（%を削除）
+    df["複勝率"] = (
+        df["複勝率"]
+        .astype(str)
+        .str.replace("%", "", regex=False)
+        .str.replace(",", "", regex=False)
+        .astype(float)
+    )
+
+    # 騎乗数がある場合は数値化
+    if "騎乗数" in df.columns:
+        df["騎乗数"] = (
+            df["騎乗数"]
+            .astype(str)
+            .str.replace(",", "", regex=False)
+            .replace("", 0)
+        )
+        # 数値化に失敗した行は 0 に
+        df["騎乗数"] = pd.to_numeric(df["騎乗数"], errors="coerce").fillna(0).astype(int)
+
+    # ランク付け
+    def to_rank(x: float) -> str:
+        if x >= 30.0:
+            return "A"
+        if x >= 20.0:
+            return "B"
+        return "C"
+
+    df["ランク"] = df["複勝率"].apply(to_rank)
+
+    # 出力に使う順序
+    out_cols = ["騎手名", "所属", "騎乗数", "複勝率", "ランク"]
+    # 無い列は除外して出力
+    out_cols = [c for c in out_cols if c in df.columns]
+    df = df[out_cols].copy()
+
+    # 騎手名重複をまとめたいならここで groupby 等しても可
+    return df
 
 def main():
-    rows = fetch_all_pages()
-    rows.sort(key=lambda x: x[0])
-    out_path = "data/jockey_ranks.csv"
-    print(f"write: {out_path} ({len(rows)} rows)")
-    # data/ フォルダはActions側で作成せずともCSV書き込みでOK（git管理は後段のcommitステップ）
-    with open(out_path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["jockey_name", "fukusho_rate", "rank"])
-        for name, rate in rows:
-            w.writerow([name, f"{rate:.3f}", rank(rate)])
+    html = fetch_html(URL)
+    df = parse_table(html)
+
+    os.makedirs(OUT_DIR, exist_ok=True)
+    df.to_csv(OUT_PATH, index=False, encoding="utf-8-sig")
+    print(f"[OK] wrote: {OUT_PATH}  rows={len(df)}")
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        print("ERROR:", e, file=sys.stderr)
-        raise
+        print(f"[ERROR] {e}", file=sys.stderr)
+        sys.exit(1)
