@@ -1,0 +1,35 @@
+name: Build jockey ranks CSV
+
+on:
+  workflow_dispatch:    # 手動実行ボタン
+  schedule:
+    - cron: "0 18 * * 5"   # 毎週金曜 18:00 UTC（= 土曜 03:00 JST）
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4
+
+      - name: Run scraper
+        run: |
+          python scripts/build_jockey_ranks.py
+
+      - name: Commit CSV
+        uses: EndBug/add-and-commit@v9
+        with:
+          add: "data/jockey_ranks.csv"
+          message: "chore: refresh jockey_ranks.csv"
+          default_author: github_actions
