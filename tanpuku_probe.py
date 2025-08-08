@@ -6,7 +6,7 @@ UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.1
 
 # ★ここにテストしたい RACEID を1つ入れてください（リンク抽出ログに出ていたIDでOK）
 RACEID = "202508072135050400"  # 例）園田2RっぽいID。手元の実ログに出たものに置き換え
-202508072135050400
+
 def fetch_tanfuku(raceid: str):
     url = f"https://keiba.rakuten.co.jp/odds/tanfuku/RACEID/{raceid}"
     r = requests.get(url, headers={"User-Agent": UA, "Accept-Language":"ja"}, timeout=25)
