@@ -1,59 +1,76 @@
-import os
-import sys
-import datetime as dt
+# app.py －－－ 診断②：リンク抽出（個別レース/オッズのパターンを掴む）
+import os, sys, re, datetime as dt
 import requests
 from bs4 import BeautifulSoup
 
-RACE_URL = os.getenv(
-    "RACE_URL",
-    # 例: 楽天競馬 当日レースカード（ユーザーさんが前に貼ってくれた例）
-    "https://keiba.rakuten.co.jp/race_card/list/RACEID/202508070000000000?bmode=1&l-id=sp_top_raceInfoToday_raceCard_pc",
-)
+TARGET = "https://keiba.rakuten.co.jp/race_card/list/RACEID/202508070000000000?bmode=1"
 
-UA = (
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) "
-    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
-)
-
-def log(msg):
-    now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{now}] {msg}")
-    sys.stdout.flush()
+def log(s): 
+    print(f"[{dt.datetime.now():%Y-%m-%d %H:%M:%S}] {s}", flush=True)
 
 def main():
-    log("=== 取得テスト開始 ===")
-    log(f"TARGET: {RACE_URL}")
+    log("=== リンク抽出テスト開始 ===")
+    log(f"TARGET: {TARGET}")
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/125.0.0.0 Safari/537.36"
+        )
+    }
+    r = requests.get(TARGET, headers=headers, timeout=25)
+    log(f"HTTP status: {r.status_code}")
+    ctype = r.headers.get("Content-Type", "")
+    log(f"Content-Type: {ctype}")
+    html = r.text
+    log(f"取得サイズ: {len(html)} bytes")
 
-    try:
-        resp = requests.get(RACE_URL, headers={"User-Agent": UA}, timeout=20)
-        log(f"HTTP status: {resp.status_code}")
-        log(f"Content-Type: {resp.headers.get('Content-Type')}")
-        text = resp.text
-        log(f"取得サイズ: {len(text)} bytes")
+    soup = BeautifulSoup(html, "html.parser")
 
-        # 先頭 2000 文字をログに出す（レンダリングや JS SPA の有無を確認）
-        head = text[:2000].replace("\n", "\\n")  # 改行を潰すと読みやすい
-        log(f"HTML head(2000): {head}")
+    # 1) ページタイトル
+    title = (soup.title.string.strip() if soup.title and soup.title.string else "")
+    log(f"page <title>: {title}")
 
-        if resp.status_code != 200 or len(text) < 500:
-            log("⚠️ 取得失敗の可能性（ステータス or サイズが不正）")
-            return
+    # 2) すべてのリンクを抽出
+    links = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        text = a.get_text(strip=True)
+        links.append((href, text))
 
-        # 解析の最小テスト：title を抜く
-        soup = BeautifulSoup(text, "html.parser")
-        title = (soup.title.string.strip() if soup.title else "（title なし）")
-        log(f"page <title>: {title}")
+    log(f"aタグ総数: {len(links)}")
 
-        # JSで描画するタイプかどうかの簡易チェック
-        if "id=\"__NEXT_DATA__\"" in text or "id=\"__NUXT\"" in text or "window.__NUXT__" in text:
-            log("⚠️ JSレンダリング型の可能性（静的HTMLにデータが無い）")
-            log("　→ 解析はXHRのJSON APIを探すか、データが埋め込まれている<script>を抽出する必要あり")
+    # 3) race_card / odds を含むリンクを分類表示
+    def pick(pattern, name, limit=40):
+        found = [(h, t) for h, t in links if pattern in h]
+        log(f"--- {name} ({len(found)}件) ---")
+        for h, t in found[:limit]:
+            log(f"{name}: href={h} | text='{t}'")
+        return found
 
-        # ここまで通れば「ひとまず取得はOK」
-        log("✅ 取得テスト完了（次は解析手順に進めます）")
+    race_card_links = pick("/race_card/", "race_card_link")
+    odds_links      = pick("/odds",       "odds_link")
 
-    except Exception as e:
-        log(f"❌ 例外: {e!r}")
+    # 4) 絶対URLに補正（相対パスなら）
+    def abs_url(href):
+        if href.startswith("http"):
+            return href
+        if href.startswith("/"):
+            return "https://keiba.rakuten.co.jp" + href
+        # 相対→一旦基底からの単純連結（必要に応じて厳密化）
+        return "https://keiba.rakuten.co.jp/" + href
+
+    # サンプルとして race_card/odds の先頭数件を絶対URLで出す
+    log("--- 代表URL（上位5件） ---")
+    for kind, arr in [("race_card", race_card_links), ("odds", odds_links)]:
+        for i, (h, t) in enumerate(arr[:5], 1):
+            log(f"{kind}[{i}]: {abs_url(h)} | text='{t}'")
+
+    log("✅ 診断②完了：href パターンが見えたら、次は個別ページの中身を解析して『人気・オッズ・締切』を取りに行きます。")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        log(f"例外: {e}")
+        sys.exit(1)
