@@ -1,139 +1,96 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="ja">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>LINE連携ユーザー登録</title>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>LIFF → Googleフォーム 連携</title>
   <script src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
   <style>
-    :root { color-scheme: light dark; }
-    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans JP", "Hiragino Kaku Gothic ProN", Meiryo, sans-serif; margin:0; background:#f7f7f8; }
-    .wrap { max-width: 720px; margin: 0 auto; padding: 24px 16px; }
-    .card { background:#fff; border-radius:14px; padding:22px; box-shadow:0 2px 10px rgba(0,0,0,.06); }
-    h1 { font-size:20px; margin:0 0 12px; }
-    .muted { color:#666; font-size:13px; }
-    .row { margin:14px 0; }
-    label { display:block; font-weight:600; margin-bottom:6px; }
-    input[type="text"], textarea {
-      width: 100%; box-sizing:border-box; padding:12px 14px; border:1px solid #ddd; border-radius:10px; font-size:16px; background:#fff;
-    }
-    input[readonly] { background:#f2f2f2; color:#333; }
-    button {
-      appearance:none; border:0; background:#06c755; color:#fff; font-weight:700;
-      font-size:16px; padding:12px 16px; border-radius:12px; width:100%; cursor:pointer;
-    }
-    button:disabled { opacity:.5; cursor:not-allowed; }
-    .note { font-size:12px; color:#666; line-height:1.6; margin-top:12px; }
-    .warn { color:#c00; font-weight:700; }
+    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; padding: 20px; }
+    .card { max-width: 720px; margin: 0 auto; padding: 16px; border: 1px solid #ddd; border-radius: 8px; }
+    .ok { color: #0a7; }
+    .ng { color: #d33; }
+    button { padding: 10px 16px; font-size: 16px; }
+    .hint { color:#666; font-size: 13px; }
   </style>
 </head>
 <body>
-  <div class="wrap">
-    <div class="card">
-      <h1>LINE 連携ユーザー登録</h1>
-      <p class="muted">このページでは、あなたの <b>LINE表示名</b> と <b>userId</b> を自動取得して Google フォームへ送信します。</p>
+  <div class="card">
+    <h2>LINE ログイン → Googleフォーム送信</h2>
 
-      <div class="row">
-        <label>LINE表示名（自動入力）</label>
-        <input id="displayName" type="text" readonly />
-      </div>
+    <p id="status" class="hint">LIFF 初期化中…</p>
 
-      <div class="row">
-        <label>userId（自動入力・非表示で送信）</label>
-        <input id="userIdDisplay" type="text" readonly />
-      </div>
+    <!-- ★★★ ここが重要：formResponse に POST ★★★ -->
+    <form
+      id="gform"
+      action="https://docs.google.com/forms/d/e/1FAIpQLSfSN0Zb6NY7edTlWuZoxRtgV61U5PiNk-oXtmE9XUsYtNLenw/formResponse"
+      method="POST"
+      target="_self"
+      enctype="application/x-www-form-urlencoded">
 
-      <div class="row">
-        <label>補足（任意）</label>
-        <textarea id="memo" rows="3" placeholder="任意でメモなどがあれば入力してください"></textarea>
-      </div>
+      <!-- ここはあなたのフォームの “userId” 用の entry 番号に合わせる -->
+      <input type="hidden" name="entry.2061017733" id="entry_userid" />
 
-      <div class="row">
-        <label><input id="agree" type="checkbox" /> 利用規約に同意します</label>
-      </div>
+      <!-- 表示名など（任意） -->
+      <input type="hidden" name="entry.1119093151" id="entry_displayName" />
 
-      <form id="gf" method="POST" target="hidden_iframe">
-        <input type="hidden" id="eName"   name="entry.1119093151" />
-        <input type="hidden" id="eUserId" name="entry.2061017733" />
-        <input type="hidden" id="eMemo"   name="entry.1748558192" />
-        <button id="submitBtn" type="submit" disabled>この内容を送信する</button>
-        <p id="errorText" class="note warn" style="display:none"></p>
-        <p class="note">
-          ※送信すると <b>LINE表示名</b> と <b>userId</b> が Google フォームに保存されます。<br />
-          ※この情報は通知配信・重複防止・障害対応のために利用します。
-        </p>
-      </form>
+      <!-- 必要なら他の項目も hidden で埋める（任意）
+      <input type="hidden" name="entry.1947235779" id="entry_other1" />
+      <input type="hidden" name="entry.1748558192" id="entry_other2" />
+      -->
 
-      <iframe name="hidden_iframe" id="hidden_iframe" style="display:none;"></iframe>
-    </div>
+      <button id="submitBtn" type="submit" disabled>送信（userId 取得後に有効化）</button>
+    </form>
+
+    <p class="hint">
+      ※ LINEアプリ内でページを開くと自動的に userId を取得してフォームに送信できます。<br>
+      ※ PCブラウザでテストする場合は LIFF ログインが動かないので、仮値を手動セットしてください（デバッグ時）。
+    </p>
+
+    <pre id="debug" class="hint"></pre>
   </div>
 
 <script>
-const CONFIG = {
-  LIFF_ID: "2007882844-1lMbv7NY",
-  GOOGLE_FORM_ACTION: "https://docs.google.com/forms/d/e/1FAIpQLSfSN0Zb6NY7edTlWuZoxRtgV61U5PiNk-oXtmE9XUsYtNLenw/formResponse",
-  THANKS_URL: "thanks.html"
-};
+  const LIFF_ID = "【あなたの LIFF ID】";  // 例: 2007882844-1lMbv7NY
 
-const $ = (sel) => document.querySelector(sel);
+  async function main() {
+    try {
+      document.getElementById('status').textContent = 'LIFF 初期化中…';
+      await liff.init({ liffId: LIFF_ID });
 
-const $displayName = $("#displayName");
-const $userIdDisplay = $("#userIdDisplay");
-const $memo = $("#memo");
-const $agree = $("#agree");
-const $submit = $("#submitBtn");
-const $errorText = $("#errorText");
-const $form = $("#gf");
-const $eName = $("#eName");
-const $eUserId = $("#eUserId");
-const $eMemo = $("#eMemo");
-const $hiddenIframe = $("#hidden_iframe");
+      if (!liff.isLoggedIn()) {
+        document.getElementById('status').textContent = 'ログインへ遷移します…';
+        liff.login();
+        return;
+      }
 
-$form.action = CONFIG.GOOGLE_FORM_ACTION;
+      const profile = await liff.getProfile();
+      // ▼ ここで hidden に値を設定（entry 番号はあなたのフォームに合わせている）
+      document.getElementById('entry_userid').value      = profile.userId;
+      document.getElementById('entry_displayName').value = profile.displayName;
 
-$hiddenIframe.addEventListener("load", () => {
-  if ($eName.value && $eUserId.value) {
-    location.href = CONFIG.THANKS_URL;
-  }
-});
+      // デバッグ表示（確認用）
+      const dbg = [
+        'userId: ' + profile.userId,
+        'displayName: ' + profile.displayName
+      ].join('\n');
+      document.getElementById('debug').textContent = dbg;
 
-$agree.addEventListener("change", () => toggleSubmit());
+      // 送信ボタンを有効化
+      document.getElementById('submitBtn').disabled = false;
+      document.getElementById('status').innerHTML =
+        '<span class="ok">userId の取得に成功。送信できます。</span>';
 
-function toggleSubmit() {
-  const ok = Boolean($displayName.value && $userIdDisplay.value && $agree.checked);
-  $submit.disabled = !ok;
-}
-
-async function init() {
-  try {
-    await liff.init({ liffId: CONFIG.LIFF_ID });
-    if (!liff.isLoggedIn()) {
-      liff.login();
-      return;
+    } catch (e) {
+      document.getElementById('status').innerHTML =
+        '<span class="ng">LIFF 初期化またはプロフィール取得に失敗：' + e.message + '</span>';
+      console.error(e);
+      // PCデバッグ時は仮値を入れると送信検証が可能（開発時のみ）
+      // document.getElementById('entry_userid').value = 'Uxxxxxxxxxxxxxxxx';
+      // document.getElementById('submitBtn').disabled = false;
     }
-    const profile = await liff.getProfile();
-    const userId  = profile.userId;
-
-    $displayName.value = profile.displayName || "";
-    $userIdDisplay.value = userId || "";
-
-    $eName.value = profile.displayName || "";
-    $eUserId.value = userId || "";
-
-    toggleSubmit();
-  } catch (err) {
-    console.error(err);
-    $errorText.style.display = "block";
-    $errorText.textContent = "LIFF初期化に失敗しました。LINEアプリ内で開いているかご確認ください。";
   }
-}
-
-$form.addEventListener("submit", (e) => {
-  // 同意項目はチェックONのときだけ "はい。" を送る（フォームの選択肢と一致させる）
-  $eMemo.value = $agree.checked ? "はい。" : "";
-});
-
-init();
+  main();
 </script>
 </body>
 </html>
