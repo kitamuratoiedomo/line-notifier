@@ -73,4 +73,4 @@ def list_raceids_for_date(yyyymmdd: str) -> List[str]:
         time.sleep(SLEEP_SEC_BETWEEN_REQ)
 
     out = sorted(ids)
-    if len(out) > MAX
+    if len(out) > MAX:
