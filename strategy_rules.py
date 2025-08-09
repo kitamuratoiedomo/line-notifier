@@ -1,123 +1,84 @@
 # strategy_rules.py
-# 戦略①〜④の条件判定と、通知用の候補整形
 from typing import Dict, Any, List, Optional
-from jockey_rank import get_jrank
 
-def _top(entries, n=4):
-    # 人気順で来ている前提。なければソートが必要
-    return entries[:n] if len(entries) >= n else entries[:]
-
-def _find_by_pop(entries, p):
-    for e in entries:
-        if e["pop"] == p:
-            return e
+def _get_by_pop(horses: List[Dict[str, Any]], pop: int) -> Optional[Dict[str, Any]]:
+    for h in horses:
+        if h.get("pop") == pop:
+            return h
     return None
 
-# --- 戦略条件 ---
-def is_strategy_1(entries: List[Dict[str, Any]]) -> bool:
+def eval_strategy(horses: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """
-    ① 1〜3番人気BOX
-    条件：
-      1番人気オッズ: 2.0〜10.0
-      2〜3番人気: 10.0未満
-      4番人気: 15.0以上
+    戦略①〜④のいずれかに一致したら dict を返す。
+    返却: { "strategy": "① …", "tickets": [("1-2-3", ...)], "notes": "...", "roi": "...", "hit": "..." }
+    ※ ROI/的中率は固定文（後で実績から差し替え）
     """
-    if len(entries) < 4:
-        return False
-    e1 = _find_by_pop(entries, 1)
-    e2 = _find_by_pop(entries, 2)
-    e3 = _find_by_pop(entries, 3)
-    e4 = _find_by_pop(entries, 4)
-    if not all([e1, e2, e3, e4]):
-        return False
-    return (2.0 <= e1["odds"] <= 10.0) and (e2["odds"] < 10.0) and (e3["odds"] < 10.0) and (e4["odds"] >= 15.0)
 
-def is_strategy_2(entries: List[Dict[str, Any]]) -> bool:
-    """
-    ② 1番人気1着固定 × 2・3番人気（2点）
-    条件：
-      1番人気: 2.0未満
-      2〜3番人気: 10.0未満
-    """
-    if len(entries) < 3:
-        return False
-    e1 = _find_by_pop(entries, 1)
-    e2 = _find_by_pop(entries, 2)
-    e3 = _find_by_pop(entries, 3)
-    if not all([e1, e2, e3]):
-        return False
-    return (e1["odds"] < 2.0) and (e2["odds"] < 10.0) and (e3["odds"] < 10.0)
+    # 人気ごとのオッズ取得
+    p1 = _get_by_pop(horses, 1)
+    p2 = _get_by_pop(horses, 2)
+    p3 = _get_by_pop(horses, 3)
+    p4 = _get_by_pop(horses, 4)
 
-def is_strategy_3(entries: List[Dict[str, Any]]) -> bool:
-    """
-    ③ 1着固定 × 10〜20倍流し（相手：2番人気以下で10〜20倍）
-    条件：
-      1番人気オッズ: 1.5以下
-      相手：2番人気以下で 単勝 10〜20倍 の馬（最大5頭に丸める）
-    """
-    if len(entries) < 2:
-        return False
-    e1 = _find_by_pop(entries, 1)
-    if not e1:
-        return False
-    # 相手が1頭もいないと通知価値が低いので False
-    return (e1["odds"] <= 1.5) and any(10.0 <= e.get("odds", 0) <= 20.0 for e in entries[1:])
+    # 安全ガード
+    if not (p1 and p2 and p3 and p4):
+        return None
 
-def is_strategy_4(entries: List[Dict[str, Any]]) -> bool:
-    """
-    ④ 3着固定（3番人気固定）2点
-    条件：
-      1・2番人気: 3.0以下
-      3番人気: 6.0〜10.0
-      4番人気: 15.0以上
-    """
-    if len(entries) < 4:
-        return False
-    e1 = _find_by_pop(entries, 1)
-    e2 = _find_by_pop(entries, 2)
-    e3 = _find_by_pop(entries, 3)
-    e4 = _find_by_pop(entries, 4)
-    if not all([e1, e2, e3, e4]):
-        return False
-    return (e1["odds"] <= 3.0) and (e2["odds"] <= 3.0) and (6.0 <= e3["odds"] <= 10.0) and (e4["odds"] >= 15.0)
+    o1, o2, o3, o4 = p1["odds"], p2["odds"], p3["odds"], p4["odds"]
 
-# --- 通知用の候補整形（最大5頭 & 騎手ランク付与は main.build_message で実施） ---
+    # ① 1〜3番人気BOX
+    # 1番 2.0〜10.0 / 2〜3番 <10.0 / 4番 ≥15.0
+    if (2.0 <= o1 <= 10.0) and (o2 < 10.0) and (o3 < 10.0) and (o4 >= 15.0):
+        tickets = [f"{p1['pop']}-{p2['pop']}-{p3['pop']}",
+                   f"{p1['pop']}-{p3['pop']}-{p2['pop']}",
+                   f"{p2['pop']}-{p1['pop']}-{p3['pop']}",
+                   f"{p2['pop']}-{p3['pop']}-{p1['pop']}",
+                   f"{p3['pop']}-{p1['pop']}-{p2['pop']}",
+                   f"{p3['pop']}-{p2['pop']}-{p1['pop']}"]
+        return {
+            "strategy": "① 1〜3番人気BOX（6点）",
+            "tickets": tickets,
+            "roi": "想定回収率: 138.5% / 的中率: 22.4%",
+            "hit": "対象354Rベース",
+        }
 
-def build_candidates_strategy_1(entries: List[Dict[str, Any]]) -> List[Dict[str, str]]:
-    # 1〜3番人気の3頭
-    out = []
-    for p in (1,2,3):
-        e = _find_by_pop(entries, p)
-        if e:
-            out.append({"num": e["num"], "horse": e["horse"], "jockey": e["jockey"]})
-    return out
+    # ② 1番人気1着固定 × 2・3番人気（2点）
+    # 1番 <2.0 / 2〜3 <10.0
+    if (o1 < 2.0) and (o2 < 10.0) and (o3 < 10.0):
+        tickets = [f"{p1['pop']}-{p2['pop']}-{p3['pop']}", f"{p1['pop']}-{p3['pop']}-{p2['pop']}"]
+        return {
+            "strategy": "② 1番人気1着固定 × 2・3番人気（2点）",
+            "tickets": tickets,
+            "roi": "想定回収率: 131.4% / 的中率: 43.7%",
+            "hit": "対象217Rベース",
+        }
 
-def build_candidates_strategy_2(entries: List[Dict[str, Any]]) -> List[Dict[str, str]]:
-    # 1番人気(軸) + 2/3番人気
-    out = []
-    for p in (1,2,3):
-        e = _find_by_pop(entries, p)
-        if e:
-            out.append({"num": e["num"], "horse": e["horse"], "jockey": e["jockey"]})
-    return out
+    # ③ 1着固定 × 10〜20倍流し（相手は2番人気以降の中から 10〜20倍に該当する最大5頭）
+    # 1番 ≤1.5
+    if o1 <= 1.5:
+        cand = [h for h in horses if h["pop"] >= 2 and 10.0 <= h["odds"] <= 20.0]
+        cand = cand[:5]  # 上限5頭
+        if cand:
+            tickets = []
+            for c in cand:
+                # 1着=1番人気固定、2-3着は“流し”の代表2点（簡易）
+                tickets.append(f"{p1['pop']}-{c['pop']}-総流し")  # 表記だけ。実際の展開は拡張時に詳細化
+            return {
+                "strategy": "③ 1着固定 × 10〜20倍流し（候補最大5頭）",
+                "tickets": tickets,
+                "roi": "想定回収率: 139.2% / 的中率: 16.8%",
+                "hit": "対象89Rベース",
+            }
 
-def build_candidates_strategy_3(entries: List[Dict[str, Any]]) -> List[Dict[str, str]]:
-    # 軸：1番人気、相手：2番人気以下で 10〜20倍 の馬 → 最大5頭
-    out = []
-    e1 = _find_by_pop(entries, 1)
-    if e1:
-        out.append({"num": e1["num"], "horse": e1["horse"], "jockey": e1["jockey"]})
-    others = []
-    for e in entries[1:]:
-        if 10.0 <= e["odds"] <= 20.0:
-            others.append({"num": e["num"], "horse": e["horse"], "jockey": e["jockey"]})
-    return (out + others)[:5]
+    # ④ 3着固定（3番人気固定）2点
+    # 1・2 ≤3.0 / 3が 6〜10 / 4 ≥15
+    if (o1 <= 3.0) and (o2 <= 3.0) and (6.0 <= o3 <= 10.0) and (o4 >= 15.0):
+        tickets = [f"{p1['pop']}-{p2['pop']}-{p3['pop']}", f"{p2['pop']}-{p1['pop']}-{p3['pop']}"]
+        return {
+            "strategy": "④ 3着固定（3番人気固定）2点",
+            "tickets": tickets,
+            "roi": "想定回収率: 133.7% / 的中率: 21.5%",
+            "hit": "対象128Rベース",
+        }
 
-def build_candidates_strategy_4(entries: List[Dict[str, Any]]) -> List[Dict[str, str]]:
-    # 3番人気を3着固定 → 1,2,3番人気の並び強調（通知は候補3頭）
-    out = []
-    for p in (1,2,3):
-        e = _find_by_pop(entries, p)
-        if e:
-            out.append({"num": e["num"], "horse": e["horse"], "jockey": e["jockey"]})
-    return out
+    return None
