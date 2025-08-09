@@ -1,85 +1,94 @@
 # jockey_rank.py
-# 騎手ランクCSV(data/jockey_ranks.csv)を読み込んで
-# 騎手名 -> {"belong":..., "jrank": "A|B|C"} を返すユーティリティ
+import re
+import logging
+from typing import Dict, Tuple
+from datetime import timezone, timedelta
 
-import csv
-import os
+import requests
+from bs4 import BeautifulSoup
 
-CSV_PATH_DEFAULT = "data/jockey_ranks.csv"
+JST = timezone(timedelta(hours=9))
+HEADERS = {"user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
-# 日本語/英語どちらのヘッダでも読めるように候補を定義
-_HEADER_MAP = {
-    "rank":   ["Rank", "順位", "ランク"],
-    "name":   ["Name", "騎手名", "ジョッキー"],
-    "belong": ["Belong", "所属"],
+# ---- 任意：簡易ランク表（必要に応じて更新） ----------------------------
+# 実運用ではここをスプレッドシート等に差し替えてもOK
+_RANK_TABLE = {
+    # 例
+    "矢野貴之": "B",
+    "本田正重": "C",
+    "笹川翼": "C",
+    # 未登録はデフォルト C とする
 }
 
-def _pick(row, keys):
-    for k in keys:
-        if k in row and row[k] is not None:
-            return str(row[k]).strip()
-    raise KeyError(f"Missing columns. tried={keys}, got={list(row.keys())}")
+def _get(url: str, timeout: int = 12) -> str:
+    r = requests.get(url, headers=HEADERS, timeout=timeout)
+    r.raise_for_status()
+    r.encoding = r.apparent_encoding or "utf-8"
+    return r.text
 
-def _normalize_name(name: str) -> str:
-    # 前後空白や連続スペースを整理（必要なら追加で正規化）
-    return " ".join(name.split())
+def _norm_jname(name: str) -> str:
+    name = (name or "").strip()
+    name = re.sub(r"\s+", "", name)
+    # 括弧の所属など除去
+    name = re.sub(r"（.*?）|\(.*?\)", "", name)
+    return name
 
-def load_jrank(csv_path: str = CSV_PATH_DEFAULT) -> dict:
+def get_jockey_rank(name: str) -> str:
+    name = _norm_jname(name)
+    if not name:
+        return "-"
+    return _RANK_TABLE.get(name, "C")
+
+def get_jockey_map(race_id: str) -> Dict[int, Tuple[str, str]]:
     """
-    CSV を読み込み、 {騎手名: {"belong": 所属, "jrank": A/B/C}} を返す
-    CSVが無い/壊れている場合は空dict
+    楽天のレースカードから「馬番 -> (騎手名, ランク)」を返す。
+    失敗時は空 dict。
     """
-    table = {}
-    if not os.path.exists(csv_path):
-        return table
+    urls = [
+        f"https://keiba.rakuten.co.jp/race_card/list/RACEID/{race_id}",
+        f"https://keiba.rakuten.co.jp/race/top/RACEID/{race_id}",
+    ]
+    for url in urls:
+        try:
+            html = _get(url, timeout=10)
+            soup = BeautifulSoup(html, "html.parser")
 
-    with open(csv_path, newline="", encoding="utf-8") as f:
-        r = csv.DictReader(f)
-        for row in r:
-            try:
-                name   = _normalize_name(_pick(row, _HEADER_MAP["name"]))
-                belong = _pick(row, _HEADER_MAP["belong"])
-                jrank  = row.get("jrank") or row.get("JRank")  # 既に列がある場合
-                if not jrank:
-                    # ランク列が無いCSVでも、順位から即席ランク付けできるように
-                    rank_str = _pick(row, _HEADER_MAP["rank"])
-                    rank = int(rank_str)
-                    if rank <= 70:
-                        jrank = "A"
-                    elif rank <= 150:
-                        jrank = "B"
-                    else:
-                        jrank = "C"
-                # ばんえい所属は除外（そもそもCSVに入れない運用だがガード）
-                if "ばんえ" in belong or "ばんえい" in belong:
-                    continue
-                table[name] = {"belong": belong, "jrank": jrank}
-            except Exception:
-                # 空行/合わない行はスキップ
-                continue
-    return table
+            # 馬番・騎手名が同じ行に並ぶ table/section を広めに探索
+            cand = soup.find_all(["table", "section", "div"])
+            pairs = {}
+            for blk in cand:
+                rows = blk.find_all("tr")
+                for tr in rows:
+                    texts = [td.get_text(" ", strip=True) for td in tr.find_all(["th", "td"])]
+                    if len(texts) < 3:
+                        continue
+                    # 馬番
+                    umaban = None
+                    for t in texts[:2]:
+                        if re.fullmatch(r"\d{1,2}", t):
+                            umaban = int(t)
+                            break
+                    if umaban is None:
+                        continue
+                    # 騎手名候補
+                    jname = None
+                    for t in texts:
+                        # 「騎手」「斤量」等の文字列が近傍にあることもあるが、
+                        # とにかく漢字/カナ2〜4字程度を優先的に拾う
+                        if re.search(r"[一-龥ァ-ヶー]{2,}", t):
+                            # 明らかに馬名や厩舎・調教師と紛れることがあるため
+                            # “斤量”“厩舎”“父”“母”“馬体重”などを含むセルは避ける
+                            if any(x in t for x in ["斤量", "厩舎", "父", "母", "馬体重", "タイム"]):
+                                continue
+                            jname = _norm_jname(t)
+                            # 騎手名はだいたい 2〜4 文字程度
+                            if 1 <= len(jname) <= 6:
+                                break
+                    if umaban is not None and jname:
+                        pairs[umaban] = (jname, get_jockey_rank(jname))
+            if pairs:
+                return pairs
+        except Exception as e:
+            logging.warning("get_jockey_map failed url=%s err=%s", url, e)
 
-# モジュール読み込み時に一度だけロード（必要なら再読込APIも用意）
-_JRANK_CACHE = None
-
-def _ensure_loaded():
-    global _JRANK_CACHE
-    if _JRANK_CACHE is None:
-        _JRANK_CACHE = load_jrank()
-
-def get_jrank(name: str, default: str = "C") -> str:
-    """
-    騎手名から A/B/C を返す。見つからなければ default（既定C）
-    """
-    _ensure_loaded()
-    key = _normalize_name(name or "")
-    info = _JRANK_CACHE.get(key) if _JRANK_CACHE else None
-    return (info or {}).get("jrank", default)
-
-def get_info(name: str) -> dict | None:
-    """
-    騎手名から {"belong":..,"jrank":..} を返す（無ければNone）
-    """
-    _ensure_loaded()
-    key = _normalize_name(name or "")
-    return (_JRANK_CACHE or {}).get(key)
+    return {}
