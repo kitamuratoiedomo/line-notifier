@@ -1,75 +1,118 @@
 # sheets_client.py
-import os
-import json
-import logging
+import os, json, logging
 from typing import List, Dict, Any
 
-import gspread
+# google client
 from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
 
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets.readonly",
-    "https://www.googleapis.com/auth/drive.readonly",
-]
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 
-def _build_creds_from_env() -> Credentials:
-    raw = os.getenv("GOOGLE_CREDENTIALS_JSON", "").strip()
+def _load_sa_info() -> Dict[str, Any]:
+    """
+    サービスアカウントJSONを環境変数から読み込む。
+    GOOGLE_CREDENTIALS_JSON か GOOGLE_APPLICATION_CREDENTIALS_JSON のどちらでもOK。
+    """
+    raw = os.getenv("GOOGLE_CREDENTIALS_JSON") or os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON") or ""
+    raw = raw.strip()
     if not raw:
         raise RuntimeError("GOOGLE_CREDENTIALS_JSON env is empty")
-
     try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as e:
-        # 1行圧縮して貼った/改行ありなどどちらでもOK。JSONとして不正ならここで落とす
-        raise RuntimeError(f"Invalid GOOGLE_CREDENTIALS_JSON: {e}")
+        # RenderのUIで改行を \n として入れている前提
+        return json.loads(raw)
+    except Exception as e:
+        # もし誤って実ファイルパスを入れてしまった時も拾えるように
+        if os.path.exists(raw):
+            with open(raw, "r", encoding="utf-8") as f:
+                return json.load(f)
+        raise RuntimeError(f"Invalid SA JSON in env: {e!r}")
 
-    return Credentials.from_service_account_info(data, scopes=SCOPES)
+def _build_service():
+    info = _load_sa_info()
+    creds = Credentials.from_service_account_info(info, scopes=SCOPES)
+    # cache_discovery=False で App Engine / serverless の不具合を回避
+    return build("sheets", "v4", credentials=creds, cache_discovery=False)
 
-def get_worksheet():
-    sheet_id = os.getenv("GOOGLE_SHEET_ID", "").strip()
-    tab_name = os.getenv("GOOGLE_SHEET_TAB", "").strip() or "フォームの回答 1"
-    if not sheet_id:
-        raise RuntimeError("GOOGLE_SHEET_ID env is empty")
+def _pick(value: str) -> str:
+    return (value or "").strip()
 
-    creds = _build_creds_from_env()
-    gc = gspread.authorize(creds)
-    sh = gc.open_by_key(sheet_id)
-    ws = sh.worksheet(tab_name)
-    return ws
+def _to_bool(s: str) -> bool:
+    s = (s or "").strip().lower()
+    return s in ("1","true","on","yes","有効","通知on","通知オン","○")
 
 def fetch_recipients() -> List[Dict[str, Any]]:
     """
-    スプレッドシートから受信者リストを取得。
-    期待する列例：
-      userId / 氏名 / LINEアイコン名 / 有効(はい/いいえ) / プラン / 夜レポ(はい/いいえ)
-    ※列名は実シートに合わせて柔軟に読む（ヘッダー行をそのままキーに）
+    受信者一覧をスプレッドシートから取得して標準化して返す。
+    想定するヘッダはいずれか（列名は大小/全角半角ゆるめ判定）:
+
+    A) シンプル表:
+       name | userId | enabled
+    B) Googleフォーム出力っぽい表:
+       タイムスタンプ | 表示名 | LINEユーザーID | 通知ON
+
+    返却: [{ "name": "...", "userId": "...", "enabled": True/False }, ...]
     """
-    try:
-        ws = get_worksheet()
-        rows = ws.get_all_records()  # 1行目をヘッダーとして辞書化
-    except Exception as e:
-        logging.warning("fetch_recipients failed: %s", e)
+    sheet_id = os.getenv("GOOGLE_SHEET_ID", "").strip()
+    tab = os.getenv("GOOGLE_SHEET_TAB", "").strip()
+    if not sheet_id or not tab:
+        raise RuntimeError("GOOGLE_SHEET_ID or GOOGLE_SHEET_TAB missing")
+
+    service = _build_service()
+    rng = f"'{tab}'!A:Z"
+    resp = service.spreadsheets().values().get(
+        spreadsheetId=sheet_id, range=rng
+    ).execute()
+
+    values = resp.get("values", [])
+    if not values:
         return []
 
-    recipients = []
-    for r in rows:
-        # userId が空ならスキップ
-        uid = str(r.get("userId") or r.get("ユーザーID") or "").strip()
-        if not uid:
+    header = [str(h).strip() for h in values[0]]
+    body = values[1:]
+
+    # 列インデックス探索（ゆるふわマッチ）
+    def idx(keys):
+        for i, h in enumerate(header):
+            hs = h.replace(" ", "").lower()
+            for k in keys:
+                if k in hs:
+                    return i
+        return -1
+
+    # A) シンプル系
+    i_name   = idx(["name","表示名"])
+    i_user   = idx(["userid","user_id","lineユーザーid","lineユーザid","lineid"])
+    i_enable = idx(["enabled","有効","通知on","通知オン"])
+
+    # どれか足りなければ、フォームっぽい想定で再探査
+    if i_user < 0:
+        # よくあるフォーム列名
+        i_user = idx(["lineユーザーid","lineユーザid","userid","lineid"])
+
+    out = []
+    for row in body:
+        # 配列長が足りないセルは空に
+        name   = _pick(row[i_name])   if 0 <= i_name   < len(row) else ""
+        userId = _pick(row[i_user])   if 0 <= i_user   < len(row) else ""
+        enabled_s = _pick(row[i_enable]) if 0 <= i_enable < len(row) else ""
+
+        # enabled 列が存在しなければ既定 True（フォームでスイッチ置かない運用向け）
+        enabled = _to_bool(enabled_s) if i_enable >= 0 else True
+
+        if not userId:
             continue
+        out.append({"name": name or userId, "userId": userId, "enabled": enabled})
 
-        # 有効/無効フラグ（列名はあなたのシートに合わせて変更）
-        enabled_val = str(r.get("有効") or r.get("Enabled") or "はい").strip()
-        enabled = enabled_val in ("はい", "true", "True", "TRUE", "有効", "1")
+    logging.info("シートから有効受信者=%d: %s",
+                 sum(1 for r in out if r["enabled"]),
+                 [r["userId"] for r in out if r["enabled"]])
+    return out
 
-        recipients.append({
-            "userId": uid,
-            "name": r.get("氏名") or r.get("名前") or "",
-            "icon_name": r.get("LINEアイコン名") or "",
-            "enabled": enabled,
-            "plan": r.get("プラン") or r.get("Plan") or "",
-            "night_report": str(r.get("夜レポ") or "").strip() in ("はい", "true", "True", "1"),
-            # 必要に応じて項目を増やす
-            "_raw": r,
-        })
-    return recipients
+if __name__ == "__main__":
+    # 手元確認用
+    try:
+        rs = fetch_recipients()
+        print(rs)
+    except Exception as e:
+        logging.exception("fetch_recipients failed: %r", e)
+        raise
