@@ -6,3 +6,7 @@ pandas
 lxml
 gspread==6.1.4
 google-auth==2.31.0
+google-api-python-client
+google-auth
+google-auth-httplib2
+google-auth-oauthlib
