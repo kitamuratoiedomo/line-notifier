@@ -1,114 +1,137 @@
 # odds_client.py
-# インターフェイス確定版（まずはImportErrorを解消し、main.pyから利用できる形）
-# 1) list_today_raceids(): 今日監視するレースID一覧を返す
-# 2) fetch_tanfuku_odds(race_id): レースの単勝/複勝オッズと出走表（最低限）を返す
-#
-# 現状：
-# - 本番スクレイピングは未実装。まずは環境変数からレースIDを受け取り、
-#   テスト用ダミーデータ or 将来の実装差し替えポイントを提供。
-#
-# 将来差し替え：
-# - 楽天等からの実オッズ取得を、このファイルの内部に実装して置き換えるだけでOK。
-# - 関数の返り値フォーマットは崩さないこと。
-
-from __future__ import annotations
-import os
 import re
 import time
+import logging
 from typing import List, Dict, Any, Optional
+from datetime import datetime, timezone, timedelta
+import os
 
+import requests
+from bs4 import BeautifulSoup
 
-def _split_ids(s: str) -> List[str]:
-    return [x.strip() for x in re.split(r"[,\s]+", s) if x.strip()]
+JST = timezone(timedelta(hours=9))
 
+HEADERS = {
+    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+}
+
+def _get(url: str, timeout: int = 12) -> str:
+    r = requests.get(url, headers=HEADERS, timeout=timeout)
+    r.raise_for_status()
+    # 楽天は UTF-8
+    r.encoding = r.apparent_encoding or "utf-8"
+    return r.text
 
 def list_today_raceids() -> List[str]:
     """
-    監視対象レースIDの一覧を返す。
-    まずは環境変数から渡す方式：
-      - RACEIDS: "KAWASAKI-3R, FUNABASHI-7R" のようにカンマ区切り/空白区切りOK
-      - RACEID: 1個だけ渡す場合
-    何もなければ空配列を返す（本番スクレイピング未実装のため）。
+    簡易版：環境変数 RACEIDS にカンマ区切りで race_id を渡しておく想定。
+    例）RACEIDS=202508073601090301,202508072726110201
     """
-    s = os.getenv("RACEIDS") or os.getenv("RACEID") or ""
-    ids = _split_ids(s)
+    env = os.getenv("RACEIDS", "").strip()
+    if not env:
+        logging.info("RACEIDS が未設定のため、レース列挙をスキップ")
+        return []
+    ids = [x.strip() for x in env.split(",") if x.strip()]
     return ids
 
-
-def fetch_tanfuku_odds(race_id: str) -> Dict[str, Any]:
+def _parse_tanfuku_table(html: str) -> List[Dict[str, Any]]:
     """
-    指定レースの最小限データを返す。返却フォーマットの例：
-    {
-      "race_id": "KAWASAKI-3R",
-      "venue": "川崎",
-      "race_no": "3R",
-      "start_at_iso": "2025-08-09T10:37:00+09:00",
-      "entries": [
-        {"num": "1", "horse": "ホースA", "jockey": "矢野貴之", "win": 2.8, "place": 1.4, "pop": 1},
-        ...
-      ]
-    }
-
-    現状はテスト用のダミーデータを返す。
-    - 本番化する時は、この関数内部で楽天等からHTML/JSONを取得 → パースして
-      上記フォーマットで返すように差し替える。
+    単勝オッズ表から [ {umaban:int, odds:float}, ... ] を抽出。
+    人気順は odds 昇順で擬似決定（同値はそのままの順）。
     """
-    # ---- ここから先はダミー（テスト通知を動かすための最低限） ----
-    # race_id からそれっぽく venue/race_no を作る（"KAWASAKI-3R" 形式想定）
-    venue = race_id.split("-")[0] if "-" in race_id else "川崎"
-    race_no = race_id.split("-")[1] if "-" in race_id and len(race_id.split("-")) >= 2 else "3R"
+    soup = BeautifulSoup(html, "html.parser")
 
-    # 開始時刻：今から +30分 を仮設定（ISO8601 / JST）
-    # ※ 実オッズ導入時は、サイトから正確な発走時刻を取って入れてください
-    start_at_iso = _in_30min_iso()
+    # 1) テーブル探索（クラス名は変わりやすいので柔軟に）
+    # “単勝”の文字が近くにあるtableを優先
+    tables = soup.find_all("table")
+    candidates = []
+    for t in tables:
+        txt = (t.get_text(" ", strip=True) or "")
+        if "単勝" in txt:
+            candidates.append(t)
+    if not candidates and tables:
+        candidates = tables
 
-    entries = [
-        # 人気・オッズはテスト用の固定値。戦略判定コードが動く最低限の形にしてある。
-        {"num": "1", "horse": "ホースA", "jockey": "矢野貴之", "win": 2.8, "place": 1.4, "pop": 1},
-        {"num": "2", "horse": "ホースB", "jockey": "本田正重", "win": 4.2, "place": 1.9, "pop": 2},
-        {"num": "3", "horse": "ホースC", "jockey": "笹川翼", "win": 6.5, "place": 2.3, "pop": 3},
-        {"num": "4", "horse": "ホースD", "jockey": "和田譲治", "win": 9.8, "place": 3.0, "pop": 4},
-        {"num": "5", "horse": "ホースE", "jockey": "達城龍次", "win": 12.3, "place": 3.6, "pop": 5},
-    ]
+    rows = []
+    for t in candidates:
+        for tr in t.find_all("tr"):
+            tds = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
+            if len(tds) < 3:
+                continue
+            # よくある並び: [馬番, 馬名, 単勝, 複勝...] など
+            # 馬番（整数）と 単勝（小数 or “—”）を拾う
+            umaban = None
+            odds = None
+
+            # 馬番候補
+            for cell in tds[:2]:  # 先頭2セルに馬番があることが多い
+                m = re.match(r"^\d{1,2}$", cell)
+                if m:
+                    umaban = int(m.group(0))
+                    break
+
+            # 単勝候補（小数 or 整数）
+            for cell in tds:
+                if re.match(r"^\d+(\.\d+)?$", cell):
+                    # オッズにしては妙な巨大値は排除
+                    val = float(cell)
+                    if 1.0 <= val <= 999.9:
+                        odds = val
+                        break
+
+            if umaban is not None and odds is not None:
+                rows.append({"umaban": umaban, "odds": odds})
+
+    # 重複排除＆ソート
+    uniq = {}
+    for r in rows:
+        uniq[r["umaban"]] = r["odds"]
+    out = [{"umaban": k, "odds": v} for k, v in uniq.items()]
+    out.sort(key=lambda x: x["odds"])
+    # 人気番号を付与
+    for i, x in enumerate(out, 1):
+        x["pop"] = i
+    return out
+
+def fetch_tanfuku_odds(race_id: str) -> Optional[Dict[str, Any]]:
+    """
+    単勝ページを取得して馬番×単勝オッズを返す。
+    venue/race_no/start_at はプレースホルダか、分かる範囲で推測。
+    """
+    url = f"https://keiba.rakuten.co.jp/odds/tanfuku/RACEID/{race_id}"
+    try:
+        html = _get(url)
+    except Exception as e:
+        logging.warning("odds取得失敗 %s: %s", race_id, e)
+        return None
+
+    horses = _parse_tanfuku_table(html)
+    if not horses:
+        logging.warning("単勝テーブル抽出に失敗（空） race_id=%s", race_id)
+        return None
+
+    # 画面上から場名やRを拾えれば拾う（簡易）
+    venue = None
+    m = re.search(r"（(.+?)）", html)  # ざっくり
+    if m:
+        venue = m.group(1)
+    if not venue:
+        venue = "地方"
+
+    race_no = None
+    m = re.search(r"(\d{1,2})R", html)
+    if m:
+        race_no = f"{m.group(1)}R"
+    else:
+        race_no = "—R"
+
+    # 発走時刻が拾えないときは「この後10分」で仮置き（本番は別取得）
+    start_at_iso = (datetime.now(JST) + timedelta(minutes=10)).isoformat()
 
     return {
         "race_id": race_id,
-        "venue": _venue_ja(venue),
+        "venue": venue,
         "race_no": race_no,
         "start_at_iso": start_at_iso,
-        "entries": entries,
+        "horses": horses,  # [{umaban, odds, pop}, ...] 人気順
     }
-
-
-# ---------- ヘルパ ----------
-
-def _in_30min_iso() -> str:
-    # JST固定の簡易ISO。依存を増やさないため time モジュールで生成
-    # 実オッズ時は正確時刻に差し替え
-    t = time.time() + 30 * 60
-    # 9時間(=32400秒)進めてJSTっぽくする簡易実装
-    jst = t + 9 * 60 * 60
-    lt = time.gmtime(jst)  # UTCとして見た時の構造体
-    return time.strftime("%Y-%m-%dT%H:%M:00+09:00", lt)
-
-
-def _venue_ja(s: str) -> str:
-    # "KAWASAKI" -> "川崎" などの簡易変換。必要に応じて拡張してください。
-    m = {
-        "KAWASAKI": "川崎",
-        "FUNABASHI": "船橋",
-        "OI": "大井",
-        "KASAMATSU": "笠松",
-        "NAGOYA": "名古屋",
-        "MIZUSAWA": "水沢",
-        "MORIOKA": "盛岡",
-        "KOUCHI": "高知",
-        "SONODA": "園田",
-        "HIMEJI": "姫路",
-        "URAWA": "浦和",
-        "SAGAWA": "佐賀",
-        "MONBETSU": "門別",
-        "KANAZAWA": "金沢",
-        "KITA": "北見",
-    }
-    return m.get(s.upper(), s)
