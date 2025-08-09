@@ -74,3 +74,4 @@ def list_raceids_for_date(yyyymmdd: str) -> List[str]:
 
     out = sorted(ids)
     if len(out) > MAX:
+    out = out[:MAX]
