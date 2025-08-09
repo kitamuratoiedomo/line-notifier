@@ -8,6 +8,7 @@ from typing import List, Dict, Any
 from datetime import datetime, timedelta, timezone
 
 import requests
+from jockey_rank import get_jrank
 
 # ====== 設定 ======
 # RenderでDiskを追加し Mount Path を /var/data にしてください
