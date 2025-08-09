@@ -195,3 +195,31 @@ def get_race_start_iso(race_id: str) -> str:
             continue
 
     raise ValueError(f"発走時刻を取得できませんでした: race_id={race_id}")
+    
+    def get_race_title(race_id: str) -> str:
+    """
+    楽天競馬のレースタイトルを取得。
+    例: '佐賀 2R C2-9組'
+    """
+    urls = [
+        f"https://keiba.rakuten.co.jp/race_card/list/RACEID/{race_id}",
+        f"https://keiba.rakuten.co.jp/race/top/RACEID/{race_id}",
+    ]
+    import requests
+    import re
+    for url in urls:
+        try:
+            resp = requests.get(url, timeout=8)
+            if resp.status_code != 200:
+                continue
+            # タイトル部分を正規表現で抽出（<title>や見出しh2など）
+            m = re.search(r"<title>(.+?)\s-\s楽天競馬", resp.text)
+            if m:
+                return m.group(1).strip()
+            # 予備パターン
+            m = re.search(r"<h2[^>]*>(.+?)</h2>", resp.text)
+            if m:
+                return m.group(1).strip()
+        except Exception:
+            continue
+    return "レース名不明"
