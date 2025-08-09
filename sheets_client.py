@@ -1,118 +1,108 @@
 # sheets_client.py
-import os, json, logging
-from typing import List, Dict, Any
+import json
+import os
+import time
+import logging
+from typing import List, Dict, Any, Optional
 
-# google client
-from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
+from google.oauth2.service_account import Credentials
+from googleapiclient.errors import HttpError
 
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
-
-def _load_sa_info() -> Dict[str, Any]:
-    """
-    サービスアカウントJSONを環境変数から読み込む。
-    GOOGLE_CREDENTIALS_JSON か GOOGLE_APPLICATION_CREDENTIALS_JSON のどちらでもOK。
-    """
-    raw = os.getenv("GOOGLE_CREDENTIALS_JSON") or os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON") or ""
-    raw = raw.strip()
-    if not raw:
-        raise RuntimeError("GOOGLE_CREDENTIALS_JSON env is empty")
-    try:
-        # RenderのUIで改行を \n として入れている前提
-        return json.loads(raw)
-    except Exception as e:
-        # もし誤って実ファイルパスを入れてしまった時も拾えるように
-        if os.path.exists(raw):
-            with open(raw, "r", encoding="utf-8") as f:
-                return json.load(f)
-        raise RuntimeError(f"Invalid SA JSON in env: {e!r}")
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "")
+RECIPIENTS_TAB = os.getenv("GOOGLE_SHEET_TAB", "フォームの回答1")
+SENT_LOG_TAB = os.getenv("SENT_LOG_TAB", "sent_log")
 
 def _build_service():
-    info = _load_sa_info()
+    creds_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON", "").strip()
+    if not creds_json:
+        raise RuntimeError("GOOGLE_APPLICATION_CREDENTIALS_JSON env is empty")
+    info = json.loads(creds_json)
     creds = Credentials.from_service_account_info(info, scopes=SCOPES)
-    # cache_discovery=False で App Engine / serverless の不具合を回避
     return build("sheets", "v4", credentials=creds, cache_discovery=False)
-
-def _pick(value: str) -> str:
-    return (value or "").strip()
-
-def _to_bool(s: str) -> bool:
-    s = (s or "").strip().lower()
-    return s in ("1","true","on","yes","有効","通知on","通知オン","○")
 
 def fetch_recipients() -> List[Dict[str, Any]]:
     """
-    受信者一覧をスプレッドシートから取得して標準化して返す。
-    想定するヘッダはいずれか（列名は大小/全角半角ゆるめ判定）:
-
-    A) シンプル表:
-       name | userId | enabled
-    B) Googleフォーム出力っぽい表:
-       タイムスタンプ | 表示名 | LINEユーザーID | 通知ON
-
-    返却: [{ "name": "...", "userId": "...", "enabled": True/False }, ...]
+    受信者シート（フォーム出力想定）から有効な userId を取り出す。
+    想定列例:
+      - 有効フラグ: enabled（'1' または TRUE）/ 無しは無効
+      - LINEのユーザーID: userId
+    既存シート列名に合わせて調整してください。
     """
-    sheet_id = os.getenv("GOOGLE_SHEET_ID", "").strip()
-    tab = os.getenv("GOOGLE_SHEET_TAB", "").strip()
-    if not sheet_id or not tab:
-        raise RuntimeError("GOOGLE_SHEET_ID or GOOGLE_SHEET_TAB missing")
-
-    service = _build_service()
-    rng = f"'{tab}'!A:Z"
-    resp = service.spreadsheets().values().get(
-        spreadsheetId=sheet_id, range=rng
-    ).execute()
-
-    values = resp.get("values", [])
-    if not values:
+    try:
+        service = _build_service()
+        rng = f"'{RECIPIENTS_TAB}'!A1:Z1000"
+        res = service.spreadsheets().values().get(spreadsheetId=SHEET_ID, range=rng).execute()
+        values = res.get("values", [])
+        if not values:
+            return []
+        header = [c.strip() for c in values[0]]
+        out = []
+        for row in values[1:]:
+            rec = {header[i]: (row[i] if i < len(row) else "") for i in range(len(header))}
+            enabled = str(rec.get("enabled", "")).strip().lower() in ("1","true","yes","on")
+            uid = str(rec.get("userId", "")).strip()
+            out.append({"enabled": enabled, "userId": uid})
+        return out
+    except Exception as e:
+        logging.warning("fetch_recipients failed: %s", e)
         return []
 
-    header = [str(h).strip() for h in values[0]]
-    body = values[1:]
-
-    # 列インデックス探索（ゆるふわマッチ）
-    def idx(keys):
-        for i, h in enumerate(header):
-            hs = h.replace(" ", "").lower()
-            for k in keys:
-                if k in hs:
-                    return i
-        return -1
-
-    # A) シンプル系
-    i_name   = idx(["name","表示名"])
-    i_user   = idx(["userid","user_id","lineユーザーid","lineユーザid","lineid"])
-    i_enable = idx(["enabled","有効","通知on","通知オン"])
-
-    # どれか足りなければ、フォームっぽい想定で再探査
-    if i_user < 0:
-        # よくあるフォーム列名
-        i_user = idx(["lineユーザーid","lineユーザid","userid","lineid"])
-
-    out = []
-    for row in body:
-        # 配列長が足りないセルは空に
-        name   = _pick(row[i_name])   if 0 <= i_name   < len(row) else ""
-        userId = _pick(row[i_user])   if 0 <= i_user   < len(row) else ""
-        enabled_s = _pick(row[i_enable]) if 0 <= i_enable < len(row) else ""
-
-        # enabled 列が存在しなければ既定 True（フォームでスイッチ置かない運用向け）
-        enabled = _to_bool(enabled_s) if i_enable >= 0 else True
-
-        if not userId:
-            continue
-        out.append({"name": name or userId, "userId": userId, "enabled": enabled})
-
-    logging.info("シートから有効受信者=%d: %s",
-                 sum(1 for r in out if r["enabled"]),
-                 [r["userId"] for r in out if r["enabled"]])
-    return out
-
-if __name__ == "__main__":
-    # 手元確認用
+def ensure_sent_log_sheet() -> None:
+    """ sent_log タブが無ければ作成し、ヘッダを書く """
     try:
-        rs = fetch_recipients()
-        print(rs)
+        service = _build_service()
+        meta = service.spreadsheets().get(spreadsheetId=SHEET_ID).execute()
+        sheets = [s["properties"]["title"] for s in meta.get("sheets", [])]
+        if SENT_LOG_TAB not in sheets:
+            # 追加
+            body = {
+                "requests": [{
+                    "addSheet": {"properties": {"title": SENT_LOG_TAB}}
+                }]
+            }
+            service.spreadsheets().batchUpdate(spreadsheetId=SHEET_ID, body=body).execute()
+            # ヘッダ
+            header = [["sent_key", "race_id", "strategy", "sale_close_iso", "created_at"]]
+            service.spreadsheets().values().update(
+                spreadsheetId=SHEET_ID,
+                range=f"'{SENT_LOG_TAB}'!A1:E1",
+                valueInputOption="RAW",
+                body={"values": header}
+            ).execute()
+    except HttpError as he:
+        logging.warning("ensure_sent_log_sheet http error: %s", he)
     except Exception as e:
-        logging.exception("fetch_recipients failed: %r", e)
-        raise
+        logging.warning("ensure_sent_log_sheet failed: %s", e)
+
+def already_sent(sent_key: str) -> bool:
+    """ sent_log に同じ sent_key があるか """
+    try:
+        service = _build_service()
+        rng = f"'{SENT_LOG_TAB}'!A2:A100000"
+        res = service.spreadsheets().values().get(spreadsheetId=SHEET_ID, range=rng).execute()
+        vals = res.get("values", [])
+        for row in vals:
+            if row and row[0].strip() == sent_key:
+                return True
+        return False
+    except Exception as e:
+        logging.warning("already_sent failed (treat as not sent): %s", e)
+        return False
+
+def append_sent_log(race_id: str, strategy: str, sale_close_iso: str, sent_key: str) -> None:
+    """ 送信後に1行追加 """
+    try:
+        service = _build_service()
+        now = time.strftime("%Y-%m-%dT%H:%M:%S")
+        row = [[sent_key, race_id, strategy, sale_close_iso, now]]
+        service.spreadsheets().values().append(
+            spreadsheetId=SHEET_ID,
+            range=f"'{SENT_LOG_TAB}'!A:E",
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={"values": row}
+        ).execute()
+    except Exception as e:
+        logging.warning("append_sent_log failed: %s", e)
