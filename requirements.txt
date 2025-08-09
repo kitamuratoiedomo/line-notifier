@@ -4,3 +4,5 @@ python-dateutil==2.9.0.post0
 pytz==2024.1
 pandas
 lxml
+gspread==6.1.4
+google-auth==2.31.0
