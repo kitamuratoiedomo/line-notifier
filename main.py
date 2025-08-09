@@ -1,289 +1,361 @@
 # main.py
 import os
 import json
+import time
 import logging
+import socket
 from pathlib import Path
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta, timezone
 
-from odds_client import (
-    fetch_tanfuku_odds,   # 単勝オッズ {horses:[{umaban,odds,pop}], venue, race_no, start_at_iso, ...}
-    list_today_raceids,   # 監視レースID列挙（env RACEIDS 推奨）
-)
-from jockey_rank import get_jockey_map
-from notify_line import send_line
+import requests
 
+# ====== オプション依存（存在しなければフォールバック） ======
+# Sheetsクライアント（複数宛先）
+USE_SHEET = os.getenv("USE_SHEET", "1") == "1"
+SHEET_AVAILABLE = False
+try:
+    if USE_SHEET:
+        from sheets_client import fetch_recipients  # -> List[Dict]: {userId, enabled(bool), name?}
+        SHEET_AVAILABLE = True
+except Exception as e:
+    logging.warning("sheets_client を読み込めませんでした（単一宛先にフォールバック）: %s", e)
+    SHEET_AVAILABLE = False
+
+# オッズ・レース情報
+from odds_client import (
+    list_today_raceids,       # -> List[str]
+    fetch_tanfuku_odds,       # -> Dict{race_id, venue, race_no, start_at_iso, horses:[{pop, umaban, odds}]}
+    get_race_start_iso,       # -> "YYYY-MM-DDTHH:MM:SS+09:00"
+)
+
+# 騎手ランク（戦略③は1番人気のみ表示。それ以外は1〜3番人気）
+try:
+    from jockey_rank import get_jrank  # -> "A" / "B" / "C" / "—"
+except Exception:
+    def get_jrank(_: str) -> str:
+        return "—"  # 名前が取れない環境でも落ちないように
+
+
+# ====== 環境変数・基本設定 ======
+NOTIFIED_PATH = Path(os.getenv("NOTIFIED_PATH", "/tmp/notified_races.json"))
+NOTIFIED_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+LINE_ACCESS_TOKEN = os.getenv("LINE_ACCESS_TOKEN", "").strip()
+LINE_USER_ID      = os.getenv("LINE_USER_ID", "").strip()
+
+# 送信制御
+KILL_SWITCH = os.getenv("NOTIFY_ENABLED", "1") != "1"           # 1で有効、0で停止
+DRY_RUN     = os.getenv("DRY_RUN_MESSAGE", "0") == "1"          # 1で送らずログのみ
+
+# 通知時間窓（販売締切時刻＝発走時刻 − CUTOFF_OFFSET_MIN を基準）
+# 例: 販売締切5分前に通知したい → CUTOFF_OFFSET_MIN=5, WINDOW_BEFORE_MIN=5, WINDOW_AFTER_MIN=0 など
+CUTOFF_OFFSET_MIN = int(os.getenv("CUTOFF_OFFSET_MIN", "5"))    # 販売締切 = 発走 − 5分（デフォルト）
+WINDOW_BEFORE_MIN = int(os.getenv("WINDOW_BEFORE_MIN", "5"))    # 締切のX分前から
+WINDOW_AFTER_MIN  = int(os.getenv("WINDOW_AFTER_MIN", "0"))     # 締切のY分後まで
+
+# ログ
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 JST = timezone(timedelta(hours=9))
 
-# ===== env =====
-NOTIFIED_PATH = os.getenv("NOTIFIED_PATH", "/tmp/notified_races.json")
-WINDOW_BEFORE_MIN = int(os.getenv("WINDOW_BEFORE_MIN", "5"))  # 販売締切5分前“想定”
-WINDOW_AFTER_MIN  = int(os.getenv("WINDOW_AFTER_MIN", "0"))
-KILL_SWITCH = os.getenv("KILL_SWITCH", "False").lower() == "true"
-DRY_RUN = os.getenv("DRY_RUN", "False").lower() == "true"
-TEST_HOOK = os.getenv("TEST_HOOK", "0") in ("1", "true", "True")
-SHEET_ENABLED = os.getenv("SHEET", "True").lower() == "true"
-LINE_FALLBACK_USER = os.getenv("LINE_USER_ID", "").strip()
 
-# ===== logging =====
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
-
-# ===== util =====
-def _now() -> datetime:
+# ============ ユーティリティ ============
+def now_jst() -> datetime:
     return datetime.now(JST)
 
-def load_notified() -> Dict[str, str]:
-    p = Path(NOTIFIED_PATH)
-    if not p.exists():
-        return {}
+def _load_notified() -> Dict[str, Any]:
+    if NOTIFIED_PATH.exists():
+        try:
+            return json.loads(NOTIFIED_PATH.read_text())
+        except Exception as e:
+            logging.warning("通知済みファイル読み込み失敗: %s", e)
+            return {}
+    return {}
+
+def _save_notified(obj: Dict[str, Any]) -> None:
     try:
-        return json.loads(p.read_text())
-    except Exception:
-        return {}
-
-def save_notified(d: Dict[str, str]) -> None:
-    p = Path(NOTIFIED_PATH)
-    p.write_text(json.dumps(d, ensure_ascii=False))
-
-def within_window(sale_close_iso: str) -> bool:
-    """
-    「販売締切（想定）」のISO時刻を基準に、[ -WINDOW_BEFORE, +WINDOW_AFTER ] に
-    現在時刻が入っているかどうか。
-    取得できない場合は False。
-    """
-    try:
-        tgt = datetime.fromisoformat(sale_close_iso)
-    except Exception:
-        return False
-    now = _now()
-    return (tgt - timedelta(minutes=WINDOW_BEFORE_MIN)) <= now <= (tgt + timedelta(minutes=WINDOW_AFTER_MIN))
-
-# ===== strategy judgement =====
-def _sort_horses(horses: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    hs = [dict(h) for h in horses]
-    hs.sort(key=lambda x: x["odds"])
-    for i, h in enumerate(hs, 1):
-        h["pop"] = i
-    return hs
-
-def judge_strategies(horses: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    4戦略の一致を返す。
-    return: [{code:'S1'|'S2'|'S3'|'S4', picks: {...}} ...]
-    """
-    h = _sort_horses(horses)
-    if len(h) < 3:
-        return []
-
-    res = []
-
-    # ① 1〜3人気 三連単BOX（6点）
-    # 1番人気:2.0〜10.0, 2〜3番人気<10.0, 4番人気>=15.0
-    if (2.0 <= h[0]["odds"] <= 10.0) and (h[1]["odds"] < 10.0) and (h[2]["odds"] < 10.0) and (len(h) >= 4 and h[3]["odds"] >= 15.0):
-        res.append({"code": "S1", "picks": {"box": [h[0], h[1], h[2]]}})
-
-    # ② 1番人気1着固定 × 2・3番人気（三連単2点）
-    # 1番人気 < 2.0, 2〜3番人気 < 10.0
-    if (h[0]["odds"] < 2.0) and (h[1]["odds"] < 10.0) and (h[2]["odds"] < 10.0):
-        res.append({"code": "S2", "picks": {"first": h[0], "pair": [h[1], h[2]]}})
-
-    # ③ 1着固定 × 10〜20倍流し（相手4頭）
-    # 1番人気 <= 1.5, 相手: 2番人気以下で 10〜20 の馬 から最大4頭
-    cand = [x for x in h[1:] if 10.0 <= x["odds"] <= 20.0]
-    if h[0]["odds"] <= 1.5 and cand:
-        res.append({"code": "S3", "picks": {"first": h[0], "targets": cand[:4]}})
-
-    # ④ 3着固定（3番人気固定）三連単2点
-    # 1・2人気 <= 3.0, 3番人気 6.0〜10.0, 4番人気 >= 15.0
-    if (h[0]["odds"] <= 3.0) and (h[1]["odds"] <= 3.0) and (6.0 <= h[2]["odds"] <= 10.0) and (len(h) >= 4 and h[3]["odds"] >= 15.0):
-        res.append({"code": "S4", "picks": {"third_fixed": h[2], "pair12": [h[0], h[1]]}})
-
-    return res
-
-# ===== format =====
-def _fmt_odds_tag(h: Dict[str, Any]) -> str:
-    return f"#{h['pop']} 単勝:{h['odds']:.1f}"
-
-def _fmt_jockey(h: Dict[str, Any]) -> str:
-    jn = h.get("jockey") or "—"
-    rk = h.get("jrank") or "-"
-    return f"{jn} / Rk:{rk}"
-
-def format_message(hit: Dict[str, Any], meta: Dict[str, str], jockey_policy: str) -> str:
-    """
-    jockey_policy: 'top3'|'top1'
-    """
-    venue = meta.get("venue", "")
-    race_no = meta.get("race_no", "")
-    sale_close = meta.get("sale_close_hhmm", "")
-    rid = meta.get("race_id", "")
-
-    lines = []
-    title = ""
-    if hit["code"] == "S1":
-        title = "【戦略一致】① 1〜3番人気 三連単BOX（6点）"
-        picks = hit["picks"]["box"]
-        lines += [f"設定方法  {race_no}  {venue}（販売締切 {sale_close}）", ""]
-        # 騎手は上位3人気
-        if jockey_policy == "top3":
-            for i, ph in enumerate(picks, 1):
-                lines.append(f"{i}. {_fmt_odds_tag(ph)}  { _fmt_jockey(ph)}")
-    elif hit["code"] == "S2":
-        title = "【戦略一致】② 1番人気1着固定 × 2・3番人気（三連単2点）"
-        f1 = hit["picks"]["first"]
-        a  = hit["picks"]["pair"]
-        lines += [f"設定方法  {race_no}  {venue}（販売締切 {sale_close}）", ""]
-        lines.append(f"1着固定：{_fmt_odds_tag(f1)}  {_fmt_jockey(f1)}")
-        for i, ph in enumerate(a, 1):
-            lines.append(f"相手{i}：{_fmt_odds_tag(ph)}  {_fmt_jockey(ph)}")
-    elif hit["code"] == "S3":
-        title = "【戦略一致】③ 1→相手4頭→相手4頭（三連単）"
-        f1 = hit["picks"]["first"]
-        ts = hit["picks"]["targets"]
-        lines += [f"設定方法  {race_no}  {venue}（販売締切 {sale_close}）", ""]
-        lines.append(f"◎ 1頭固定：{_fmt_odds_tag(f1)}  {_fmt_jockey(f1)}")
-        lines.append("○ 候補（最大4頭）")
-        for i, ph in enumerate(ts, 1):
-            lines.append(f"{i}. {_fmt_odds_tag(ph)}")
-    elif hit["code"] == "S4":
-        title = "【戦略一致】④ 3着固定（1番人気×2番人気）-3番人気（三連単2点）"
-        a, b = hit["picks"]["pair12"]
-        c = hit["picks"]["third_fixed"]
-        lines += [f"設定方法  {race_no}  {venue}（販売締切 {sale_close}）", ""]
-        # 騎手は上位3人気
-        lines.append(f"1番人気：{_fmt_odds_tag(a)}  {_fmt_jockey(a)}")
-        lines.append(f"2番人気：{_fmt_odds_tag(b)}  {_fmt_jockey(b)}")
-        lines.append(f"3着固定：{_fmt_odds_tag(c)}  {_fmt_jockey(c)}")
-    else:
-        title = "【戦略】"
-    body = "\n".join(lines)
-    note = "※この通知は『販売締切（発走5分前想定）5分前』基準です。"
-    url = f"https://keiba.rakuten.co.jp/odds/tanfuku/RACEID/{rid}"
-    return f"{title}\n{body}\n{note}\n{url}"
-
-# ===== recipients =====
-def fetch_recipients() -> List[str]:
-    """
-    スプレッドシートから LINE userId の配列を返す。
-    取得失敗時は環境変数 LINE_USER_ID（単一宛）にフォールバック。
-    """
-    try:
-        from sheets_client import fetch_recipients as _fr  # 既存の関数名想定
-        ids = _fr()
-        ids = [x for x in ids if x]
-        if ids:
-            return ids
+        NOTIFIED_PATH.write_text(json.dumps(obj, ensure_ascii=False))
+        logging.info("notified saved: %s (bytes=%d)", NOTIFIED_PATH, NOTIFIED_PATH.stat().st_size)
     except Exception as e:
-        logging.warning("fetch_recipients failed: %s", e)
-    if LINE_FALLBACK_USER:
-        logging.info("フォールバックで単一宛: %s", LINE_FALLBACK_USER[:6] + "…")
-        return [LINE_FALLBACK_USER]
-    return []
+        logging.warning("通知済み保存に失敗: %s", e)
 
-# ===== main flow =====
-def enrich_with_jockey(horses: List[Dict[str, Any]], jmap: Dict[int, Tuple[str, str]]) -> None:
-    for h in horses:
-        umaban = h.get("umaban")
-        if umaban in jmap:
-            jn, rk = jmap[umaban]
-            h["jockey"] = jn
-            h["jrank"] = rk
-        else:
-            h["jockey"] = "—"
-            h["jrank"] = "-"
+def prune_notified(store: Dict[str, Any], keep_date: str) -> Dict[str, Any]:
+    pruned = {k: v for k, v in store.items() if keep_date in k}
+    if len(pruned) != len(store):
+        logging.info("notified pruned: %d -> %d", len(store), len(pruned))
+    return pruned
 
-def main():
-    logging.info("ジョブ開始 host=%s pid=%s", os.getenv("RENDER_INSTANCE_ID","local"), os.getpid())
-    logging.info("NOTIFIED_PATH=%s KILL_SWITCH=%s DRY_RUN=%s SHEET=%s TEST_HOOK=%s",
-                 NOTIFIED_PATH, KILL_SWITCH, DRY_RUN, SHEET_ENABLED, TEST_HOOK)
+def within_window(cutoff_iso: str) -> bool:
+    """
+    cutoff_iso: 販売締切のISO時刻（= 発走時刻 - CUTOFF_OFFSET_MIN 分）
+    """
+    t = datetime.fromisoformat(cutoff_iso)
+    now = now_jst()
+    return (t - timedelta(minutes=WINDOW_BEFORE_MIN)) <= now <= (t + timedelta(minutes=WINDOW_AFTER_MIN))
 
+def hhmm(dt_iso: str) -> str:
+    try:
+        return datetime.fromisoformat(dt_iso).strftime("%H:%M")
+    except Exception:
+        return dt_iso
+
+
+# ============ LINE送信系 ============
+def _push_line(user_id: str, text: str) -> None:
+    if not LINE_ACCESS_TOKEN or not user_id:
+        logging.warning("LINE 環境変数 or user_id 未設定のため送信しません。")
+        return
+    url = "https://api.line.me/v2/bot/message/push"
+    headers = {"Authorization": f"Bearer {LINE_ACCESS_TOKEN}", "Content-Type": "application/json"}
+    payload = {"to": user_id, "messages": [{"type": "text", "text": text}]}
+    r = requests.post(url, headers=headers, json=payload, timeout=10)
+    if r.status_code != 200:
+        logging.warning("LINE送信失敗 user=%s status=%s body=%s", user_id, r.status_code, r.text)
+
+def send_line_message(text: str) -> None:
     if KILL_SWITCH:
-        logging.info("KILL_SWITCH=True のため終了")
+        logging.info("KILL_SWITCH有効のため送信しません。")
+        return
+    if DRY_RUN:
+        logging.info("[DRY RUN] %s", text.replace("\n", " "))
         return
 
+    # シートに受信者がいれば複数送信、なければ単一宛
+    if SHEET_AVAILABLE:
+        try:
+            recs = fetch_recipients()
+            active = [r for r in recs if r.get("enabled") and r.get("userId")]
+        except Exception as e:
+            logging.warning("fetch_recipients failed: %s", e)
+            active = []
+
+        if active:
+            for r in active:
+                _push_line(r["userId"], text)
+                time.sleep(0.15)  # rate-limit 予防
+            logging.info("LINE送信OK（複数宛 %d件）", len(active))
+            return
+
+    # フォールバック（単一宛）
+    if LINE_USER_ID:
+        _push_line(LINE_USER_ID, text)
+        logging.info("LINE送信OK（単一宛）")
+    else:
+        logging.warning("宛先がありません（SHEETもLINE_USER_IDもなし）")
+
+
+# ============ 戦略判定ロジック ============
+def pick_top(horses: List[Dict[str, Any]], n: int) -> List[Dict[str, Any]]:
+    return [h for h in horses if h.get("pop", 999) <= n]
+
+def find_strategy_for_race(od: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    od: fetch_tanfuku_odds の返り値
+        {race_id, venue, race_no, start_at_iso, horses:[{pop, umaban, odds}]}
+    戻り: 一致した戦略 dict or None
+    """
+    horses = od.get("horses", [])
+    if len(horses) < 4:
+        return None
+
+    # 人気別オッズ（存在しなければ大きめの数）
+    def get_odds_by_pop(p: int) -> float:
+        for h in horses:
+            if h.get("pop") == p:
+                return float(h.get("odds", 9999))
+        return 9999.0
+
+    o1, o2, o3, o4 = get_odds_by_pop(1), get_odds_by_pop(2), get_odds_by_pop(3), get_odds_by_pop(4)
+
+    # ---- 戦略① 1〜3番人気 三連単BOX
+    # 1番人気: 2.0〜10.0、2〜3番人気: 10.0未満、4番人気: 15.0以上
+    if (2.0 <= o1 <= 10.0) and (o2 < 10.0) and (o3 < 10.0) and (o4 >= 15.0):
+        nums = [h["umaban"] for h in pick_top(horses, 3)]
+        detail = f"三連単BOX（{nums[0]}-{nums[1]}-{nums[2]}）6点"
+        return {
+            "strategy": "①",
+            "buy_detail": detail,
+            "nums": nums,
+            "note": "1〜3番人気BOX",
+        }
+
+    # ---- 戦略② 1番人気1着固定 × 2・3番人気（三連単）
+    # 1番人気: 2.0未満、2〜3番人気: 10.0未満
+    if (o1 < 2.0) and (o2 < 10.0) and (o3 < 10.0):
+        n1 = [h for h in horses if h["pop"] == 1][0]["umaban"]
+        n2 = [h for h in horses if h["pop"] == 2][0]["umaban"]
+        n3 = [h for h in horses if h["pop"] == 3][0]["umaban"]
+        detail = f"【戦略一致】②\n1着固定（{n1}）- 2,3番人気（{n2},{n3}）三連単2点"
+        return {
+            "strategy": "②",
+            "buy_detail": detail,
+            "nums": [n1, n2, n3],
+            "note": "1人気1着固定×2・3人気",
+        }
+
+    # ---- 戦略③ 1着固定 × 10〜20倍流し（更新版）
+    # 1番人気: 1.5以下、さらに 2番人気オッズ >= 10.0 を条件追加
+    # 相手は「2番人気以下」かつ「10〜20倍」の馬から最大4頭
+    if (o1 <= 1.5) and (o2 >= 10.0):
+        candidates = [h for h in horses if h["pop"] >= 2 and 10.0 <= float(h["odds"]) <= 20.0]
+        if candidates:
+            candidates = candidates[:4]
+            n1 = [h for h in horses if h["pop"] == 1][0]["umaban"]
+            others = [h["umaban"] for h in candidates]
+            # 買い目は「1 → 相手4頭 → 相手4頭」（2・3着入れ替え）最大12点
+            detail = (
+                f"【戦略一致】③\n"
+                f"1着固定（{n1}）- 相手流し（{','.join(map(str, others))}）\n"
+                f"三連単『1→相手→相手』最大12点（相手は10〜20倍から最大4頭）"
+            )
+            return {
+                "strategy": "③",
+                "buy_detail": detail,
+                "nums": [n1] + others,
+                "note": "1着固定×10〜20倍流し（相手最大4頭）",
+            }
+
+    # ---- 戦略④ 3着固定（3番人気固定）三連単 2点
+    # 1・2番人気: 3.0以下、3番人気: 6.0〜10.0、4番人気: 15.0以上
+    if (o1 <= 3.0) and (o2 <= 3.0) and (6.0 <= o3 <= 10.0) and (o4 >= 15.0):
+        n1 = [h for h in horses if h["pop"] == 1][0]["umaban"]
+        n2 = [h for h in horses if h["pop"] == 2][0]["umaban"]
+        n3 = [h for h in horses if h["pop"] == 3][0]["umaban"]
+        # 戦略②と同じフォーマット要望
+        detail = (
+            f"【戦略一致】④\n"
+            f"3着固定　（{n1}×{n2}）- {n3}（３着固定）、三連単2点"
+        )
+        return {
+            "strategy": "④",
+            "buy_detail": detail,
+            "nums": [n1, n2, n3],
+            "note": "3着固定（3番人気固定）",
+        }
+
+    return None
+
+
+def build_message(od: Dict[str, Any], strat: Dict[str, Any],
+                  start_iso: str, cutoff_iso: str) -> str:
+    """
+    通知メッセージ生成
+    ※ 騎手名はデータ元未取得環境でも落ちないよう、省略安全設計
+    """
+    race_url = f"https://keiba.rakuten.co.jp/odds/tanfuku/RACEID/{od['race_id']}"
+    venue = od.get("venue", "地方")
+    race_no = od.get("race_no", "—R")
+    start_hm  = hhmm(start_iso)
+    cutoff_hm = hhmm(cutoff_iso)
+
+    header = f"発走 {start_hm}（販売締切 {cutoff_hm}）"
+    body   = strat["buy_detail"]
+    footer = f"単勝オッズ確認: {race_url}"
+
+    # 騎手表示ルール（省略運用。将来、馬番→騎手名のマップが入れば拡張）
+    # ③は1番人気のみ表示ルールだが、現状は名前ソースがないためスキップ
+    # ①②④は1〜3番人気の騎手表示ルールも同様にスキップ
+
+    return f"{header}\n{body}\n{footer}"
+
+
+# ============ 戦略判定の実行 ============
+def find_strategy_matches() -> List[Dict[str, Any]]:
+    """
+    全レース（list_today_raceids）に対して:
+      - オッズ取得
+      - 発走→販売締切（発走−CUTOFF_OFFSET_MIN）計算
+      - 戦略判定
+      - 1件につき {race_id, start_at_iso, cutoff_at_iso, strategy, message} を返却
+    """
+    results: List[Dict[str, Any]] = []
     race_ids = list_today_raceids()
     if not race_ids:
-        logging.info("RACEIDS が未設定のため、レース列挙をスキップ")
-        return
-
-    notified = load_notified()
-    recipients = fetch_recipients()
+        logging.info("対象レースIDがありません（RACEIDSなどの設定を確認）")
+        return results
 
     for rid in race_ids:
-        info = fetch_tanfuku_odds(rid)
-        if not info or not info.get("horses"):
-            logging.warning("オッズ取得失敗/空 rid=%s", rid)
+        od = fetch_tanfuku_odds(rid)
+        if not od:
             continue
 
-        # 騎手取得（常に試みる）
-        jmap = get_jockey_map(rid)
-        enrich_with_jockey(info["horses"], jmap)
-
-        # 販売締切（想定）時刻（発走時刻しか取れない場合は発走-5分を仮の販売締切とする）
-        sale_close_iso = None
+        # 発走時刻は odds_client 既定 or 正式に取り直し
         try:
-            # 既存 odds_client に sale-close 取得があれば利用（ない場合 except）
-            from odds_client import get_sale_close_iso  # type: ignore
-            sale_close_iso = get_sale_close_iso(rid)
+            start_iso = get_race_start_iso(rid)
         except Exception:
-            pass
-        if not sale_close_iso:
-            try:
-                start_iso = info.get("start_at_iso")
-                if start_iso:
-                    sale_close_iso = (datetime.fromisoformat(start_iso) - timedelta(minutes=5)).isoformat()
-            except Exception:
-                sale_close_iso = None
+            # 取得失敗時はオッズ側の推定を利用
+            start_iso = od.get("start_at_iso")
 
-        if not sale_close_iso or not within_window(sale_close_iso):
-            logging.info("時間窓外のためスキップ: %s %s", rid, sale_close_iso or "N/A")
+        if not start_iso:
             continue
 
-        # 戦略判定
-        hits = judge_strategies(info["horses"])
-        if not hits:
-            logging.info("戦略一致なし（通知なし）")
+        # 販売締切基準（発走−CUTOFF_OFFSET_MIN）
+        cutoff_iso = (datetime.fromisoformat(start_iso) - timedelta(minutes=CUTOFF_OFFSET_MIN)).isoformat()
+
+        strat = find_strategy_for_race(od)
+        if not strat:
             continue
 
-        # 二重送信防止キー：rid + sale_close 'YYYY-MM-DDTHH:MM'
-        key_base = f"{rid}:{(sale_close_iso or '')[:16]}"
-        sent_any = False
+        msg = build_message(od, strat, start_iso=start_iso, cutoff_iso=cutoff_iso)
+        results.append({
+            "race_id": rid,
+            "start_at_iso": start_iso,
+            "cutoff_at_iso": cutoff_iso,
+            "strategy": strat["strategy"],
+            "message": msg,
+        })
 
-        for hit in hits:
-            k = f"{key_base}:{hit['code']}"
-            if notified.get(k):
-                continue
+    return results
 
-            meta = {
-                "venue": info.get("venue",""),
-                "race_no": info.get("race_no",""),
-                "race_id": rid,
-                "sale_close_hhmm": (sale_close_iso or "")[11:16],
-            }
-            # 騎手表示ポリシー
-            policy = "top3" if hit["code"] in ("S1","S4") else ("top1" if hit["code"]=="S3" else "top3")
-            msg = format_message(hit, meta, policy)
 
-            if DRY_RUN or not recipients:
-                logging.info("[DRY] would send to %d users: %s", len(recipients), hit["code"])
-            else:
-                try:
-                    send_line(msg, recipients)
-                    sent_any = True
-                    logging.info("LINE送信OK（%d宛）", len(recipients))
-                except Exception as e:
-                    logging.warning("LINE送信失敗: %s", e)
-                    continue
+# ============ メイン ============
+def main():
+    logging.info("ジョブ開始 host=%s pid=%s", socket.gethostname(), os.getpid())
+    logging.info("NOTIFIED_PATH=%s KILL_SWITCH=%s DRY_RUN=%s SHEET=%s",
+                 NOTIFIED_PATH, KILL_SWITCH, DRY_RUN, SHEET_AVAILABLE)
 
-            notified[k] = _now().isoformat()
+    notified = _load_notified()
+    today = now_jst().strftime("%Y-%m-%d")
+    notified = prune_notified(notified, keep_date=today)
 
-        if sent_any:
-            save_notified(notified)
+    hits = find_strategy_matches()
+    logging.info("HITS=%s", len(hits))
 
+    if not hits:
+        logging.info("戦略一致なし（通知なし）")
+        _save_notified(notified)
+        logging.info("ジョブ終了")
+        return
+
+    for h in hits:
+        race_id   = h.get("race_id", "")
+        strategy  = h.get("strategy", "")
+        cutoff_iso = h.get("cutoff_at_iso", "")
+        start_iso  = h.get("start_at_iso", "")
+
+        # 販売締切の時間窓判定
+        if cutoff_iso and not within_window(cutoff_iso):
+            logging.info("（締切基準）時間窓外のためスキップ: %s %s", race_id, cutoff_iso)
+            continue
+
+        # 日付入り強デデュープキー（同一戦略・同一レース・同一日で1回のみ）
+        key_date = (start_iso or cutoff_iso)[:10] if (start_iso or cutoff_iso) else today
+        key = f"{race_id}|{strategy}|{key_date}"
+        if notified.get(key):
+            logging.info("重複通知を回避: %s", key)
+            continue
+
+        msg = (h.get("message") or "").strip()
+        if not msg:
+            logging.info("message空のためスキップ: %s", key)
+            continue
+
+        send_line_message(msg)
+        notified[key] = int(time.time())
+
+    _save_notified(notified)
     logging.info("ジョブ終了")
+
 
 if __name__ == "__main__":
     main()
