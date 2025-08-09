@@ -135,3 +135,63 @@ def fetch_tanfuku_odds(race_id: str) -> Optional[Dict[str, Any]]:
         "start_at_iso": start_at_iso,
         "horses": horses,  # [{umaban, odds, pop}, ...] 人気順
     }
+    
+# ===== get_race_start_iso =====================================================
+from datetime import datetime, timezone, timedelta
+import re
+
+_JST = timezone(timedelta(hours=9))
+
+def _to_iso_today_hhmm(hhmm: str) -> str:
+    """'HH:MM' を 今日の日付の JST ISO8601 に変換"""
+    today = datetime.now(_JST).strftime("%Y-%m-%d")
+    return f"{today}T{hhmm}:00+09:00"
+
+def get_race_start_iso(race_id: str) -> str:
+    """
+    レースID（例: 202508093230080102）から、JST の ISO8601 文字列を返す。
+    取得順序:
+      1) 既存の社内関数があればそれを利用（get_race_start_time / get_race_info）
+      2) 楽天レースカードを軽量スクレイピングして '発走 HH:MM' を抽出
+    失敗時は ValueError を送出
+    """
+    # 1) 既存関数の利用（プロジェクトによって名称が違う想定）
+    try:
+        _fn = globals().get("get_race_start_time")
+        if callable(_fn):
+            hhmm = _fn(race_id)  # 例: '10:25'
+            if isinstance(hhmm, str) and re.fullmatch(r"\d{1,2}:\d{2}", hhmm):
+                return _to_iso_today_hhmm(hhmm)
+    except Exception:
+        pass
+
+    try:
+        _fn = globals().get("get_race_info")
+        if callable(_fn):
+            info = _fn(race_id) or {}
+            hhmm = (info.get("start_time") or info.get("post_time") or "").strip()
+            if isinstance(hhmm, str) and re.fullmatch(r"\d{1,2}:\d{2}", hhmm):
+                return _to_iso_today_hhmm(hhmm)
+    except Exception:
+        pass
+
+    # 2) 楽天のレースカードでスクレイピング
+    urls = [
+        f"https://keiba.rakuten.co.jp/race_card/list/RACEID/{race_id}",
+        f"https://keiba.rakuten.co.jp/race/top/RACEID/{race_id}",
+    ]
+    pat = re.compile(r"(発走|出走)\s*([0-2]?\d:\d{2})")
+
+    import requests  # ファイル先頭にあるなら自動的にそちらが使われます
+    for url in urls:
+        try:
+            resp = requests.get(url, timeout=8)
+            if resp.status_code != 200:
+                continue
+            m = pat.search(resp.text)
+            if m:
+                return _to_iso_today_hhmm(m.group(2))
+        except Exception:
+            continue
+
+    raise ValueError(f"発走時刻を取得できませんでした: race_id={race_id}")
