@@ -1,14 +1,7 @@
 # main.py
-import os
-import json
-import time
-import logging
-import socket
-from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
-from datetime import datetime, timedelta, timezone
 
-import requests
+
+from odds_client import list_today_raceids, fetch_tanfuku_odds, get_race_start_iso
 
 # ==== 既存モジュール（あなたのリポジトリにある想定） ====
 # - odds_client: レース一覧、単複オッズ、発走時刻ISO
