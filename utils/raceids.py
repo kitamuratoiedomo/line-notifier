@@ -1,4 +1,4 @@
-# utils/raceids.py  — 本日の「地方競馬・全レース」RACEIDを安全取得（検証付き）
+# utils/raceids.py — 本日の「地方競馬・全レース」RACEIDを安全取得（厳密検証）
 from __future__ import annotations
 
 import re
@@ -12,7 +12,7 @@ from bs4 import BeautifulSoup
 
 # ===== 時刻・HTTP =====
 JST = dt.timezone(dt.timedelta(hours=9))
-USER_AGENT = "Mozilla/5.0 (compatible; LocalKeibaNotifier/1.2)"
+USER_AGENT = "Mozilla/5.0 (compatible; LocalKeibaNotifier/1.3)"
 HEADERS = {"User-Agent": USER_AGENT}
 
 def _session(timeout: int = 10) -> requests.Session:
@@ -73,13 +73,21 @@ def _maybe_filter_today(ids: Iterable[str], today: str) -> Set[str]:
     today_ids = {i for i in ids if i.startswith(today)}
     return today_ids if today_ids else set(ids)
 
-# ===== オッズページの有無を検証 =====
-_TANFUKU_NUM_RE = re.compile(r"\b\d+\.\d\b")  # 例: 1.2 / 12.3
+# ===== 単勝オッズページの「準備完了」判定 =====
+# 数字検出（少数1〜2桁対応）
+_ODDS_NUM = re.compile(r"\b\d{1,3}\.\d{1,2}\b")
 
-def _has_tanfuku(sess: requests.Session, rid: str) -> bool:
+_BLOCK_WORDS = (
+    "発売前", "発売は締め切りました", "オッズ情報はありません",
+    "ただいま集計中", "投票は締め切りました"
+)
+
+def _is_tanfuku_ready(sess: requests.Session, rid: str) -> bool:
     """
-    単勝オッズページが実体を持つか簡易検証。
-    - 200系かつ本文に「単勝」テキストがあり、かつ少なくとも1つの小数オッズが見える
+    単勝オッズページが実体を持ち、表が埋まっているかを判定。
+    - ブロック語（発売前/締切/未提供/集計中）が含まれていたら不可
+    - '単勝' か '単勝オッズ' を含み、本文にオッズらしき数値が複数（>=3）ある
+    - <table> が1つ以上
     """
     url = f"https://keiba.rakuten.co.jp/odds/tanfuku/RACEID/{rid}"
     try:
@@ -87,9 +95,16 @@ def _has_tanfuku(sess: requests.Session, rid: str) -> bool:
         if not r.ok or not r.text:
             return False
         text = r.text
-        if "単勝" not in text:
+        for w in _BLOCK_WORDS:
+            if w in text:
+                return False
+        if ("単勝" not in text) and ("単勝オッズ" not in text):
             return False
-        if not _TANFUKU_NUM_RE.search(text):
+        nums = _ODDS_NUM.findall(text)
+        if len(nums) < 3:
+            return False
+        soup = BeautifulSoup(text, "html.parser")
+        if not soup.find_all("table"):
             return False
         return True
     except Exception:
@@ -99,7 +114,7 @@ def _has_tanfuku(sess: requests.Session, rid: str) -> bool:
 def get_all_local_race_ids_today() -> List[str]:
     """
     トップ/一覧 → 開催日配下 → detail/odds をたどって候補を収集。
-    最後に “単勝オッズページが存在するIDのみ” に絞り込んで返す。
+    最後に “単勝オッズページが **準備完了** のIDのみ” に絞り込んで返す。
     """
     today = dt.datetime.now(JST).strftime("%Y%m%d")
     entry_urls = [
@@ -141,12 +156,11 @@ def get_all_local_race_ids_today() -> List[str]:
         if re.fullmatch(r"\d{18,}", i) and not _is_meeting_id(i)
     })
 
-    # 6) **ここが肝**: 単勝オッズページの実体チェックで最終フィルタ
+    # 6) **準備完了チェック**で最終フィルタ
     validated: List[str] = []
     for rid in cleaned:
-        if _has_tanfuku(sess, rid):
+        if _is_tanfuku_ready(sess, rid):
             validated.append(rid)
-        # 優しめにスロットル（サイト負荷軽減）
-        time.sleep(0.08)
+        time.sleep(0.08)  # サイト負荷配慮
 
     return validated
