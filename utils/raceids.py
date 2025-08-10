@@ -1,5 +1,5 @@
 # utils/raceids.py — 本日の「地方競馬・全レース」RACEIDを安全取得
-# v1.8: tanfuku(単勝)の表だけでなく、race/detail の「発売中/投票/締切」でも発売中判定する
+# v1.9: 会場一覧(list)で「投票」リンクを一次判定 + detailの締切/発走/投票ヒントで発売中補完
 from __future__ import annotations
 
 import re
@@ -13,7 +13,7 @@ from bs4 import BeautifulSoup
 
 # ===== 時刻・HTTP =====
 JST = dt.timezone(dt.timedelta(hours=9))
-USER_AGENT = "Mozilla/5.0 (compatible; LocalKeibaNotifier/1.8)"
+USER_AGENT = "Mozilla/5.0 (compatible; LocalKeibaNotifier/1.9)"
 HEADERS = {"User-Agent": USER_AGENT}
 
 def _session(timeout: int = 10) -> requests.Session:
@@ -52,8 +52,10 @@ def _extract_ids_from_html(html: str) -> Set[str]:
         href = a["href"]
         for pat in RACE_LINK_PATTERNS:
             m = pat.search(href)
-            if m: ids.add(m.group(1))
-    for pat in RACE_LINK_PATTERNS:  # 保険で本文も走査
+            if m:
+                ids.add(m.group(1))
+    # 本文保険
+    for pat in RACE_LINK_PATTERNS:
         ids |= set(pat.findall(html))
     return {i for i in ids if re.fullmatch(r"\d{18,}", i)}
 
@@ -69,8 +71,9 @@ def _maybe_filter_today(ids: Iterable[str], today: str) -> Set[str]:
     today_ids = {i for i in ids if i.startswith(today)}
     return today_ids if today_ids else set(ids)
 
-# ===== 発売中判定（tanfuku HTML / detail HTML の二段構え） =====
+# ===== 発売中判定（list/detail/tanfuku の三段構え） =====
 _ODDS_NUM = re.compile(r"\b\d{1,3}\.\d{1,2}\b")
+_TIME_PAT = re.compile(r"\b(?:[01]?\d|2[0-3]):[0-5]\d\b")  # 14:53 のような時刻
 _PLACEHOLDER = {"--", "—", "-", "0.0", "0", ""}
 
 BLOCK_WORDS_COMMON = (
@@ -79,35 +82,44 @@ BLOCK_WORDS_COMMON = (
     "オッズ情報はありません", "発売中止",
 )
 
-def _table_ready_check(html: str) -> bool:
-    soup = BeautifulSoup(html, "html.parser")
-    tables = soup.find_all("table")
-    if not tables: return False
-    # '単勝' 含むテーブルを優先
-    target = None
-    for tb in tables:
-        if "単勝" in tb.get_text() or "単勝オッズ" in tb.get_text():
-            target = tb; break
-    if target is None: target = tables[0]
+def _list_page_open_ids(sess: requests.Session, meeting_id: str) -> Set[str]:
+    """
+    会場一覧 (race_card/list/RACEID/{meeting_id}) から
+    “投票”リンク/ボタンに紐づく RACEID を優先抽出。
+    """
+    url = f"https://keiba.rakuten.co.jp/race_card/list/RACEID/{meeting_id}"
+    ids: Set[str] = set()
+    try:
+        r = sess.get(url)
+        if not r.ok or not r.text: return ids
+        soup = BeautifulSoup(r.text, "html.parser")
 
-    rows = target.find_all("tr")
-    data_rows = [tr for tr in rows if len(tr.find_all("td")) >= 2]
-    if len(data_rows) < 4:  # 会場により頭数少のことがあるため 6→4 に緩和
-        return False
+        # aタグのテキストやボタン周辺に「投票」「オッズ」があるリンクを抽出
+        for a in soup.find_all("a", href=True):
+            txt = a.get_text(strip=True)
+            href = a["href"]
+            m = None
+            for pat in RACE_LINK_PATTERNS:
+                m = pat.search(href)
+                if m: break
+            if not m: continue
+            rid = m.group(1)
+            if not re.fullmatch(r"\d{18,}", rid): continue
 
-    numeric_cells, placeholder_cells = 0, 0
-    for tr in data_rows:
-        for td in tr.find_all("td"):
-            txt = td.get_text(strip=True)
-            if _ODDS_NUM.fullmatch(txt): numeric_cells += 1
-            elif txt in _PLACEHOLDER: placeholder_cells += 1
+            # “投票”“オッズ”という語、もしくはボタン風クラス名で判断
+            cls = " ".join(a.get("class", []))
+            neighbor = (a.find_next(string=True) or "") if not txt else ""
+            if ("投票" in txt or "オッズ" in txt or
+                "btn" in cls or "vote" in cls or "odds" in cls or
+                ("投票" in neighbor) or ("オッズ" in neighbor)):
+                ids.add(rid)
 
-    if numeric_cells < 1:  # 完全ゼロはNG
-        return False
-    total = numeric_cells + placeholder_cells
-    if total > 0 and (placeholder_cells / total) >= 0.7:  # プレースホルダだらけはNG
-        return False
-    return True
+        # もし何も拾えなければ従来の抽出にフォールバック
+        if not ids:
+            ids = _extract_ids_from_html(r.text)
+        return ids
+    except Exception:
+        return ids
 
 def _tanfuku_looks_open(sess: requests.Session, rid: str) -> bool:
     url = f"https://keiba.rakuten.co.jp/odds/tanfuku/RACEID/{rid}"
@@ -117,18 +129,27 @@ def _tanfuku_looks_open(sess: requests.Session, rid: str) -> bool:
         text = r.text
         if any(w in text for w in BLOCK_WORDS_COMMON): return False
         if ("単勝" not in text) and ("単勝オッズ" not in text): return False
-        # 小数が1つでも、かつテーブル検査も通ればOK（JS後描画でもHTMLに残る場合あり）
-        if _ODDS_NUM.search(text) and _table_ready_check(text):
-            return True
-        # ここまででダメなら detail 側へ回す
-        return False
+
+        # 小数が1つ以上 & プレースホルダだらけではない
+        if not _ODDS_NUM.search(text): return False
+        soup = BeautifulSoup(text, "html.parser")
+        nums = 0; ph = 0
+        for td in soup.find_all("td"):
+            t = td.get_text(strip=True)
+            if _ODDS_NUM.fullmatch(t): nums += 1
+            elif t in _PLACEHOLDER: ph += 1
+        if nums == 0: return False
+        total = nums + ph
+        if total > 0 and ph/total >= 0.7: return False
+        return True
     except Exception:
         return False
 
 def _detail_says_open(sess: requests.Session, rid: str) -> bool:
     """
-    race/detail ページに「投票ボタン」「締切」「オッズ更新」などが出ていれば発売中とみなす。
-    一方、BLOCK_WORDS_COMMON があれば除外。
+    race/detail の非JS要素で発売中を推定。
+    - ブロック語が無い
+    - 「投票」「締切」「オッズ更新」「R番」「発走」「時点」など＋時刻パターンが存在
     """
     url = f"https://keiba.rakuten.co.jp/race/detail/{rid}"
     try:
@@ -137,23 +158,24 @@ def _detail_says_open(sess: requests.Session, rid: str) -> bool:
         text = r.text
         if any(w in text for w in BLOCK_WORDS_COMMON): return False
 
-        # 代表的な発売中の目印
-        OPEN_HINTS = ("投票", "締切", "オッズ", "オッズ更新", "投票する")
-        if any(h in text for h in OPEN_HINTS):
-            return True
-        return False
+        # キーワード＋時刻の組み合わせ
+        HINTS = ("投票", "締切", "オッズ更新", "発走", "R", "時点")
+        has_hint = any(h in text for h in HINTS)
+        has_time = bool(_TIME_PAT.search(text))
+        return has_hint and has_time
     except Exception:
         return False
 
 def _is_open(sess: requests.Session, rid: str) -> bool:
-    # まず tanfuku で判定、ダメなら detail で補完
+    # tanfuku で開いている or detail で開いている → 発売中とみなす
     return _tanfuku_looks_open(sess, rid) or _detail_says_open(sess, rid)
 
 # ===== メイン =====
 def get_all_local_race_ids_today() -> List[str]:
     """
-    トップ/一覧 → 開催日配下 → detail/odds をたどって候補を収集。
-    最後に “発売中（単勝ページ or detailページで確認）” のIDのみ返す。
+    トップ/一覧 → 開催日配下（list）→ detail/odds をたどって候補を収集。
+    - 会場一覧で“投票リンクがある RACEID”を優先抽出
+    - その後、tanfuku/detail で発売中チェック
     """
     today = dt.datetime.now(JST).strftime("%Y%m%d")
     entry_urls = [
@@ -173,19 +195,21 @@ def get_all_local_race_ids_today() -> List[str]:
     meeting_ids = {rid for rid in coarse if _is_meeting_id(rid)}
     race_level: Set[str] = {rid for rid in coarse if not _is_meeting_id(rid)}
 
-    # 3) 開催日ID配下（会場ごとの一覧）から各レースID
-    for mid in list(meeting_ids)[:16]:
-        list_url = f"https://keiba.rakuten.co.jp/race_card/list/RACEID/{mid}"
-        race_level |= _extract_ids_from_url(sess, list_url)
-        time.sleep(0.1)
+    # 3) 会場一覧から “投票リンク有り” の RACEID を優先で収集
+    open_from_list: Set[str] = set()
+    for mid in list(meeting_ids)[:20]:  # 会場多い日も拾えるよう上限↑
+        open_from_list |= _list_page_open_ids(sess, mid)
+        time.sleep(0.08)
+
+    race_level |= open_from_list
 
     # 4) 取りこぼし削減：detail/odds を軽くクロール
-    peek = list(race_level)[:80]
+    peek = list(race_level)[:120]
     for rid in peek:
         for path in (f"https://keiba.rakuten.co.jp/race/detail/{rid}",
                      f"https://keiba.rakuten.co.jp/odds/{rid}"):
             race_level |= _extract_ids_from_url(sess, path)
-            time.sleep(0.08)
+            time.sleep(0.06)
 
     # 5) フォーマット整形（開催日ID除外）
     cleaned = sorted({
@@ -193,7 +217,7 @@ def get_all_local_race_ids_today() -> List[str]:
         if re.fullmatch(r"\d{18,}", i) and not _is_meeting_id(i)
     })
 
-    # 6) 発売中チェック（tanfuku or detail）
+    # 6) 発売中チェック
     validated: List[str] = []
     for rid in cleaned:
         if _is_open(sess, rid):
