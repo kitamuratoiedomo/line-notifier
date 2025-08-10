@@ -12,7 +12,7 @@ from bs4 import BeautifulSoup
 
 # ===== 時刻・HTTP =====
 JST = dt.timezone(dt.timedelta(hours=9))
-USER_AGENT = "Mozilla/5.0 (compatible; LocalKeibaNotifier/1.3)"
+USER_AGENT = "Mozilla/5.0 (compatible; LocalKeibaNotifier/1.4)"
 HEADERS = {"User-Agent": USER_AGENT}
 
 def _session(timeout: int = 10) -> requests.Session:
@@ -41,13 +41,14 @@ RACE_LINK_PATTERNS = [
     re.compile(r"/odds/(?:tanfuku/)?RACEID/(\d{18,})"),
     re.compile(r"/odds/(\d{18,})"),
 ]
-MEETING_SUFFIX = re.compile(r"\d{8}0{10}$")  # 20250810 + 0000000000
-
+# 開催日ID（末尾10桁が0）例: 20250810 + 0000000000
+MEETING_SUFFIX = re.compile(r"\d{8}0{10}$")
 def _is_meeting_id(rid: str) -> bool:
     return bool(MEETING_SUFFIX.fullmatch(rid))
 
 # ===== 抽出ユーティリティ =====
 def _extract_ids_from_html(html: str) -> Set[str]:
+    """HTMLから RACEID 候補を収集（href優先＋本文保険）"""
     ids: Set[str] = set()
     soup = BeautifulSoup(html, "html.parser")
     for a in soup.find_all("a", href=True):
@@ -56,7 +57,7 @@ def _extract_ids_from_html(html: str) -> Set[str]:
             m = pat.search(href)
             if m:
                 ids.add(m.group(1))
-    for pat in RACE_LINK_PATTERNS:  # 念のため本文走査
+    for pat in RACE_LINK_PATTERNS:  # 念のため本文も走査
         ids |= set(pat.findall(html))
     return {i for i in ids if re.fullmatch(r"\d{18,}", i)}
 
@@ -70,23 +71,27 @@ def _extract_ids_from_url(sess: requests.Session, url: str) -> Set[str]:
         return set()
 
 def _maybe_filter_today(ids: Iterable[str], today: str) -> Set[str]:
+    """多くのIDは先頭にYYYYMMDDを含む→当日優先。無ければそのまま返す。"""
     today_ids = {i for i in ids if i.startswith(today)}
     return today_ids if today_ids else set(ids)
 
 # ===== 単勝オッズページの「準備完了」判定 =====
-# 数字検出（少数1〜2桁対応）
+# 小数（1〜3桁.1〜2桁）を複数検出する
 _ODDS_NUM = re.compile(r"\b\d{1,3}\.\d{1,2}\b")
 
+# 発売前・集計中・締切・中止など、除外したい語
 _BLOCK_WORDS = (
-    "発売前", "発売は締め切りました", "オッズ情報はありません",
-    "ただいま集計中", "投票は締め切りました"
+    "発売前", "発売開始前", "ただいま集計中", "集計中",
+    "発売は締め切りました", "投票は締め切りました",
+    "オッズ情報はありません", "発売中止"
 )
 
 def _is_tanfuku_ready(sess: requests.Session, rid: str) -> bool:
     """
     単勝オッズページが実体を持ち、表が埋まっているかを判定。
-    - ブロック語（発売前/締切/未提供/集計中）が含まれていたら不可
-    - '単勝' か '単勝オッズ' を含み、本文にオッズらしき数値が複数（>=3）ある
+    - ブロック語（発売前/締切/未提供/集計中/中止）を含んでいたら不可
+    - '単勝' または '単勝オッズ' を含む
+    - オッズらしき数値が複数（>=3）かつ、全て同一値の羅列ではない
     - <table> が1つ以上
     """
     url = f"https://keiba.rakuten.co.jp/odds/tanfuku/RACEID/{rid}"
@@ -95,17 +100,24 @@ def _is_tanfuku_ready(sess: requests.Session, rid: str) -> bool:
         if not r.ok or not r.text:
             return False
         text = r.text
+
         for w in _BLOCK_WORDS:
             if w in text:
                 return False
         if ("単勝" not in text) and ("単勝オッズ" not in text):
             return False
+
         nums = _ODDS_NUM.findall(text)
         if len(nums) < 3:
             return False
+        # ダミーの同一値（例: 0.0/99.9 のみ等）を弾く
+        if len(set(nums)) == 1:
+            return False
+
         soup = BeautifulSoup(text, "html.parser")
         if not soup.find_all("table"):
             return False
+
         return True
     except Exception:
         return False
@@ -114,7 +126,8 @@ def _is_tanfuku_ready(sess: requests.Session, rid: str) -> bool:
 def get_all_local_race_ids_today() -> List[str]:
     """
     トップ/一覧 → 開催日配下 → detail/odds をたどって候補を収集。
-    最後に “単勝オッズページが **準備完了** のIDのみ” に絞り込んで返す。
+    最後に “単勝オッズページが準備完了” のIDのみ返す。
+    失敗時は空リスト。
     """
     today = dt.datetime.now(JST).strftime("%Y%m%d")
     entry_urls = [
