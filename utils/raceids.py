@@ -1,4 +1,4 @@
-# utils/raceids.py — 本日の「地方競馬・全レース」RACEIDを安全取得（厳密検証）
+# utils/raceids.py — 本日の「地方競馬・全レース」RACEIDを安全取得（厳密検証 v1.5）
 from __future__ import annotations
 
 import re
@@ -12,7 +12,7 @@ from bs4 import BeautifulSoup
 
 # ===== 時刻・HTTP =====
 JST = dt.timezone(dt.timedelta(hours=9))
-USER_AGENT = "Mozilla/5.0 (compatible; LocalKeibaNotifier/1.4)"
+USER_AGENT = "Mozilla/5.0 (compatible; LocalKeibaNotifier/1.5)"
 HEADERS = {"User-Agent": USER_AGENT}
 
 def _session(timeout: int = 10) -> requests.Session:
@@ -78,13 +78,59 @@ def _maybe_filter_today(ids: Iterable[str], today: str) -> Set[str]:
 # ===== 単勝オッズページの「準備完了」判定 =====
 # 小数（1〜3桁.1〜2桁）を複数検出する
 _ODDS_NUM = re.compile(r"\b\d{1,3}\.\d{1,2}\b")
-
 # 発売前・集計中・締切・中止など、除外したい語
 _BLOCK_WORDS = (
     "発売前", "発売開始前", "ただいま集計中", "集計中",
     "発売は締め切りました", "投票は締め切りました",
     "オッズ情報はありません", "発売中止"
 )
+_PLACEHOLDER = {"--", "—", "-", "0.0", "0", ""}
+
+def _table_ready_check(html: str) -> bool:
+    """
+    テーブル行を確認して“発売前の骨格だけ”を排除。
+    - 馬行(tr)の数が十分（>=6）
+    - オッズ数値セルの数が >=3
+    - プレースホルダ（--, 0.0 等）ばかりではない（比率 < 0.5）
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    tables = soup.find_all("table")
+    if not tables:
+        return False
+
+    # '単勝' を含むテーブルを優先。無ければ最初のテーブル。
+    target = None
+    for tb in tables:
+        if "単勝" in tb.get_text() or "単勝オッズ" in tb.get_text():
+            target = tb
+            break
+    if target is None:
+        target = tables[0]
+
+    rows = target.find_all("tr")
+    # 見出しを除いた実データ行の概算（tdが2つ以上あるもの）
+    data_rows = [tr for tr in rows if len(tr.find_all("td")) >= 2]
+    if len(data_rows) < 6:
+        return False
+
+    numeric_cells = 0
+    placeholder_cells = 0
+    for tr in data_rows:
+        for td in tr.find_all("td"):
+            txt = td.get_text(strip=True)
+            if _ODDS_NUM.fullmatch(txt):
+                numeric_cells += 1
+            elif txt in _PLACEHOLDER:
+                placeholder_cells += 1
+
+    if numeric_cells < 3:
+        return False
+
+    total = numeric_cells + placeholder_cells
+    if total > 0 and (placeholder_cells / total) >= 0.5:
+        return False
+
+    return True
 
 def _is_tanfuku_ready(sess: requests.Session, rid: str) -> bool:
     """
@@ -92,7 +138,7 @@ def _is_tanfuku_ready(sess: requests.Session, rid: str) -> bool:
     - ブロック語（発売前/締切/未提供/集計中/中止）を含んでいたら不可
     - '単勝' または '単勝オッズ' を含む
     - オッズらしき数値が複数（>=3）かつ、全て同一値の羅列ではない
-    - <table> が1つ以上
+    - <table> 検査（行数・プレースホルダ比率）に合格
     """
     url = f"https://keiba.rakuten.co.jp/odds/tanfuku/RACEID/{rid}"
     try:
@@ -110,12 +156,10 @@ def _is_tanfuku_ready(sess: requests.Session, rid: str) -> bool:
         nums = _ODDS_NUM.findall(text)
         if len(nums) < 3:
             return False
-        # ダミーの同一値（例: 0.0/99.9 のみ等）を弾く
-        if len(set(nums)) == 1:
+        if len(set(nums)) == 1:  # ダミーの同一値羅列はNG
             return False
 
-        soup = BeautifulSoup(text, "html.parser")
-        if not soup.find_all("table"):
+        if not _table_ready_check(text):
             return False
 
         return True
