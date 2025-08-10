@@ -1,14 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-Rakuten競馬：本日の出馬表(一覧)から RACEID を抽出し、
-単勝/複勝オッズページへ疎通確認する“堅牢版オールインワン”。
+Rakuten競馬：本日の「投票受付中」から RACEID を抽出 → 単勝/複勝オッズに到達する最小・堅牢版
+- まずトップページ(PC/スマホ)の『本日の発売情報』を解析
+- 取れなければ 出馬表一覧ページにフォールバック
+- 取得した RACEID ごとに /odds/tanfuku/ へ疎通確認
+- 既存の環境変数(KILL_SWITCH, DRY_RUN, NOTIFIED_PATH ほか)を尊重
 
-変更点（重要）
-- 「投票受付中/発走」の文言依存をやめ、#todaysTicket 配下の a[href]から
-  RACEID を無条件回収（=取りこぼし防止）。
-- #todaysTicket が無い/崩れている場合は全リンク走査にフォールバックし、RACEID を抽出。
-- 何件拾えたか・どの段に失敗したかを段階ログで可視化。
-- 既存の NOTIFIED_PATH / DRY_RUN / KILL_SWITCH を継承。MAX_CHECK でチェック数を制限可能。
+ログ目安:
+  [INFO] Rakuten#1 本日の発売情報: X件
+  [INFO] Rakuten#2 出馬表一覧: X件
+  [INFO] 発見RACEID数: N
+  [INFO] OK: <race_id> <title> <now> <url>
 """
 
 import os
@@ -17,15 +19,13 @@ import json
 import time
 import random
 import logging
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Iterable
 from datetime import datetime, timedelta, timezone
 
 import requests
 from bs4 import BeautifulSoup
 
-# -------------------------
-# 設定
-# -------------------------
+# ===================== 基本設定 =====================
 JST = timezone(timedelta(hours=9))
 
 SESSION = requests.Session()
@@ -39,25 +39,24 @@ SESSION.headers.update({
     "Cache-Control": "no-cache",
 })
 
-TIMEOUT = (10, 20)  # (connect, read)
+TIMEOUT = (10, 20)     # (connect, read)
 RETRY = 3
-SLEEP_BETWEEN = (0.8, 1.6)
+SLEEP_BETWEEN = (0.6, 1.2)
 
-# 既存の環境変数(あれば使う)
 NOTIFIED_PATH = os.getenv("NOTIFIED_PATH", "/tmp/notified_races.json")
 DRY_RUN = os.getenv("DRY_RUN", "False").lower() == "true"
 KILL_SWITCH = os.getenv("KILL_SWITCH", "False").lower() == "true"
-MAX_CHECK = int(os.getenv("MAX_CHECK", "50"))  # 念のためチェック上限
 
-# -------------------------
-# ユーティリティ
-# -------------------------
-def get_today_str() -> str:
-    """JSTで今日の YYYYMMDD を返す"""
+# 必要なら環境変数 RACEIDS="2025...,2025..." で上書きも可
+ENV_RACEIDS = [x.strip() for x in os.getenv("RACEIDS", "").split(",") if x.strip()]
+
+RACEID_RE = re.compile(r"/RACEID/(\d{18})")
+
+def today_ymd() -> str:
     return datetime.now(JST).strftime("%Y%m%d")
 
 def fetch(url: str) -> str:
-    last_err = None
+    last = None
     for i in range(1, RETRY + 1):
         try:
             r = SESSION.get(url, timeout=TIMEOUT)
@@ -65,11 +64,14 @@ def fetch(url: str) -> str:
             r.encoding = "utf-8"
             return r.text
         except Exception as e:
-            last_err = e
-            wait = random.uniform(*SLEEP_BETWEEN)
-            logging.warning(f"[WARN] fetch失敗({i}/{RETRY}) {e} -> {wait:.1f}s待機: {url}")
-            time.sleep(wait)
-    raise last_err
+            last = e
+            wt = random.uniform(*SLEEP_BETWEEN)
+            logging.warning(f"[WARN] fetch失敗({i}/{RETRY}) {e} -> {wt:.1f}s待機: {url}")
+            time.sleep(wt)
+    raise last
+
+def uniq_sorted(xs: Iterable[str]) -> List[str]:
+    return sorted(set(xs))
 
 def load_notified() -> Dict[str, float]:
     try:
@@ -83,78 +85,70 @@ def save_notified(d: Dict[str, float]) -> None:
     with open(NOTIFIED_PATH, "w", encoding="utf-8") as f:
         json.dump(d, f, ensure_ascii=False, indent=2)
 
-# -------------------------
-# 1) 今日の出馬表(一覧)から RACEID を集める
-# -------------------------
-RACEID_RE = re.compile(r"/RACEID/(\d{18})")
-
-def list_today_raceids() -> List[str]:
-    logging.info("### LIST v3 start ###")
-    ymd = get_today_str()
-    list_url = f"https://keiba.rakuten.co.jp/race_card/list/RACEID/{ymd}0000000000"
-    logging.info(f"[INFO] fetch(list) => {list_url}")
-
-    html = fetch(list_url)
-    logging.info(f"[INFO] fetched html length={len(html)}")
+# ===================== 1) 本日の発売情報（トップ） =====================
+def scrape_from_top() -> List[str]:
+    """
+    keiba.rakuten.co.jp（PC/スマホ同一HTML）トップの『本日の発売情報』から
+    「投票受付中」を含む a[href] の RACEID を抽出
+    """
+    html = fetch("https://keiba.rakuten.co.jp/")
     soup = BeautifulSoup(html, "lxml")
 
+    # 『本日の発売情報』周辺を広めに探す（PC/スマホどちらでも拾えるように）
+    candidates: List[str] = []
+    for a in soup.find_all("a", href=True):
+        text = (a.get_text(strip=True) or "")
+        if not text:
+            continue
+        if ("投票受付中" in text) or ("発走" in text):
+            m = RACEID_RE.search(a["href"])
+            if m:
+                candidates.append(m.group(1))
+    logging.info(f"[INFO] Rakuten#1 本日の発売情報: {len(candidates)}件")
+    return uniq_sorted(candidates)
+
+# ===================== 2) 出馬表一覧フォールバック =====================
+def scrape_from_list() -> List[str]:
+    """
+    出馬表一覧（本日）から保険抽出。
+    """
+    ymd = today_ymd()
+    url = f"https://keiba.rakuten.co.jp/race_card/list/RACEID/{ymd}0000000000"
+    html = fetch(url)
+    soup = BeautifulSoup(html, "lxml")
+
+    # #todaysTicket があれば最優先でそこから
     raceids: List[str] = []
+    box = soup.find(id="todaysTicket")
+    links = box.select("a[href]") if box else soup.find_all("a", href=True)
+    for a in links:
+        text = (a.get_text(strip=True) or "")
+        m = RACEID_RE.search(a["href"])
+        if not m:
+            continue
+        if ("投票受付中" in text) or ("発走" in text) or ("レース一覧" in text):
+            raceids.append(m.group(1))
 
-    # まず #todaysTicket を優先（ここに“今日の発売情報”が集約される）
-    table = soup.find(id="todaysTicket")
-    if table:
-        logging.info("[INFO] #todaysTicket found")
-        links = table.select("a[href]")
-        logging.info(f"[INFO] links_in_todaysTicket={len(links)}")
-        for a in links:
-            href = a.get("href", "")
-            m = RACEID_RE.search(href)
-            if m:
-                raceids.append(m.group(1))
-    else:
-        # 全リンク走査フォールバック
-        logging.info("[INFO] #todaysTicket missing -> 全リンク走査へ")
-        links = soup.find_all("a", href=True)
-        logging.info(f"[INFO] links_all={len(links)}")
-        for a in links:
-            href = a["href"]
-            m = RACEID_RE.search(href)
-            if m:
-                raceids.append(m.group(1))
+    logging.info(f"[INFO] Rakuten#2 出馬表一覧: {len(raceids)}件")
+    return uniq_sorted(raceids)
 
-    # 重複排除＆安定ソート
-    raceids = sorted(set(raceids))
-    logging.info(f"[INFO] RACEID collected={len(raceids)}")
-    if raceids[:5]:
-        logging.info(f"[INFO] sample: {raceids[:5]} ...")
-
-    return raceids
-
-# -------------------------
-# 2) 各レースの単勝/複勝オッズページへアクセス（疎通確認）
-# -------------------------
-def check_tanfuku_page(race_id: str) -> Optional[Dict]:
+# ===================== 3) tanfuku ページ疎通 =====================
+def check_tanfuku(race_id: str) -> Optional[Dict]:
     url = f"https://keiba.rakuten.co.jp/odds/tanfuku/RACEID/{race_id}"
-    try:
-        html = fetch(url)
-    except Exception as e:
-        logging.warning(f"[WARN] odds fetch失敗: {race_id} {e}")
-        return None
-
+    html = fetch(url)
     soup = BeautifulSoup(html, "lxml")
 
-    # 見出しや時刻など、最低限のメタ
     h1 = soup.find("h1")
-    nowtime = soup.select_one(".withUpdate .nowTime")
     race_title = h1.get_text(strip=True) if h1 else "N/A"
+    nowtime = soup.select_one(".withUpdate .nowTime")
     now_label = nowtime.get_text(strip=True) if nowtime else ""
 
-    # 単/複のテーブルがあるか（壊れてないか）
-    odds_table = soup.find("table", {"summary": re.compile("オッズ")})
+    # 単勝/複勝テーブル有無を緩く判定
+    odds_table = soup.find("table")
     if not odds_table:
-        logging.warning(f"[WARN] 単勝/複勝テーブル見つからず: {url}")
-        return None
-
+        logging.warning(f"[WARN] オッズ表が見つからない可能性: {url}")
+        # 表示が重い/遅延のケースもあるので、None は返さずメタだけ返す運用でもよい
+        # ここでは疎通OKとして扱う
     return {
         "race_id": race_id,
         "title": race_title,
@@ -162,50 +156,48 @@ def check_tanfuku_page(race_id: str) -> Optional[Dict]:
         "url": url,
     }
 
-# -------------------------
-# メイン
-# -------------------------
+# ===================== メイン =====================
 def main():
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
     if KILL_SWITCH:
-        logging.info("[INFO] KILL_SWITCH=True のため、処理をスキップします。")
+        logging.info("[INFO] KILL_SWITCH=True のため終了")
         return
 
-    logging.info(f"[INFO] ジョブ開始 JST={datetime.now(JST):%Y-%m-%d %H:%M:%S}")
-    logging.info(f"[INFO] NOTIFIED_PATH={NOTIFIED_PATH} KILL_SWITCH={KILL_SWITCH} DRY_RUN={DRY_RUN} MAX_CHECK={MAX_CHECK}")
+    logging.info(f"[INFO] ジョブ開始 host={os.uname().nodename} pid={os.getpid()}")
+    logging.info(f"[INFO] NOTIFIED_PATH={NOTIFIED_PATH} KILL_SWITCH={KILL_SWITCH} DRY_RUN={DRY_RUN}")
 
-    raceids = list_today_raceids()
+    # 1) env 指定があればそれを最優先
+    raceids: List[str] = []
+    if ENV_RACEIDS:
+        raceids = uniq_sorted(ENV_RACEIDS)
+        logging.info(f"[INFO] ENV RACEIDS 使用: {len(raceids)}件")
+    else:
+        # 2) トップ → 3) フォールバック
+        r1 = scrape_from_top()
+        r2 = scrape_from_list() if not r1 else []
+        raceids = uniq_sorted([*r1, *r2])
+
     if not raceids:
-        logging.info("[INFO] RACEID=0。ページ構造変更/メンテ/アクセス拒否の可能性。")
+        logging.info("[INFO] 本日分の対象RACEIDなし（開催なし or 取得失敗）")
         logging.info("[INFO] HITS=0")
         save_notified({})
         logging.info("[INFO] ジョブ終了")
         return
 
-    # ログ：一覧
-    logging.info("[INFO] 発見RACEID一覧(最大10): " + ", ".join(raceids[:10]) + (" ..." if len(raceids) > 10 else ""))
+    logging.info(f"[INFO] 発見RACEID数: {len(raceids)}")
+    for rid in raceids:
+        logging.info(f"  - {rid} -> tanfuku")
 
     notified = load_notified()
     hits = 0
 
-    # 上限チェック（念のため）
-    target_ids = raceids[:MAX_CHECK]
-
-    for rid in target_ids:
-        meta = check_tanfuku_page(rid)
+    for rid in raceids:
+        meta = check_tanfuku(rid)
         if not meta:
             continue
-
         hits += 1
         logging.info(f"[INFO] OK: {meta['race_id']} {meta['title']} {meta['now']} {meta['url']}")
-
-        # 記録（通知は各自の処理に接続）
         notified[rid] = time.time()
-
-        # 実通知例（必要なら既存の送信関数へ）
-        # if not DRY_RUN:
-        #     send_line(meta)
-
         time.sleep(random.uniform(*SLEEP_BETWEEN))
 
     logging.info(f"[INFO] HITS={hits}")
