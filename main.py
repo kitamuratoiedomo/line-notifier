@@ -1,340 +1,217 @@
-# main.py — RACEIDS自動列挙（env→odds_client→scrape）/ 締切5分前通知 / 重複防止
-import os
-import json
-import time
-import logging
-import socket
-from pathlib import Path
-from typing import List, Dict, Any, Optional
-from datetime import datetime, timedelta, timezone
-
+# main.py
+import os, re, json, time, logging, datetime as dt
+from typing import List, Set
 import requests
 
-# ====== オプション依存（存在しなければフォールバック） ======
-# Sheetsクライアント（複数宛先）
-USE_SHEET = os.getenv("USE_SHEET", "1") == "1"
-SHEET_AVAILABLE = False
-try:
-    if USE_SHEET:
-        from sheets_client import fetch_recipients  # -> List[Dict]: {userId, enabled(bool), name?}
-        SHEET_AVAILABLE = True
-except Exception as e:
-    logging.warning("sheets_client を読み込めませんでした（単一宛先にフォールバック）: %s", e)
-    SHEET_AVAILABLE = False
+# ========== 設定 ==========
+BASE = "https://keiba.rakuten.co.jp"
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 
-# オッズ・レース情報（通常ルート）
-from odds_client import (
-    list_today_raceids,       # -> List[str]
-    fetch_tanfuku_odds,       # -> Dict{race_id, venue, race_no, start_at_iso, horses:[{pop, umaban, odds}]}
-    get_race_start_iso,       # -> "YYYY-MM-DDTHH:MM:SS+09:00"
-)
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": UA, "Accept-Language": "ja,en-US;q=0.9"})
 
-# フォールバック（本日の地方競馬・全RACEID 自動列挙）
-try:
-    from utils.raceids import get_all_local_race_ids_today  # -> List[str]
-    RACEIDS_SCRAPER_AVAILABLE = True
-except Exception as e:
-    logging.warning("utils.raceids が読み込めませんでした（最終フォールバック不可）: %s", e)
-    RACEIDS_SCRAPER_AVAILABLE = False
-
-# 騎手ランク（現状は未使用でも安全に）
-try:
-    from jockey_rank import get_jrank  # -> "A" / "B" / "C" / "—"
-except Exception:
-    def get_jrank(_: str) -> str:
-        return "—"
-
-# ====== 環境変数・基本設定 ======
-NOTIFIED_PATH = Path(os.getenv("NOTIFIED_PATH", "/tmp/notified_races.json"))
-NOTIFIED_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-LINE_ACCESS_TOKEN = os.getenv("LINE_ACCESS_TOKEN", "").strip()
-LINE_USER_ID      = os.getenv("LINE_USER_ID", "").strip()
-
-# 送信制御
-KILL_SWITCH = os.getenv("NOTIFY_ENABLED", "1") != "1"           # 1で有効、0で停止
-DRY_RUN     = os.getenv("DRY_RUN_MESSAGE", "0") == "1"          # 1で送らずログのみ
-
-# 通知時間窓（販売締切＝発走 − CUTOFF_OFFSET_MIN）
-CUTOFF_OFFSET_MIN = int(os.getenv("CUTOFF_OFFSET_MIN", "5"))    # 例: 5
-WINDOW_BEFORE_MIN = int(os.getenv("WINDOW_BEFORE_MIN", "5"))    # 例: 5
-WINDOW_AFTER_MIN  = int(os.getenv("WINDOW_AFTER_MIN", "0"))     # 例: 0
+# 環境変数
+NOTIFIED_PATH = os.getenv("NOTIFIED_PATH", "/tmp/notified_races.json")
+LINE_TOKEN = os.getenv("LINE_NOTIFY_TOKEN", "").strip()
+KILL_SWITCH = os.getenv("KILL_SWITCH", "False") == "True"
+DRY_RUN = os.getenv("DRY_RUN", "False") == "True"
+SHEET = os.getenv("SHEET", "True") == "True"  # 互換のため残すだけ（未使用でもOK）
 
 # ログ
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-# odds_client の内部WARNINGはスキップ（失敗レースは静かに無視）
-logging.getLogger("odds_client").setLevel(logging.ERROR)
-JST = timezone(timedelta(hours=9))
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+log = logging.getLogger(__name__)
 
-# ============ ユーティリティ ============
-def now_jst() -> datetime:
-    return datetime.now(JST)
+# ========== ユーティリティ ==========
+def _get(url: str, max_retry=3, timeout=15) -> str:
+    last = None
+    for i in range(max_retry):
+        r = SESSION.get(url, timeout=timeout)
+        if r.ok and r.text:
+            return r.text
+        last = r
+        time.sleep(1.2 * (i + 1))
+    raise RuntimeError(f"GET失敗: {url} status={getattr(last,'status_code',None)}")
 
-def _load_notified() -> Dict[str, Any]:
-    if NOTIFIED_PATH.exists():
-        try:
-            return json.loads(NOTIFIED_PATH.read_text())
-        except Exception as e:
-            logging.warning("通知済みファイル読み込み失敗: %s", e)
-            return {}
-    return {}
+def jst_now() -> dt.datetime:
+    return dt.datetime.utcnow() + dt.timedelta(hours=9)
 
-def _save_notified(obj: Dict[str, Any]) -> None:
-    try:
-        NOTIFIED_PATH.write_text(json.dumps(obj, ensure_ascii=False))
-        logging.info("notified saved: %s (bytes=%d)", NOTIFIED_PATH, NOTIFIED_PATH.stat().st_size)
-    except Exception as e:
-        logging.warning("通知済み保存に失敗: %s", e)
+# ========== RACEID 抽出ロジック ==========
+def _extract_course_list_ids(top_html: str) -> List[str]:
+    """
+    当日の出馬表トップから『各競馬場の“レース一覧”ページ』のRACEID（…400）を取る
+    """
+    ids: Set[str] = set()
 
-def prune_notified(store: Dict[str, Any], keep_date: str) -> Dict[str, Any]:
-    pruned = {k: v for k, v in store.items() if keep_date in k}
-    if len(pruned) != len(store):
-        logging.info("notified pruned: %d -> %d", len(store), len(pruned))
-    return pruned
+    # race_track 部分のリンク
+    for m in re.finditer(r"/race_card/list/RACEID/(\d{18})", top_html):
+        rid = m.group(1)
+        if rid.endswith("400"):
+            ids.add(rid)
 
-def within_window(cutoff_iso: str) -> bool:
-    t = datetime.fromisoformat(cutoff_iso)
-    now = now_jst()
-    return (t - timedelta(minutes=WINDOW_BEFORE_MIN)) <= now <= (t + timedelta(minutes=WINDOW_AFTER_MIN))
+    # 「本日の発売情報」内の保険リンク
+    for m in re.finditer(
+        r'href="https://keiba\.rakuten\.co\.jp/race_card/list/RACEID/(\d{18})"', top_html
+    ):
+        rid = m.group(1)
+        if rid.endswith("400"):
+            ids.add(rid)
 
-def hhmm(dt_iso: str) -> str:
-    try:
-        return datetime.fromisoformat(dt_iso).strftime("%H:%M")
-    except Exception:
-        return dt_iso
+    return sorted(ids)
 
-# ============ LINE送信系 ============
-def _push_line(user_id: str, text: str) -> None:
-    if not LINE_ACCESS_TOKEN or not user_id:
-        logging.warning("LINE 環境変数 or user_id 未設定のため送信しません。")
-        return
-    url = "https://api.line.me/v2/bot/message/push"
-    headers = {"Authorization": f"Bearer {LINE_ACCESS_TOKEN}", "Content-Type": "application/json"}
-    payload = {"to": user_id, "messages": [{"type": "text", "text": text}]}
-    r = requests.post(url, headers=headers, json=payload, timeout=10)
-    if r.status_code != 200:
-        logging.warning("LINE送信失敗 user=%s status=%s body=%s", user_id, r.status_code, r.text)
+def _extract_race_ids_from_course(course_html: str) -> List[str]:
+    """
+    各場ページから「各RのRACEID（…01〜12）」を抜く
+    links: /race_card/list/RACEID/XXXXXXXXXXXXXX01 など
+           /odds/tanfuku/RACEID/XXXXXXXXXXXXXX01 なども拾ってOK
+    """
+    ids: Set[str] = set()
+    for m in re.finditer(r"/(?:race_card/list|odds/[a-z]+)/RACEID/(\d{18})", course_html):
+        rid = m.group(1)
+        # 末尾が01〜12（各レース本体）だけ採用
+        if re.search(r"\d{16}(0[1-9]|1[0-2])$", rid):
+            ids.add(rid)
+    return sorted(ids)
 
-def send_line_message(text: str) -> None:
-    if KILL_SWITCH:
-        logging.info("KILL_SWITCH有効のため送信しません。")
-        return
-    if DRY_RUN:
-        logging.info("[DRY RUN] %s", text.replace("\n", " "))
-        return
+def list_today_raceids(now: dt.datetime | None = None) -> List[str]:
+    if now is None:
+        now = jst_now()
+    ymd = now.strftime("%Y%m%d")
 
-    if SHEET_AVAILABLE:
-        try:
-            recs = fetch_recipients()
-            active = [r for r in recs if r.get("enabled") and r.get("userId")]
-        except Exception as e:
-            logging.warning("fetch_recipients failed: %s", e)
-            active = []
+    # 当日の出馬表トップ
+    top_url = f"{BASE}/race_card/list/RACEID/{ymd}000000000000"
+    top_html = _get(top_url)
+    course_list_ids = _extract_course_list_ids(top_html)
 
-        if active:
-            for r in active:
-                _push_line(r["userId"], text)
-                time.sleep(0.15)
-            logging.info("LINE送信OK（複数宛 %d件）", len(active))
-            return
-
-    if LINE_USER_ID:
-        _push_line(LINE_USER_ID, text)
-        logging.info("LINE送信OK（単一宛）")
-    else:
-        logging.warning("宛先がありません（SHEETもLINE_USER_IDもなし）")
-
-# ============ レース列挙 ============
-def _parse_env_raceids() -> List[str]:
-    env_rids = os.getenv("RACEIDS", "").strip()
-    if not env_rids:
+    if not course_list_ids:
+        log.info("当日トップからコース一覧が見つかりませんでした（構造変更の可能性）")
         return []
-    rids = [x.strip() for x in env_rids.split(",") if x.strip()]
-    logging.info("RACEIDS（環境変数）件数: %d", len(rids))
-    return rids
 
-def resolve_race_ids() -> List[str]:
-    """
-    1) RACEIDS env
-    2) odds_client.list_today_raceids()
-    3) utils.raceids.get_all_local_race_ids_today()
-    の順でフォールバックして“本日の地方競馬・各レースID”を返す。
-    """
-    rids = _parse_env_raceids()
-    if rids:
-        return rids
+    race_ids: List[str] = []
+    for cid in course_list_ids:
+        url = f"{BASE}/race_card/list/RACEID/{cid}"
+        ch = _get(url)
+        race_ids.extend(_extract_race_ids_from_course(ch))
 
+    race_ids = sorted(set(race_ids))
+    return race_ids
+
+# ========== 発売中判定 ==========
+ODDS_HINT_MUST = [
+    "投票締切時刻",
+    "投票する",           # ボタンラベル
+]
+ODDS_HINT_NEG = [
+    "発売前", "未発売", "開催なし", "データがありません"
+]
+
+def is_selling_open(race_id: str) -> bool:
+    """
+    単勝/複勝ページで発売中をざっくり判定。
+    """
+    url = f"{BASE}/odds/tanfuku/RACEID/{race_id}"
+    html = _get(url)
+
+    # NGワードがあるなら未発売扱い
+    if any(x in html for x in ODDS_HINT_NEG):
+        return False
+
+    # 必須ワードが揃っていれば発売中とみなす
+    if all(x in html for x in ODDS_HINT_MUST):
+        return True
+
+    # 予備：見出しなど
+    if re.search(r"オッズ.*?単勝", html) and "みんなの予想まとめ" in html:
+        return True
+
+    return False
+
+# ========== 通知（LINE or ログ） ==========
+def send_line(text: str):
+    msg = f"[地方競馬] {text}"
+    if not LINE_TOKEN:
+        log.info("LINE_TOKEN未設定: %s", msg)
+        return
     try:
-        rids = list_today_raceids()
-        if rids:
-            logging.info("list_today_raceids() から %d 件取得", len(rids))
-            return rids
-        else:
-            logging.info("list_today_raceids() は空でした。フォールバックします。")
+        r = SESSION.post(
+            "https://notify-api.line.me/api/notify",
+            headers={"Authorization": f"Bearer {LINE_TOKEN}"},
+            data={"message": msg},
+            timeout=15,
+        )
+        if r.status_code != 200:
+            log.warning("LINE通知失敗 status=%s body=%s", r.status_code, r.text[:200])
     except Exception as e:
-        logging.warning("list_today_raceids() で例外: %s（フォールバックへ）", e)
+        log.exception("LINE通知例外: %s", e)
 
-    if RACEIDS_SCRAPER_AVAILABLE:
-        try:
-            rids = get_all_local_race_ids_today()
-            logging.info("Rakutenスクレイピングで本日検出: %d 件", len(rids))
-            if rids[:10]:
-                logging.debug("先頭10件: %s", rids[:10])
-            return rids
-        except Exception as e:
-            logging.warning("Rakutenスクレイピング失敗: %s", e)
+# ========== 既通知の保存 ==========
+def load_notified(path: str) -> Set[str]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return set(json.load(f))
+    except FileNotFoundError:
+        return set()
+    except Exception as e:
+        log.warning("既通知JSON読込失敗: %s", e)
+        return set()
 
-    logging.error("対象レースIDが取得できません（開催なし or 取得失敗）。")
-    return []
+def save_notified(path: str, ids: Set[str]):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(sorted(ids), f, ensure_ascii=False)
+        log.info("notified saved: %s (bytes=%d)", path, os.path.getsize(path))
+    except Exception as e:
+        log.warning("notified保存失敗: %s", e)
 
-# ============ 戦略判定 ============
-def pick_top(horses: List[Dict[str, Any]], n: int) -> List[Dict[str, Any]]:
-    return [h for h in horses if h.get("pop", 999) <= n]
-
-def find_strategy_for_race(od: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    horses = od.get("horses", [])
-    if len(horses) < 4:
-        return None
-
-    def get_odds_by_pop(p: int) -> float:
-        for h in horses:
-            if h.get("pop") == p:
-                try:
-                    return float(h.get("odds", 9999))
-                except Exception:
-                    return 9999.0
-        return 9999.0
-
-    o1, o2, o3, o4 = get_odds_by_pop(1), get_odds_by_pop(2), get_odds_by_pop(3), get_odds_by_pop(4)
-
-    # ① 1〜3番人気 三連単BOX
-    if (2.0 <= o1 <= 10.0) and (o2 < 10.0) and (o3 < 10.0) and (o4 >= 15.0):
-        nums = [h["umaban"] for h in pick_top(horses, 3)]
-        detail = f"三連単BOX（{nums[0]}-{nums[1]}-{nums[2]}）6点"
-        return {"strategy": "①", "buy_detail": detail, "nums": nums, "note": "1〜3番人気BOX"}
-
-    # ② 1人気1着固定 × 2・3人気（三連単2点）
-    if (o1 < 2.0) and (o2 < 10.0) and (o3 < 10.0):
-        n1 = [h for h in horses if h["pop"] == 1][0]["umaban"]
-        n2 = [h for h in horses if h["pop"] == 2][0]["umaban"]
-        n3 = [h for h in horses if h["pop"] == 3][0]["umaban"]
-        detail = f"【戦略一致】②\n1着固定（{n1}）- 2,3番人気（{n2},{n3}）三連単2点"
-        return {"strategy": "②", "buy_detail": detail, "nums": [n1, n2, n3], "note": "1人気1着固定×2・3人気"}
-
-    # ③ 1着固定 × 10〜20倍流し（相手最大4頭）
-    if (o1 <= 1.5) and (o2 >= 10.0):
-        candidates = [h for h in horses if h["pop"] >= 2 and 10.0 <= float(h.get("odds", 9999)) <= 20.0]
-        if candidates:
-            candidates = candidates[:4]
-            n1 = [h for h in horses if h["pop"] == 1][0]["umaban"]
-            others = [h["umaban"] for h in candidates]
-            detail = (
-                f"【戦略一致】③\n"
-                f"1着固定（{n1}）- 相手流し（{','.join(map(str, others))}）\n"
-                f"三連単『1→相手→相手』最大12点（相手は10〜20倍から最大4頭）"
-            )
-            return {"strategy": "③", "buy_detail": detail, "nums": [n1] + others, "note": "1着固定×10〜20倍流し"}
-
-    # ④ 3着固定（3番人気固定）三連単2点
-    if (o1 <= 3.0) and (o2 <= 3.0) and (6.0 <= o3 <= 10.0) and (o4 >= 15.0):
-        n1 = [h for h in horses if h["pop"] == 1][0]["umaban"]
-        n2 = [h for h in horses if h["pop"] == 2][0]["umaban"]
-        n3 = [h for h in horses if h["pop"] == 3][0]["umaban"]
-        detail = f"【戦略一致】④\n3着固定　（{n1}×{n2}）- {n3}（３着固定）、三連単2点"
-        return {"strategy": "④", "buy_detail": detail, "nums": [n1, n2, n3], "note": "3着固定（3番人気固定）"}
-
-    return None
-
-def build_message(od: Dict[str, Any], strat: Dict[str, Any],
-                  start_iso: str, cutoff_iso: str) -> str:
-    race_url = f"https://keiba.rakuten.co.jp/odds/tanfuku/RACEID/{od['race_id']}"
-    start_hm  = hhmm(start_iso)
-    cutoff_hm = hhmm(cutoff_iso)
-    header = f"発走 {start_hm}（販売締切 {cutoff_hm}）"
-    body   = strat["buy_detail"]
-    footer = f"単勝オッズ確認: {race_url}"
-    return f"{header}\n{body}\n{footer}"
-
-# ============ 戦略判定の実行 ============
-def find_strategy_matches() -> List[Dict[str, Any]]:
-    results: List[Dict[str, Any]] = []
-    race_ids = resolve_race_ids()
-    if not race_ids:
-        logging.info("対象レースIDがありません（開催なし or 取得失敗）")
-        return results
-
-    for rid in race_ids:
-        od = fetch_tanfuku_odds(rid)
-        if not od:
-            continue
-
-        try:
-            start_iso = get_race_start_iso(rid)
-        except Exception:
-            start_iso = od.get("start_at_iso")
-        if not start_iso:
-            continue
-
-        cutoff_iso = (datetime.fromisoformat(start_iso) - timedelta(minutes=CUTOFF_OFFSET_MIN)).isoformat()
-        strat = find_strategy_for_race(od)
-        if not strat:
-            continue
-
-        msg = build_message(od, strat, start_iso=start_iso, cutoff_iso=cutoff_iso)
-        results.append({
-            "race_id": rid,
-            "start_at_iso": start_iso,
-            "cutoff_at_iso": cutoff_iso,
-            "strategy": strat["strategy"],
-            "message": msg,
-        })
-    return results
-
-# ============ メイン ============
+# ========== メイン ==========
 def main():
-    logging.info("ジョブ開始 host=%s pid=%s", socket.gethostname(), os.getpid())
-    logging.info("NOTIFIED_PATH=%s KILL_SWITCH=%s DRY_RUN=%s SHEET=%s",
-                 NOTIFIED_PATH, KILL_SWITCH, DRY_RUN, SHEET_AVAILABLE)
+    log.info(
+        "ジョブ開始 host=%s pid=%s", os.environ.get("RENDER_INSTANCE_ID", "?"), os.getpid()
+    )
+    log.info(
+        "NOTIFIED_PATH=%s KILL_SWITCH=%s DRY_RUN=%s SHEET=%s",
+        NOTIFIED_PATH, KILL_SWITCH, DRY_RUN, SHEET
+    )
 
-    notified = _load_notified()
-    today = now_jst().strftime("%Y-%m-%d")
-    notified = prune_notified(notified, keep_date=today)
-
-    hits = find_strategy_matches()
-    logging.info("HITS=%s", len(hits))
-
-    if not hits:
-        logging.info("戦略一致なし（通知なし）")
-        _save_notified(notified)
-        logging.info("ジョブ終了")
+    if KILL_SWITCH:
+        log.info("KILL_SWITCH=True のため何もしません。")
         return
 
-    for h in hits:
-        race_id    = h.get("race_id", "")
-        strategy   = h.get("strategy", "")
-        cutoff_iso = h.get("cutoff_at_iso", "")
-        start_iso  = h.get("start_at_iso", "")
+    # 1) 今日の全RACEIDを収集
+    race_ids = list_today_raceids()
+    if not race_ids:
+        log.info("本日のRACEIDが見つかりませんでした。終了。")
+        return
+    log.info("今日のRACEID件数: %d 例: %s ...", len(race_ids), ", ".join(race_ids[:5]))
 
-        if cutoff_iso and not within_window(cutoff_iso):
-            logging.info("（締切基準）時間窓外のためスキップ: %s %s", race_id, cutoff_iso)
+    # 2) 既通知をロード
+    notified = load_notified(NOTIFIED_PATH)
+
+    # 3) 発売中をチェックして通知
+    hits = []
+    for rid in race_ids:
+        if rid in notified:
             continue
+        try:
+            if is_selling_open(rid):
+                hits.append(rid)
+                if not DRY_RUN:
+                    send_line(f"発売中: RACEID={rid}  オッズ: {BASE}/odds/tanfuku/RACEID/{rid}")
+                else:
+                    log.info("[DRY_RUN] 通知予定: %s", rid)
+        except Exception as e:
+            log.warning("判定失敗 RACEID=%s err=%s", rid, e)
 
-        key_date = (start_iso or cutoff_iso)[:10] if (start_iso or cutoff_iso) else today
-        key = f"{race_id}|{strategy}|{key_date}"
-        if notified.get(key):
-            logging.info("重複通知を回避: %s", key)
-            continue
+    # 4) 保存
+    if hits:
+        notified.update(hits)
+        save_notified(NOTIFIED_PATH, notified)
 
-        msg = (h.get("message") or "").strip()
-        if not msg:
-            logging.info("message空のためスキップ: %s", key)
-            continue
-
-        send_line_message(msg)
-        notified[key] = int(time.time())
-
-    _save_notified(notified)
-    logging.info("ジョブ終了")
+    log.info("HITS=%d", len(hits))
+    log.info("ジョブ終了")
 
 if __name__ == "__main__":
     main()
