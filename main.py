@@ -1,41 +1,34 @@
 # -*- coding: utf-8 -*-
 """
-Rakuten競馬 監視ワンファイル版（戦略①②③④内蔵・完全差し替え）
-
-機能
-- 楽天競馬「出馬表(一覧)」から RACEID を抽出（2系統で堅牢化）
-- 各RACEIDの 単勝/複勝 オッズページ(odds/tanfuku)へ疎通 → オッズを軽量パース
-- 戦略①②③④（ユーザー提供ロジック）で判定
-- 判定の可否と理由をログ出力
-- 環境変数:
-    KILL_SWITCH       : True/False でジョブ停止
-    DRY_RUN           : True なら通知（send_line）は実行しない
-    NOTIFY_ENABLED    : 0/1 で通知ON/OFF（0で止める）
-    NOTIFIED_PATH     : 既通知記録の保存先（JSON）
-    DEBUG_RACEIDS     : カンマ区切りでRACEIDを直接指定してテスト
-    USER_AGENT        : 任意のUser-Agentを上書き
+Rakuten競馬 全面差し替え版
+- 今日の「出馬表一覧」から開催ごとのページを拾う
+- 開催ページ内の各レース（個別RACEID）を列挙
+- 各レースの単勝/人気テーブルから 1〜4番人気のオッズを抽出
+- いただいた戦略①〜④で判定し、一致のみ通知（またはDRY_RUNでログ）
 """
 
 import os
 import re
-import json
 import time
+import json
 import random
 import logging
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Optional, Tuple
 from datetime import datetime, timedelta, timezone
 
 import requests
 from bs4 import BeautifulSoup
 
-# ========================
+from strategy_rules import eval_strategy  # ← いただいた判定そのまま利用
+
+# -------------------------
 # 設定
-# ========================
+# -------------------------
 JST = timezone(timedelta(hours=9))
 
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": os.getenv("USER_AGENT") or (
+    "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
@@ -43,24 +36,26 @@ SESSION.headers.update({
     "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
     "Cache-Control": "no-cache",
 })
-
-TIMEOUT = (10, 20)           # (connect, read)
+TIMEOUT = (10, 20)
 RETRY = 3
-SLEEP_BETWEEN = (0.8, 1.5)
+SLEEP_BETWEEN = (0.5, 1.2)
 
 NOTIFIED_PATH = os.getenv("NOTIFIED_PATH", "/tmp/notified_races.json")
 DRY_RUN = os.getenv("DRY_RUN", "False").lower() == "true"
 KILL_SWITCH = os.getenv("KILL_SWITCH", "False").lower() == "true"
-NOTIFY_ENABLED = int(os.getenv("NOTIFY_ENABLED", "1"))
-DEBUG_RACEIDS = [s.strip() for s in os.getenv("DEBUG_RACEIDS", "").split(",") if s.strip()]
+NOTIFY_ENABLED = os.getenv("NOTIFY_ENABLED", "0") == "1"
+LINE_NOTIFY_TOKEN = os.getenv("LINE_NOTIFY_TOKEN", "").strip()
 
-# ========================
-# 共通ユーティリティ
-# ========================
-def jst_now_str() -> str:
-    return datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
+# テスト用: カンマ区切り（空欄なら無効）
+# 例: DEBUG_RACEIDS="202508101006060411,202508111006060501"
+DEBUG_RACEIDS = [x.strip() for x in os.getenv("DEBUG_RACEIDS", "").split(",") if x.strip()]
 
-def yyyymmdd_today() -> str:
+RACEID_RE = re.compile(r"/RACEID/(\d{18})")
+
+# -------------------------
+# ユーティリティ
+# -------------------------
+def today_str() -> str:
     return datetime.now(JST).strftime("%Y%m%d")
 
 def fetch(url: str) -> str:
@@ -90,340 +85,258 @@ def save_notified(d: Dict[str, float]) -> None:
     with open(NOTIFIED_PATH, "w", encoding="utf-8") as f:
         json.dump(d, f, ensure_ascii=False, indent=2)
 
-# ========================
-# RACEID 収集
-# ========================
-RACEID_RE = re.compile(r"/RACEID/(\d{18})")
+def line_notify(message: str) -> None:
+    """LINE Notify が設定されている場合のみ送る。無ければ何もしない。"""
+    if not (NOTIFY_ENABLED and LINE_NOTIFY_TOKEN and not DRY_RUN):
+        logging.info("[DRY_RUN]" if DRY_RUN else "[INFO] 通知はスキップ（トークン未設定または無効）")
+        return
+    try:
+        resp = SESSION.post(
+            "https://notify-api.line.me/api/notify",
+            headers={"Authorization": f"Bearer {LINE_NOTIFY_TOKEN}"},
+            data={"message": message},
+            timeout=TIMEOUT,
+        )
+        if resp.status_code != 200:
+            logging.warning(f"[WARN] LINE通知失敗 status={resp.status_code} body={resp.text[:200]}")
+        else:
+            logging.info("[INFO] LINE通知OK")
+    except Exception as e:
+        logging.warning(f"[WARN] LINE通知中に例外: {e}")
 
-def list_today_raceids() -> List[str]:
-    """楽天 出馬表(一覧)ページから RACEID を抽出（2系統）"""
-    ymd = yyyymmdd_today()
+# -------------------------
+# RACEID 正規化と列挙
+# -------------------------
+def list_meeting_pages_for_today() -> List[str]:
+    """本日の出馬表トップから、開催別「出馬表一覧」ページのURLを抜く"""
+    ymd = today_str()
     url = f"https://keiba.rakuten.co.jp/race_card/list/RACEID/{ymd}0000000000"
     html = fetch(url)
     soup = BeautifulSoup(html, "lxml")
 
-    # 系統1: #todaysTicket（本日の発売情報）
-    cnt1 = 0
-    ids: List[str] = []
-    todays = soup.find(id="todaysTicket")
-    if todays:
-        links = todays.select("td.nextRace a[href], td a[href]")
-        for a in links:
-            m = RACEID_RE.search(a.get("href", ""))
-            if m:
-                ids.append(m.group(1))
-                cnt1 += 1
-
-    # 系統2: ページ中の全リンクから /RACEID/ を総なめ（保険）
-    cnt2 = 0
+    # 1) 「出馬表」メニューに並ぶ各開催の一覧リンク
+    links = []
     for a in soup.find_all("a", href=True):
-        m = RACEID_RE.search(a["href"])
-        if m:
-            ids.append(m.group(1))
-            cnt2 += 1
+        href = a["href"]
+        # 例: https://keiba.rakuten.co.jp/race_card/list/RACEID/202508111006060500
+        if "/race_card/list/RACEID/" in href:
+            m = RACEID_RE.search(href)
+            if m:
+                rid = m.group(1)
+                # 開催一覧（末尾00）だけ採用（個別は後段で拾う）
+                if rid.endswith("00"):
+                    links.append(href)
 
-    # 正規化
-    ids = sorted(set(ids))
-    logging.info(f"[INFO] Rakuten#1 本日の発売情報: {cnt1}件")
-    logging.info(f"[INFO] Rakuten#2 出馬表一覧: {len(ids)}件")
+    # 重複排除
+    links = sorted(set(links))
+    return links
 
-    return ids
+def expand_meeting_to_raceids(meeting_url: str) -> List[str]:
+    """開催別の『出馬表一覧』ページから、個別レースのRACEIDを全部抜く"""
+    html = fetch(meeting_url)
+    soup = BeautifulSoup(html, "lxml")
 
-# ========================
-# オッズページ解析
-# ========================
-def extract_tanfuku_rows(soup: BeautifulSoup) -> List[Dict[str, Any]]:
-    """
-    単勝/複勝テーブルから最低限の情報を抽出
-    返却: [{"num": 馬番(int), "win": 単勝オッズ(float|None)}]
-    """
-    tables = []
-    # summary に「オッズ」「単勝」が入るテーブルを優先
-    for t in soup.find_all("table"):
-        summary = (t.get("summary") or "").strip()
-        if "オッズ" in summary or "単勝" in summary:
-            tables.append(t)
-    if not tables:
-        # 最後の保険：table全体から“単勝”見出しを含むもの
-        for t in soup.find_all("table"):
-            if "単勝" in t.get_text(" ", strip=True):
-                tables.append(t)
-
-    rows_out: List[Dict[str, Any]] = []
-    for t in tables:
-        for tr in t.find_all("tr"):
-            txt = tr.get_text(" ", strip=True)
-            # ざっくりフィルタ：馬番らしきもの・数値オッズが含まれる行
-            tds = tr.find_all(["td", "th"])
-            if len(tds) < 2:
+    raceids = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        # tanfukuへの直リンクがあれば最優先で採用
+        if "/odds/tanfuku/RACEID/" in href:
+            m = RACEID_RE.search(href)
+            if m:
+                raceids.append(m.group(1))
                 continue
+        # それ以外に /race_card/list/RACEID/xxxxxx（個別レース）のリンクがあれば拾う
+        if "/race_card/list/RACEID/" in href:
+            m = RACEID_RE.search(href)
+            if m:
+                rid = m.group(1)
+                # 個別レースは末尾が "01"〜"12" のように "00" 以外
+                if not rid.endswith("00"):
+                    raceids.append(rid)
 
-            # 馬番候補
-            num = None
-            # 左側に馬番が入る前提で、整数に解釈できるものを拾う
-            for cell in tds[:3]:
-                s = cell.get_text(strip=True)
-                if s.isdigit():
-                    num = int(s)
-                    break
-            if num is None:
-                continue
+    # 重複排除
+    raceids = sorted(set(raceids))
+    return raceids
 
-            # 単勝オッズ候補（小数含む）
-            win = None
-            for cell in tds:
-                s = cell.get_text(strip=True).replace(",", "")
-                # "1.5" "12.1" など、小数点を含む数値をザックリ拾う
-                if re.fullmatch(r"\d+(\.\d+)?", s):
-                    try:
-                        v = float(s)
-                        # 単勝として常識的な範囲だけ許容
-                        if 1.0 <= v <= 999.9:
-                            win = v
-                            break
-                    except Exception:
-                        pass
+def gather_today_raceids() -> List[str]:
+    """今日の全開催から個別レースIDを集める。"""
+    meeting_pages = list_meeting_pages_for_today()
+    logging.info(f"[INFO] Rakuten#2 出馬表一覧: {len(meeting_pages)}件")
 
-            rows_out.append({"num": num, "win": win})
+    all_ids: List[str] = []
+    for url in meeting_pages:
+        ids = expand_meeting_to_raceids(url)
+        all_ids.extend(ids)
 
-    # 馬番でユニーク化（重複対策）
-    uniq = {}
-    for r in rows_out:
-        if r["win"] is None:
-            continue
-        uniq[r["num"]] = r
-    return list(uniq.values())
+    all_ids = sorted(set(all_ids))
+    return all_ids
 
-def parse_tanfuku_meta(soup: BeautifulSoup) -> Dict[str, Any]:
-    """見出し・時刻・オッズ行・人気順など"""
-    h1 = soup.find("h1")
-    title = h1.get_text(strip=True) if h1 else "N/A"
-    nowtime = soup.select_one(".withUpdate .nowTime")
-    now_label = nowtime.get_text(strip=True) if nowtime else ""
-
-    rows = extract_tanfuku_rows(soup)
-    horses_count = len(rows)
-
-    # 人気順（単勝オッズの昇順）
-    sorted_rows = sorted(rows, key=lambda r: (r["win"] if r["win"] is not None else 9999))
-
-    # 戦略ロジック用データ
-    horses_data = []
-    for i, r in enumerate(sorted_rows, start=1):
-        horses_data.append({
-            "pop": i,
-            "umaban": r["num"],
-            "odds": r["win"]
-        })
-
-    return {
-        "title": title,
-        "now": now_label,
-        "horses": horses_count,
-        "rows": rows,
-        "fav": sorted_rows[:5],
-        "odds_table_found": bool(rows),
-        "horses_data": horses_data
-    }
-
-# ========================
-# 戦略①②③④（ユーザー提供ロジックを内蔵）
-# ========================
-def _get_by_pop(horses: List[Dict[str, Any]], pop: int) -> Optional[Dict[str, Any]]:
-    for h in horses:
-        if h.get("pop") == pop:
-            return h
-    return None
-
-def eval_strategy(horses: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+# -------------------------
+# tanfukuページ → 人気別オッズ抽出
+# -------------------------
+def parse_horses_from_tanfuku(race_id: str) -> Tuple[str, str, List[Dict]]:
     """
-    戦略①〜④のいずれかに一致したら dict を返す。
-    返却: { "strategy": "...", "tickets": [...], "roi": "...", "hit": "..." }
+    returns: (title, nowLabel, horses)
+    horses: [{pop:int, odds:float}, ...]
     """
-    p1 = _get_by_pop(horses, 1)
-    p2 = _get_by_pop(horses, 2)
-    p3 = _get_by_pop(horses, 3)
-    p4 = _get_by_pop(horses, 4)
-
-    if not (p1 and p2 and p3 and p4):
-        return None
-
-    o1, o2, o3, o4 = p1["odds"], p2["odds"], p3["odds"], p4["odds"]
-
-    # ① 1〜3番人気BOX（6点）
-    # 1番 2.0〜10.0 / 2〜3番 <10.0 / 4番 ≥15.0
-    if (2.0 <= o1 <= 10.0) and (o2 < 10.0) and (o3 < 10.0) and (o4 >= 15.0):
-        tickets = [f"{p1['pop']}-{p2['pop']}-{p3['pop']}",
-                   f"{p1['pop']}-{p3['pop']}-{p2['pop']}",
-                   f"{p2['pop']}-{p1['pop']}-{p3['pop']}",
-                   f"{p2['pop']}-{p3['pop']}-{p1['pop']}",
-                   f"{p3['pop']}-{p1['pop']}-{p2['pop']}",
-                   f"{p3['pop']}-{p2['pop']}-{p1['pop']}"]
-        return {
-            "strategy": "① 1〜3番人気BOX（6点）",
-            "tickets": tickets,
-            "roi": "想定回収率: 138.5% / 的中率: 22.4%",
-            "hit": "対象354Rベース",
-        }
-
-    # ② 1番人気1着固定 × 2・3番人気（2点）
-    # 1番 <2.0 / 2〜3 <10.0
-    if (o1 < 2.0) and (o2 < 10.0) and (o3 < 10.0):
-        tickets = [f"{p1['pop']}-{p2['pop']}-{p3['pop']}", f"{p1['pop']}-{p3['pop']}-{p2['pop']}"]
-        return {
-            "strategy": "② 1番人気1着固定 × 2・3番人気（2点）",
-            "tickets": tickets,
-            "roi": "想定回収率: 131.4% / 的中率: 43.7%",
-            "hit": "対象217Rベース",
-        }
-
-    # ③ 1着固定 × 10〜20倍流し（相手は2番人気以降の中から 10〜20倍に該当する最大5頭）
-    # 1番 ≤1.5
-    if o1 <= 1.5:
-        cand = [h for h in horses if h["pop"] >= 2 and 10.0 <= h["odds"] <= 20.0]
-        cand = cand[:5]
-        if cand:
-            tickets = [f"{_get_by_pop(horses,1)['pop']}-{c['pop']}-総流し" for c in cand]
-            return {
-                "strategy": "③ 1着固定 × 10〜20倍流し（候補最大5頭）",
-                "tickets": tickets,
-                "roi": "想定回収率: 139.2% / 的中率: 16.8%",
-                "hit": "対象89Rベース",
-            }
-
-    # ④ 3着固定（3番人気固定）2点
-    # 1・2 ≤3.0 / 3が 6〜10 / 4 ≥15
-    if (o1 <= 3.0) and (o2 <= 3.0) and (6.0 <= o3 <= 10.0) and (o4 >= 15.0):
-        tickets = [f"{p1['pop']}-{p2['pop']}-{p3['pop']}", f"{p2['pop']}-{p1['pop']}-{p3['pop']}"]
-        return {
-            "strategy": "④ 3着固定（3番人気固定）2点",
-            "tickets": tickets,
-            "roi": "想定回収率: 133.7% / 的中率: 21.5%",
-            "hit": "対象128Rベース",
-        }
-
-    return None
-
-def judge_strategies(meta: Dict[str, Any]) -> Tuple[bool, str]:
-    horses_data = meta.get("horses_data")
-    if not horses_data or len(horses_data) < 4:
-        return False, "horses<4 で判定不可"
-
-    result = eval_strategy(horses_data)
-    if result:
-        detail = (
-            f"{result['strategy']}\n"
-            f"買い目: {', '.join(result['tickets'])}\n"
-            f"{result['roi']} / {result['hit']}"
-        )
-        return True, detail
-    return False, "戦略①〜④: 条件未充足"
-
-# ========================
-# 疎通 & 通知
-# ========================
-def check_tanfuku_page(race_id: str) -> Optional[Dict[str, Any]]:
     url = f"https://keiba.rakuten.co.jp/odds/tanfuku/RACEID/{race_id}"
     html = fetch(url)
     soup = BeautifulSoup(html, "lxml")
 
-    meta = parse_tanfuku_meta(soup)
-    if not meta.get("odds_table_found"):
+    h1 = soup.find("h1")
+    race_title = h1.get_text(strip=True) if h1 else "地方競馬"
+    nowtime = soup.select_one(".withUpdate .nowTime")
+    now_label = nowtime.get_text(strip=True) if nowtime else ""
+
+    # 単勝テーブルを緩く特定（ヘッダ/summaryに「単勝」or「オッズ」）
+    odds_table = None
+    for tbl in soup.find_all("table"):
+        summary = (tbl.get("summary") or "") + " " + (tbl.get("aria-label") or "")
+        head_txt = " ".join(th.get_text(strip=True) for th in tbl.find_all("th"))
+        joined = (summary + " " + head_txt)
+        if ("単勝" in joined) or ("オッズ" in joined):
+            odds_table = tbl
+            break
+    if odds_table is None:
         logging.warning(f"[WARN] オッズテーブル未検出: {url}")
-        return None
+        return (race_title, now_label, [])
 
-    meta.update({"url": url})
-    return meta
+    # 列名っぽいものから「人気」「単勝」に近い列のindexを推定
+    headers = [th.get_text(strip=True) for th in odds_table.find_all("th")]
+    def find_col(candidates: List[str]) -> int:
+        for i, txt in enumerate(headers):
+            for key in candidates:
+                if key in txt:
+                    return i
+        return -1
 
-def send_line(message: str) -> None:
-    """通知実装は既存のLINE連携に接続してください。ここではスイッチのみ。"""
-    if NOTIFY_ENABLED != 1:
-        return
-    if DRY_RUN:
-        logging.info("[DRY_RUN] 通知はスキップ")
-        return
-    # ここに実装を接続
-    # ex) line_notify(message)
-    logging.info(f"[NOTIFY] {message}")
+    idx_pop = find_col(["人気", "人", "人気順"])
+    idx_odds = find_col(["単勝", "オッズ", "単"])
 
-# ========================
+    horses: List[Dict] = []
+    for tr in odds_table.find_all("tr"):
+        tds = tr.find_all(["td", "th"])
+        if not tds or len(tds) < 2:
+            continue
+
+        # 人気
+        pop_val = None
+        if 0 <= idx_pop < len(tds):
+            txt = tds[idx_pop].get_text(" ", strip=True)
+            # 例: "1" / "1人気" / "1 位"
+            m = re.search(r"\d+", txt)
+            if m:
+                pop_val = int(m.group())
+
+        # オッズ
+        odds_val = None
+        if 0 <= idx_odds < len(tds):
+            txt = tds[idx_odds].get_text(" ", strip=True)
+            # "1.7" / "1.7-2.3" / "1.7～2.3"
+            txt = txt.replace("～", "-").replace("−", "-").replace("―", "-")
+            m = re.search(r"\d+(?:\.\d+)?(?:-\d+(?:\.\d+)?)?", txt)
+            if m:
+                num = m.group()
+                if "-" in num:
+                    num = num.split("-")[0]
+                odds_val = float(num)
+
+        if pop_val is not None and odds_val is not None:
+            horses.append({"pop": pop_val, "odds": odds_val})
+
+    # 人気順でソート＆重複除去（pop重複があれば先に見つかった方を残す）
+    uniq = {}
+    for h in horses:
+        uniq.setdefault(h["pop"], h)
+    horses = [uniq[k] for k in sorted(uniq.keys())]
+
+    return (race_title, now_label, horses)
+
+# -------------------------
 # メイン
-# ========================
+# -------------------------
 def main():
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [INFO] %(message)s")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    if KILL_SWITCH:
+        logging.info("[INFO] KILL_SWITCH=True のため終了")
+        return
+
     logging.info(f"[INFO] ジョブ開始 host={os.uname().nodename} pid={os.getpid()}")
     logging.info(f"[INFO] NOTIFIED_PATH={NOTIFIED_PATH} KILL_SWITCH={KILL_SWITCH} DRY_RUN={DRY_RUN}")
-    logging.info(f"[INFO] NOTIFY_ENABLED={NOTIFY_ENABLED}")
-
-    if KILL_SWITCH:
-        logging.info("[INFO] KILL_SWITCH=True のため、処理をスキップします。")
-        return
-
-    # RACEID列挙
-    if DEBUG_RACEIDS:
-        raceids = DEBUG_RACEIDS
-        logging.info(f"[INFO] DEBUG_RACEIDS 指定: {len(raceids)}件")
-    else:
-        raceids = list_today_raceids()
-        if not raceids:
-            logging.info("[INFO] 発見RACEIDなし")
-            return
-        logging.info(f"[INFO] 発見RACEID数: {len(raceids)}")
-        for rid in raceids:
-            logging.info(f"  - {rid} -> tanfuku")
+    if NOTIFY_ENABLED:
+        logging.info("[INFO] NOTIFY_ENABLED=1")
 
     notified = load_notified()
     hits = 0
     matches = 0
 
-    for rid in raceids:
-        try:
-            meta = check_tanfuku_page(rid)
-            if not meta:
-                continue
+    # --- 対象RACEIDの決定 ---
+    target_ids: List[str]
+    if DEBUG_RACEIDS:
+        logging.info(f"[INFO] DEBUG_RACEIDS 指定: {len(DEBUG_RACEIDS)}件")
+        target_ids = DEBUG_RACEIDS
+    else:
+        # 本日の開催一覧 → 各開催の個別レースIDへ展開
+        meeting_pages = list_meeting_pages_for_today()
+        logging.info(f"[INFO] Rakuten#1 本日の開催一覧: {len(meeting_pages)}件")
+        target_ids = []
+        for murl in meeting_pages:
+            target_ids.extend(expand_meeting_to_raceids(murl))
+        # 重複排除
+        target_ids = sorted(set(target_ids))
+        logging.info(f"[INFO] 個別レースID抽出: {len(target_ids)}件")
 
-            title = meta.get("title", "N/A")
-            now_label = meta.get("now", "")
-            url = meta["url"]
-            # ログ（疎通OK）
-            stamp = ""
-            m = re.search(r"(\d{2}:\d{2})", now_label)
-            if m:
-                stamp = f"{m.group(1)}時点"
-            logging.info(f"[OK] tanfuku疎通: {rid} {title} {stamp} {url}")
-            hits += 1
+    # --- 各レースで判定 ---
+    for rid in target_ids:
+        title, now_label, horses = parse_horses_from_tanfuku(rid)
+        if not horses:
+            # 未発売/未表示の時間帯や一覧ID直叩きなどはここで弾かれる
+            continue
 
-            # 判定
-            ok, detail = judge_strategies(meta)
-            if ok:
-                matches += 1
-                logging.info(f"[MATCH] {rid} 条件詳細: {detail.replace(os.linesep, ' / ')}")
+        hits += 1
+        url = f"https://keiba.rakuten.co.jp/odds/tanfuku/RACEID/{rid}"
+        logging.info(f"[OK] tanfuku疎通: {rid} {title} {now_label} {url}")
 
-                # 通知メッセージ
-                msg = (
-                    f"【戦略ヒット】\n"
-                    f"RACEID: {rid}\n"
-                    f"{title} {stamp}\n"
-                    f"{detail}\n"
-                    f"{url}"
-                )
-                send_line(msg)
-                notified[rid] = time.time()
-            else:
-                logging.info(f"[NO MATCH] {rid} 条件詳細: {detail}")
+        # 1〜4番人気が揃わなければ判定不能
+        if len([h for h in horses if 1 <= h["pop"] <= 4]) < 4:
+            logging.info(f"[NO MATCH] {rid} 条件詳細: horses<4 で判定不可")
+            continue
 
-            time.sleep(random.uniform(*SLEEP_BETWEEN))
+        res = eval_strategy(horses)
+        if not res:
+            continue
 
-        except Exception as e:
-            logging.warning(f"[WARN] {rid} 処理中に例外: {e}")
+        matches += 1
+        tickets = ", ".join(res["tickets"])
+        msg = (
+            f"【一致】{res['strategy']}\n"
+            f"RACEID: {rid}\n"
+            f"{title} {now_label}\n"
+            f"買い目: {tickets}\n"
+            f"{res['roi']} / {res['hit']}\n"
+            f"{url}"
+        )
+        logging.info(f"[MATCH] {rid} 条件詳細: {res['strategy']} / 買い目: {tickets} / {res['roi']} / {res['hit']}")
+
+        # 通知
+        if NOTIFY_ENABLED and not DRY_RUN:
+            line_notify(msg)
+            notified[rid] = time.time()
+        else:
+            logging.info("[DRY_RUN] 通知はスキップ")
+
+        time.sleep(random.uniform(*SLEEP_BETWEEN))
 
     logging.info(f"[INFO] HITS={hits} / MATCHES={matches}")
-    if matches == 0:
-        # 1件も通知していないなら空保存（重複通知防止の意味は薄いので初期化）
-        save_notified({})
-    else:
+    # 一致時のみ保存（DRY_RUN時は空のままでもOK）
+    if not DRY_RUN:
         save_notified(notified)
-    logging.info(f"[INFO] notified saved: {NOTIFIED_PATH} (bytes={len(json.dumps(notified, ensure_ascii=False))})")
+        logging.info(f"[INFO] notified saved: {NOTIFIED_PATH} (bytes={len(json.dumps(notified, ensure_ascii=False))})")
+    else:
+        # DRY_RUNでも書式合わせのため空dictを保存する場合は下行を有効化
+        save_notified({})
+        logging.info(f"[INFO] notified saved: {NOTIFIED_PATH} (bytes=2)")
+
     logging.info("[INFO] ジョブ終了")
 
 if __name__ == "__main__":
