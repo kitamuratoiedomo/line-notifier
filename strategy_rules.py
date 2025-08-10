@@ -1,4 +1,3 @@
-# strategy_rules.py
 from typing import Dict, Any, List, Optional
 
 def _get_by_pop(horses: List[Dict[str, Any]], pop: int) -> Optional[Dict[str, Any]]:
@@ -10,24 +9,19 @@ def _get_by_pop(horses: List[Dict[str, Any]], pop: int) -> Optional[Dict[str, An
 def eval_strategy(horses: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """
     戦略①〜④のいずれかに一致したら dict を返す。
-    返却: { "strategy": "① …", "tickets": [("1-2-3", ...)], "notes": "...", "roi": "...", "hit": "..." }
-    ※ ROI/的中率は固定文（後で実績から差し替え）
+    返却: { "strategy": "① …", "tickets": [...], "roi": "...", "hit": "..." }
     """
 
-    # 人気ごとのオッズ取得
     p1 = _get_by_pop(horses, 1)
     p2 = _get_by_pop(horses, 2)
     p3 = _get_by_pop(horses, 3)
     p4 = _get_by_pop(horses, 4)
-
-    # 安全ガード
     if not (p1 and p2 and p3 and p4):
         return None
 
     o1, o2, o3, o4 = p1["odds"], p2["odds"], p3["odds"], p4["odds"]
 
     # ① 1〜3番人気BOX
-    # 1番 2.0〜10.0 / 2〜3番 <10.0 / 4番 ≥15.0
     if (2.0 <= o1 <= 10.0) and (o2 < 10.0) and (o3 < 10.0) and (o4 >= 15.0):
         tickets = [f"{p1['pop']}-{p2['pop']}-{p3['pop']}",
                    f"{p1['pop']}-{p3['pop']}-{p2['pop']}",
@@ -43,7 +37,6 @@ def eval_strategy(horses: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         }
 
     # ② 1番人気1着固定 × 2・3番人気（2点）
-    # 1番 <2.0 / 2〜3 <10.0
     if (o1 < 2.0) and (o2 < 10.0) and (o3 < 10.0):
         tickets = [f"{p1['pop']}-{p2['pop']}-{p3['pop']}", f"{p1['pop']}-{p3['pop']}-{p2['pop']}"]
         return {
@@ -53,16 +46,11 @@ def eval_strategy(horses: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
             "hit": "対象217Rベース",
         }
 
-    # ③ 1着固定 × 10〜20倍流し（相手は2番人気以降の中から 10〜20倍に該当する最大5頭）
-    # 1番 ≤1.5
+    # ③ 1着固定 × 10〜20倍流し（最大5頭）
     if o1 <= 1.5:
-        cand = [h for h in horses if h["pop"] >= 2 and 10.0 <= h["odds"] <= 20.0]
-        cand = cand[:5]  # 上限5頭
+        cand = [h for h in horses if h["pop"] >= 2 and 10.0 <= h["odds"] <= 20.0][:5]
         if cand:
-            tickets = []
-            for c in cand:
-                # 1着=1番人気固定、2-3着は“流し”の代表2点（簡易）
-                tickets.append(f"{p1['pop']}-{c['pop']}-総流し")  # 表記だけ。実際の展開は拡張時に詳細化
+            tickets = [f"{p1['pop']}-{c['pop']}-総流し" for c in cand]
             return {
                 "strategy": "③ 1着固定 × 10〜20倍流し（候補最大5頭）",
                 "tickets": tickets,
@@ -71,7 +59,6 @@ def eval_strategy(horses: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
             }
 
     # ④ 3着固定（3番人気固定）2点
-    # 1・2 ≤3.0 / 3が 6〜10 / 4 ≥15
     if (o1 <= 3.0) and (o2 <= 3.0) and (6.0 <= o3 <= 10.0) and (o4 >= 15.0):
         tickets = [f"{p1['pop']}-{p2['pop']}-{p3['pop']}", f"{p2['pop']}-{p1['pop']}-{p3['pop']}"]
         return {
