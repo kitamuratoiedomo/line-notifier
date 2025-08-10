@@ -1,243 +1,225 @@
-# utils/raceids.py — 本日の「地方競馬・全レース」RACEIDを安全取得
-# v2.0: JS後描画でも拾えるよう、単勝オッズページ内の「埋め込みJSON」を直接解析して発売中判定
-from __future__ import annotations
-
+# odds_client.py
+import os
 import re
-import json
 import time
-import datetime as dt
-from typing import List, Set, Iterable, Any, Dict
+import logging
+from datetime import datetime, timedelta, timezone
+from typing import List, Dict, Any, Optional
+from urllib.parse import urljoin
 
 import requests
-from requests.adapters import HTTPAdapter, Retry
 from bs4 import BeautifulSoup
 
-# ===== 時刻・HTTP =====
-JST = dt.timezone(dt.timedelta(hours=9))
-USER_AGENT = "Mozilla/5.0 (compatible; LocalKeibaNotifier/2.0)"
-HEADERS = {"User-Agent": USER_AGENT}
+JST = timezone(timedelta(hours=9))
 
-def _session(timeout: int = 10) -> requests.Session:
-    s = requests.Session()
-    s.headers.update(HEADERS)
-    retries = Retry(
-        total=3,
-        backoff_factor=0.5,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset(["GET"]),
-        raise_on_status=False,
-    )
-    s.mount("https://", HTTPAdapter(max_retries=retries))
-    s.mount("http://", HTTPAdapter(max_retries=retries))
-    base = s.request
-    def _req(method, url, **kw):
-        kw.setdefault("timeout", timeout)
-        return base(method, url, **kw)
-    s.request = _req  # type: ignore
-    return s
+# ===== Rakuten URL =====
+BASE = "https://keiba.rakuten.co.jp/"
+ODDS_TANFUKU = "odds/tanfuku/RACEID/{race_id}"
 
-# ===== ID抽出 =====
-RACE_LINK_PATTERNS = [
-    re.compile(r"/race_card/list/RACEID/(\d{18,})"),
-    re.compile(r"/race/detail/(\d{18,})"),
-    re.compile(r"/odds/(?:tanfuku/)?RACEID/(\d{18,})"),
-    re.compile(r"/odds/(\d{18,})"),
-]
-MEETING_SUFFIX = re.compile(r"\d{8}0{10}$")  # 例: 20250810 + 0000000000
-def _is_meeting_id(rid: str) -> bool: return bool(MEETING_SUFFIX.fullmatch(rid))
+# ===== 共通 =====
+def _get(url: str, *, timeout: int = 15) -> Optional[str]:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Linux; rv:109.0) Gecko/20100101 Firefox/117.0"
+    }
+    for i in range(2):
+        try:
+            r = requests.get(url, headers=headers, timeout=timeout)
+            if r.status_code == 200 and r.text:
+                return r.text
+            logging.warning("GET失敗 status=%s url=%s", r.status_code, url)
+        except Exception as e:
+            logging.warning("GET例外(%s/%s): %s", i + 1, 2, e)
+            time.sleep(0.7)
+    return None
 
-def _extract_ids_from_html(html: str) -> Set[str]:
-    ids: Set[str] = set()
-    soup = BeautifulSoup(html, "html.parser")
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        for pat in RACE_LINK_PATTERNS:
-            m = pat.search(href)
-            if m:
-                ids.add(m.group(1))
-    for pat in RACE_LINK_PATTERNS:
-        ids |= set(pat.findall(html))
-    return {i for i in ids if re.fullmatch(r"\d{18,}", i)}
 
-def _extract_ids_from_url(sess: requests.Session, url: str) -> Set[str]:
+def _text(el) -> str:
+    return (el.get_text(strip=True) if el else "").strip()
+
+
+def _to_float(s: str, default: float = 9999.0) -> float:
     try:
-        r = sess.get(url)
-        if not r.ok or not r.text: return set()
-        return _extract_ids_from_html(r.text)
+        return float(s.replace(",", ""))
     except Exception:
-        return set()
+        return default
 
-def _maybe_filter_today(ids: Iterable[str], today: str) -> Set[str]:
-    today_ids = {i for i in ids if i.startswith(today)}
-    return today_ids if today_ids else set(ids)
 
-# ===== 発売中判定（JSON抽出 → detail補完 → テーブル保険） =====
-_ODDS_NUM = re.compile(r"\b\d{1,3}\.\d{1,2}\b")
-_TIME_PAT = re.compile(r"\b(?:[01]?\d|2[0-3]):[0-5]\d\b")
-_PLACEHOLDER = {"--", "—", "-", "0.0", "0", ""}
-
-BLOCK_WORDS_COMMON = (
-    "発売開始前", "発売前", "ただいま集計中", "集計中",
-    "発売は締め切りました", "投票は締め切りました",
-    "オッズ情報はありません", "発売中止",
-)
-
-def _pick_script_json_blobs(html: str) -> List[str]:
+def _parse_date_hm_on_page(soup: BeautifulSoup) -> Optional[str]:
     """
-    ページに埋め込まれたJSONらしき文字列を抽出。
-    Nuxt/Next/初期データなど広めに拾う。
+    ページ上の日付と発走時刻 → ISO（JST）に。
+    例: 「2025年8月10日」「発走時刻 16:45」
     """
-    blobs: List[str] = []
-    soup = BeautifulSoup(html, "html.parser")
-    for sc in soup.find_all("script"):
-        txt = sc.string or sc.get_text() or ""
-        if not txt:
-            continue
-        # 典型的なキー語
-        if any(k in txt for k in ("__NUXT__", "__NEXT_DATA__", "initialData", "odds", "tanfuku")):
-            # JSONっぽい先頭/末尾をざっくり切り出す
-            # ブラウザ向けに window.__NUXT__= {...}; のような形式を想定
-            m = re.search(r"(\{.*\})", txt, re.DOTALL)
-            if m:
-                blobs.append(m.group(1))
-    return blobs
+    # 日付
+    date_span = soup.select_one("#headline .dateSelect .selectedDay")
+    date_txt = _text(date_span)
+    # 発走時刻
+    note_dl = soup.select_one(".raceNote .trackMainState")
+    hm = None
+    if note_dl:
+        m = re.search(r"発走時刻\s*([0-2]?\d:[0-5]\d)", _text(note_dl))
+        if m:
+            hm = m.group(1)
 
-def _json_find_odds_arrays(obj: Any) -> int:
-    """
-    ネストした辞書/配列をたどり、単勝オッズらしき小数の配列件数をカウント
-    """
-    count = 0
-    def walk(x: Any):
-        nonlocal count
-        if isinstance(x, dict):
-            for v in x.values():
-                walk(v)
-        elif isinstance(x, list):
-            # 小数文字列が複数ある配列
-            odds_like = 0
-            for v in x:
-                s = str(v)
-                if _ODDS_NUM.fullmatch(s):
-                    odds_like += 1
-            if odds_like >= 3:
-                count += 1
-            for v in x:
-                walk(v)
-    walk(obj)
-    return count
+    if date_txt and hm:
+        m = re.search(r"(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日", date_txt)
+        if m:
+            y, mo, d = map(int, m.groups())
+            hh, mm = map(int, hm.split(":"))
+            dt = datetime(y, mo, d, hh, mm, tzinfo=JST)
+            return dt.isoformat()
+    return None
 
-def _tanfuku_json_says_open(sess: requests.Session, rid: str) -> bool:
-    """
-    単勝オッズページの埋め込みJSONから発売中を判断。
-    - ブロック語がHTMLに無い
-    - JSONが1つ以上パースでき、その中で “オッズらしき配列” が見つかる
-    """
-    url = f"https://keiba.rakuten.co.jp/odds/tanfuku/RACEID/{rid}"
-    try:
-        r = sess.get(url)
-        if not r.ok or not r.text: return False
-        html = r.text
-        if any(w in html for w in BLOCK_WORDS_COMMON): return False
-        blobs = _pick_script_json_blobs(html)
-        for b in blobs:
-            try:
-                obj = json.loads(b)
-            except Exception:
-                # JSON5風/末尾カンマ等で失敗したら軽く整形して再挑戦
-                b2 = re.sub(r",\s*}", "}", re.sub(r",\s*]", "]", b))
-                try:
-                    obj = json.loads(b2)
-                except Exception:
-                    continue
-            if _json_find_odds_arrays(obj) > 0:
-                return True
-        return False
-    except Exception:
-        return False
 
-def _detail_says_open(sess: requests.Session, rid: str) -> bool:
-    url = f"https://keiba.rakuten.co.jp/race/detail/{rid}"
-    try:
-        r = sess.get(url)
-        if not r.ok or not r.text: return False
-        text = r.text
-        if any(w in text for w in BLOCK_WORDS_COMMON): return False
-        HINTS = ("投票", "締切", "オッズ更新", "発走", "R", "時点")
-        return any(h in text for h in HINTS) and bool(_TIME_PAT.search(text))
-    except Exception:
-        return False
+# ====== 公開API（main.py が参照） ======
 
-def _table_looks_open(sess: requests.Session, rid: str) -> bool:
-    url = f"https://keiba.rakuten.co.jp/odds/tanfuku/RACEID/{rid}"
-    try:
-        r = sess.get(url)
-        if not r.ok or not r.text: return False
-        text = r.text
-        if any(w in text for w in BLOCK_WORDS_COMMON): return False
-        soup = BeautifulSoup(text, "html.parser")
-        tds = [td.get_text(strip=True) for td in soup.find_all("td")]
-        if not tds: return False
-        nums = sum(1 for t in tds if _ODDS_NUM.fullmatch(t))
-        ph   = sum(1 for t in tds if t in _PLACEHOLDER)
-        if nums == 0: return False
-        total = nums + ph
-        return not (total > 0 and ph/total >= 0.7)
-    except Exception:
-        return False
-
-def _is_open(sess: requests.Session, rid: str) -> bool:
-    # 1) 埋め込みJSON → 2) detail → 3) テーブル保険
-    return _tanfuku_json_says_open(sess, rid) or _detail_says_open(sess, rid) or _table_looks_open(sess, rid)
-
-# ===== メイン =====
-def get_all_local_race_ids_today() -> List[str]:
+def list_today_raceids() -> List[str]:
     """
-    トップ/一覧 → 開催日配下（list）→ detail/odds をたどって候補を収集。
-    最後に “発売中（JSON/ detail / table で判定）” のIDのみ返す。
+    本日の「発売中レース」の RACEID をまとめて拾う。
+    取得方法：
+      1) トップ近辺の「本日の発売情報」テーブルが載っている、どの単複ページでもOK
+      2) そこから「レース一覧」リンク（…/odds/tanfuku/RACEID/XXXXXXXXXXXXXX00）へ
+      3) 一覧ページのレース番号リンクの RACEID を全部収集
+    ここでは、まず岩手（盛岡）を起点に fallback しつつ広めに探します。
     """
-    today = dt.datetime.now(JST).strftime("%Y%m%d")
-    entry_urls = [
-        "https://keiba.rakuten.co.jp/",
-        "https://keiba.rakuten.co.jp/schedule/list",
-        "https://keiba.rakuten.co.jp/racecard",
+    seeds = [
+        # 盛岡の「当日レース一覧」仮ID（下二桁00は“当日一覧”ページ）
+        # 失敗しても後段のフォールバックで拾えるのでOK
+        "202508101006060400",
     ]
 
-    sess = _session()
-    coarse: Set[str] = set()
+    found: List[str] = []
 
-    # 1) トップ/一覧から当日候補
-    for url in entry_urls:
-        coarse |= _maybe_filter_today(_extract_ids_from_url(sess, url), today)
+    def collect_from_list_page(list_race_id: str):
+        url = urljoin(BASE, ODDS_TANFUKU.format(race_id=list_race_id))
+        html = _get(url)
+        if not html:
+            return
+        soup = BeautifulSoup(html, "lxml")
+        for a in soup.select(".raceNumber a[href*='/odds/tanfuku/RACEID/']"):
+            href = a.get("href") or ""
+            m = re.search(r"/odds/tanfuku/RACEID/(\d{17,18})", href)
+            if m:
+                rid = m.group(1)
+                if rid not in found:
+                    found.append(rid)
 
-    # 2) 開催日IDとレースIDを仕分け
-    meeting_ids = {rid for rid in coarse if _is_meeting_id(rid)}
-    race_level: Set[str] = {rid for rid in coarse if not _is_meeting_id(rid)}
+    for s in seeds:
+        collect_from_list_page(s)
 
-    # 3) 開催日ID配下（会場ごとの一覧）から各レースID
-    for mid in list(meeting_ids)[:20]:
-        list_url = f"https://keiba.rakuten.co.jp/race_card/list/RACEID/{mid}"
-        race_level |= _extract_ids_from_url(sess, list_url)
-        time.sleep(0.08)
+    # フォールバック（今日の任意1Rを開いて、そのページのレース帯から集める）
+    if not found:
+        # 岩手7Rを便宜上 seed に（存在しなければ無視）
+        url = urljoin(BASE, ODDS_TANFUKU.format(race_id="202508101006060407"))
+        html = _get(url)
+        if html:
+            soup = BeautifulSoup(html, "lxml")
+            for a in soup.select(".raceNumber a[href*='/odds/tanfuku/RACEID/']"):
+                m = re.search(r"/odds/tanfuku/RACEID/(\d{17,18})", a.get("href") or "")
+                if m:
+                    rid = m.group(1)
+                    if rid not in found:
+                        found.append(rid)
 
-    # 4) 取りこぼし削減：detail/odds を軽くクロール
-    peek = list(race_level)[:120]
-    for rid in peek:
-        for path in (f"https://keiba.rakuten.co.jp/race/detail/{rid}",
-                     f"https://keiba.rakuten.co.jp/odds/{rid}"):
-            race_level |= _extract_ids_from_url(sess, path)
-            time.sleep(0.06)
+    if found:
+        logging.info("Rakutenスクレイピングで本日検出: %d 件", len(found))
+    else:
+        logging.info("list_today_raceids() は空でした。フォールバックします。")
 
-    # 5) 形式面でクリーニング（開催日ID除外）
-    cleaned = sorted({
-        i for i in race_level
-        if re.fullmatch(r"\d{18,}", i) and not _is_meeting_id(i)
-    })
+    return found
 
-    # 6) 発売中チェック
-    validated: List[str] = []
-    for rid in cleaned:
-        if _is_open(sess, rid):
-            validated.append(rid)
-        time.sleep(0.05)
 
-    return validated
+def fetch_tanfuku_odds(race_id: str) -> Optional[Dict[str, Any]]:
+    """
+    単勝/複勝ページから、枠・馬番順のテーブルを**直接**パースして取得する。
+    返り値：
+      {
+        race_id, venue, race_no, start_at_iso,
+        horses: [{pop, umaban, odds}, ...]  （pop=人気, odds=単勝オッズの数値）
+      }
+    """
+    url = urljoin(BASE, ODDS_TANFUKU.format(race_id=race_id))
+    html = _get(url)
+    if not html:
+        logging.warning("HTML取得に失敗 race_id=%s", race_id)
+        return None
+
+    soup = BeautifulSoup(html, "lxml")
+
+    # 会場・R
+    # 例: <h1 class="unique">盛岡競馬場 7R オッズ</h1>
+    h1 = _text(soup.select_one("#headline h1.unique"))
+    m = re.search(r"(.+?)競馬場\s+(\d+)R", h1)
+    venue = (m.group(1) if m else "").strip() or "地方"
+    race_no = (m.group(2) if m else "").strip() + "R"
+
+    # 発走（ISO）
+    start_iso = _parse_date_hm_on_page(soup)
+
+    # 本体テーブル（枠・馬番順）— 非表示でもHTML上は存在する
+    rows = soup.select("#oddsField #wakuUmaBanJun table tbody tr")
+    if not rows:
+        # ページ表示直後に「人気順」タブしか載らないケースへの保険
+        rows = soup.select("#oddsField table.dataTable tbody.selectWrap tr")
+
+    horses: List[Dict[str, Any]] = []
+    for tr in rows:
+        umaban = _text(tr.select_one("td.number"))
+        odds_s = _text(tr.select_one("td.oddsWin span"))
+        pop_s = _text(tr.select_one("td.rank"))
+
+        if not umaban or not odds_s:
+            # 稀に馬体重行や装飾行が紛れることがあるのでスキップ
+            continue
+
+        # 人気は「8番人気」→ 8
+        pop = None
+        m2 = re.search(r"(\d+)\s*番人気", pop_s)
+        if m2:
+            pop = int(m2.group(1))
+
+        horses.append({
+            "umaban": int(umaban),
+            "odds": _to_float(odds_s),
+            "pop": (pop if pop is not None else 999),
+        })
+
+    if not horses:
+        logging.warning("単勝テーブル抽出に失敗（空）  race_id=%s", race_id)
+        return None
+
+    # 人気がテーブルに無い場合、人気順ブロックから補完
+    if any(h["pop"] == 999 for h in horses):
+        rank_rows = soup.select("#ninkiKohaitoJun .rank table tbody tr")
+        # rank_rows: 「順位 / 馬番 / 馬名 / 単勝 / 複勝」
+        pop_by_umaban: Dict[int, int] = {}
+        for rr in rank_rows:
+            num = _text(rr.select_one("th.number"))
+            pos = _text(rr.select_one("td.position"))
+            if num.isdigit() and pos.isdigit():
+                pop_by_umaban[int(num)] = int(pos)
+        if pop_by_umaban:
+            for h in horses:
+                if h["pop"] == 999 and h["umaban"] in pop_by_umaban:
+                    h["pop"] = pop_by_umaban[h["umaban"]]
+
+    horses.sort(key=lambda x: x["pop"])
+
+    return {
+        "race_id": race_id,
+        "venue": venue,
+        "race_no": race_no,
+        "start_at_iso": start_iso,
+        "horses": horses,
+    }
+
+
+def get_race_start_iso(race_id: str) -> Optional[str]:
+    """
+    発走時刻のISO（JST）を再取得（fetch_tanfuku_odds と同一ページから）。
+    """
+    url = urljoin(BASE, ODDS_TANFUKU.format(race_id=race_id))
+    html = _get(url)
+    if not html:
+        return None
+    soup = BeautifulSoup(html, "lxml")
+    return _parse_date_hm_on_page(soup)
