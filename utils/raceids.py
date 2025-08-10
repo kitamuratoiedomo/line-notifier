@@ -1,4 +1,4 @@
-# utils/raceids.py  — 本日の「地方競馬・全レース」の RACEID を安全に列挙
+# utils/raceids.py  — 本日の「地方競馬・全レース」RACEIDを安全取得（検証付き）
 from __future__ import annotations
 
 import re
@@ -12,7 +12,7 @@ from bs4 import BeautifulSoup
 
 # ===== 時刻・HTTP =====
 JST = dt.timezone(dt.timedelta(hours=9))
-USER_AGENT = "Mozilla/5.0 (compatible; LocalKeibaNotifier/1.1)"
+USER_AGENT = "Mozilla/5.0 (compatible; LocalKeibaNotifier/1.2)"
 HEADERS = {"User-Agent": USER_AGENT}
 
 def _session(timeout: int = 10) -> requests.Session:
@@ -27,8 +27,6 @@ def _session(timeout: int = 10) -> requests.Session:
     )
     s.mount("https://", HTTPAdapter(max_retries=retries))
     s.mount("http://", HTTPAdapter(max_retries=retries))
-
-    # 既定タイムアウトを強制
     orig_request = s.request
     def _req(method, url, **kw):
         kw.setdefault("timeout", timeout)
@@ -37,25 +35,20 @@ def _session(timeout: int = 10) -> requests.Session:
     return s
 
 # ===== ID 抽出用パターン =====
-# レース個別ページ/オッズページ/レース一覧のリンクから RACEID を拾う
 RACE_LINK_PATTERNS = [
     re.compile(r"/race_card/list/RACEID/(\d{18,})"),
     re.compile(r"/race/detail/(\d{18,})"),
     re.compile(r"/odds/(?:tanfuku/)?RACEID/(\d{18,})"),
     re.compile(r"/odds/(\d{18,})"),
 ]
-
-# 開催日ID（末尾10桁が全部0）を識別：例 20250810 + 0000000000
-MEETING_SUFFIX = re.compile(r"\d{8}0{10}$")
+MEETING_SUFFIX = re.compile(r"\d{8}0{10}$")  # 20250810 + 0000000000
 
 def _is_meeting_id(rid: str) -> bool:
     return bool(MEETING_SUFFIX.fullmatch(rid))
 
 # ===== 抽出ユーティリティ =====
 def _extract_ids_from_html(html: str) -> Set[str]:
-    """HTMLから RACEID 候補を収集（href優先＋保険でテキスト全体も走査）"""
     ids: Set[str] = set()
-
     soup = BeautifulSoup(html, "html.parser")
     for a in soup.find_all("a", href=True):
         href = a["href"]
@@ -63,12 +56,8 @@ def _extract_ids_from_html(html: str) -> Set[str]:
             m = pat.search(href)
             if m:
                 ids.add(m.group(1))
-
-    # 念のため本文全体からも拾う（取りこぼし対策）
-    for pat in RACE_LINK_PATTERNS:
+    for pat in RACE_LINK_PATTERNS:  # 念のため本文走査
         ids |= set(pat.findall(html))
-
-    # 数字18桁以上に限定
     return {i for i in ids if re.fullmatch(r"\d{18,}", i)}
 
 def _extract_ids_from_url(sess: requests.Session, url: str) -> Set[str]:
@@ -81,21 +70,38 @@ def _extract_ids_from_url(sess: requests.Session, url: str) -> Set[str]:
         return set()
 
 def _maybe_filter_today(ids: Iterable[str], today: str) -> Set[str]:
-    """多くのIDは先頭にYYYYMMDDを含む→当日優先。無ければそのまま返す。"""
     today_ids = {i for i in ids if i.startswith(today)}
     return today_ids if today_ids else set(ids)
+
+# ===== オッズページの有無を検証 =====
+_TANFUKU_NUM_RE = re.compile(r"\b\d+\.\d\b")  # 例: 1.2 / 12.3
+
+def _has_tanfuku(sess: requests.Session, rid: str) -> bool:
+    """
+    単勝オッズページが実体を持つか簡易検証。
+    - 200系かつ本文に「単勝」テキストがあり、かつ少なくとも1つの小数オッズが見える
+    """
+    url = f"https://keiba.rakuten.co.jp/odds/tanfuku/RACEID/{rid}"
+    try:
+        r = sess.get(url)
+        if not r.ok or not r.text:
+            return False
+        text = r.text
+        if "単勝" not in text:
+            return False
+        if not _TANFUKU_NUM_RE.search(text):
+            return False
+        return True
+    except Exception:
+        return False
 
 # ===== メイン関数 =====
 def get_all_local_race_ids_today() -> List[str]:
     """
-    Rakuten競馬のトップ/一覧 → （必要に応じて）開催日ID配下を深掘りして、
-    “本日の地方競馬・各レースIDのみ” を返す。
-    - 開催日ID（末尾10桁が0）は除外
-    - 取りこぼしを減らすため detail/odds を薄くプレビュー
-    - 失敗時は空リスト
+    トップ/一覧 → 開催日配下 → detail/odds をたどって候補を収集。
+    最後に “単勝オッズページが存在するIDのみ” に絞り込んで返す。
     """
     today = dt.datetime.now(JST).strftime("%Y%m%d")
-
     entry_urls = [
         "https://keiba.rakuten.co.jp/",
         "https://keiba.rakuten.co.jp/schedule/list",
@@ -105,7 +111,7 @@ def get_all_local_race_ids_today() -> List[str]:
     sess = _session()
     coarse: Set[str] = set()
 
-    # 1) まずトップ/一覧から “当日らしきID” を拾う
+    # 1) トップ/一覧から当日候補
     for url in entry_urls:
         coarse |= _maybe_filter_today(_extract_ids_from_url(sess, url), today)
 
@@ -113,13 +119,13 @@ def get_all_local_race_ids_today() -> List[str]:
     meeting_ids = {rid for rid in coarse if _is_meeting_id(rid)}
     race_level: Set[str] = {rid for rid in coarse if not _is_meeting_id(rid)}
 
-    # 3) 開催日IDの配下一覧を開き、そこから“各レースID”を抽出
-    for mid in list(meeting_ids)[:12]:  # 安全のため最大12会場まで
+    # 3) 開催日IDの配下から「各レースID」を取得
+    for mid in list(meeting_ids)[:12]:  # 最大12会場
         list_url = f"https://keiba.rakuten.co.jp/race_card/list/RACEID/{mid}"
         race_level |= _extract_ids_from_url(sess, list_url)
-        time.sleep(0.15)
+        time.sleep(0.12)
 
-    # 4) 取りこぼし削減：一部の detail/odds を覗く
+    # 4) 取りこぼし対策：一部 detail/odds を覗く
     peek = list(race_level)[:40]
     for rid in peek:
         for path in (
@@ -127,12 +133,20 @@ def get_all_local_race_ids_today() -> List[str]:
             f"https://keiba.rakuten.co.jp/odds/{rid}",
         ):
             race_level |= _extract_ids_from_url(sess, path)
-            time.sleep(0.12)
+            time.sleep(0.1)
 
-    # 5) ルール最終適用：18桁以上 & 開催日ID除外 → 昇順
+    # 5) 形式面でクリーニング（開催日ID除外）
     cleaned = sorted({
         i for i in race_level
         if re.fullmatch(r"\d{18,}", i) and not _is_meeting_id(i)
     })
 
-    return cleaned
+    # 6) **ここが肝**: 単勝オッズページの実体チェックで最終フィルタ
+    validated: List[str] = []
+    for rid in cleaned:
+        if _has_tanfuku(sess, rid):
+            validated.append(rid)
+        # 優しめにスロットル（サイト負荷軽減）
+        time.sleep(0.08)
+
+    return validated
