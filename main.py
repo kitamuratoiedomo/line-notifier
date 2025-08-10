@@ -1,4 +1,4 @@
-# main.py
+# main.py (complete replacement)
 import os
 import json
 import time
@@ -22,12 +22,20 @@ except Exception as e:
     logging.warning("sheets_client を読み込めませんでした（単一宛先にフォールバック）: %s", e)
     SHEET_AVAILABLE = False
 
-# オッズ・レース情報
+# オッズ・レース情報（通常ルート）
 from odds_client import (
-    list_today_raceids,       # -> List[str]
+    list_today_raceids,       # -> List[str]  ※空なら後述のフォールバックに回す
     fetch_tanfuku_odds,       # -> Dict{race_id, venue, race_no, start_at_iso, horses:[{pop, umaban, odds}]}
     get_race_start_iso,       # -> "YYYY-MM-DDTHH:MM:SS+09:00"
 )
+
+# フォールバック（本日の地方競馬・全RACEID 自動列挙）
+try:
+    from utils.raceids import get_all_local_race_ids_today  # -> List[str]
+    RACEIDS_SCRAPER_AVAILABLE = True
+except Exception as e:
+    logging.warning("utils.raceids が読み込めませんでした（最終フォールバック不可）: %s", e)
+    RACEIDS_SCRAPER_AVAILABLE = False
 
 # 騎手ランク（戦略③は1番人気のみ表示。それ以外は1〜3番人気）
 try:
@@ -49,7 +57,6 @@ KILL_SWITCH = os.getenv("NOTIFY_ENABLED", "1") != "1"           # 1で有効、0
 DRY_RUN     = os.getenv("DRY_RUN_MESSAGE", "0") == "1"          # 1で送らずログのみ
 
 # 通知時間窓（販売締切時刻＝発走時刻 − CUTOFF_OFFSET_MIN を基準）
-# 例: 販売締切5分前に通知したい → CUTOFF_OFFSET_MIN=5, WINDOW_BEFORE_MIN=5, WINDOW_AFTER_MIN=0 など
 CUTOFF_OFFSET_MIN = int(os.getenv("CUTOFF_OFFSET_MIN", "5"))    # 販売締切 = 発走 − 5分（デフォルト）
 WINDOW_BEFORE_MIN = int(os.getenv("WINDOW_BEFORE_MIN", "5"))    # 締切のX分前から
 WINDOW_AFTER_MIN  = int(os.getenv("WINDOW_AFTER_MIN", "0"))     # 締切のY分後まで
@@ -144,6 +151,53 @@ def send_line_message(text: str) -> None:
         logging.warning("宛先がありません（SHEETもLINE_USER_IDもなし）")
 
 
+# ============ レース列挙（ここが今回の追加・強化点） ============
+def _parse_env_raceids() -> List[str]:
+    env_rids = os.getenv("RACEIDS", "").strip()
+    if not env_rids:
+        return []
+    rids = [x.strip() for x in env_rids.split(",") if x.strip()]
+    logging.info("RACEIDS（環境変数）件数: %d", len(rids))
+    return rids
+
+def resolve_race_ids() -> List[str]:
+    """
+    1) RACEIDS 環境変数があればそれを使用
+    2) odds_client.list_today_raceids() が返せばそれを使用
+    3) それでも空なら utils.raceids.get_all_local_race_ids_today() で “本日の地方競馬・全レース” を自動列挙
+    """
+    # 1) 明示指定が最優先
+    rids = _parse_env_raceids()
+    if rids:
+        return rids
+
+    # 2) 通常ルート（odds_client）
+    try:
+        rids = list_today_raceids()
+        if rids:
+            logging.info("list_today_raceids() から %d 件取得", len(rids))
+            return rids
+        else:
+            logging.info("list_today_raceids() は空でした。フォールバックします。")
+    except Exception as e:
+        logging.warning("list_today_raceids() で例外: %s（フォールバックへ）", e)
+
+    # 3) 最終フォールバック（Rakutenスクレイピング）
+    if RACEIDS_SCRAPER_AVAILABLE:
+        try:
+            rids = get_all_local_race_ids_today()
+            logging.info("Rakutenスクレイピングで本日検出: %d 件", len(rids))
+            if rids[:10]:
+                logging.debug("先頭10件: %s", rids[:10])
+            return rids
+        except Exception as e:
+            logging.warning("Rakutenスクレイピング失敗: %s", e)
+
+    # どうしてもダメな場合
+    logging.error("対象レースIDが取得できません（開催なし or 取得失敗）。")
+    return []
+
+
 # ============ 戦略判定ロジック ============
 def pick_top(horses: List[Dict[str, Any]], n: int) -> List[Dict[str, Any]]:
     return [h for h in horses if h.get("pop", 999) <= n]
@@ -202,7 +256,6 @@ def find_strategy_for_race(od: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             candidates = candidates[:4]
             n1 = [h for h in horses if h["pop"] == 1][0]["umaban"]
             others = [h["umaban"] for h in candidates]
-            # 買い目は「1 → 相手4頭 → 相手4頭」（2・3着入れ替え）最大12点
             detail = (
                 f"【戦略一致】③\n"
                 f"1着固定（{n1}）- 相手流し（{','.join(map(str, others))}）\n"
@@ -221,7 +274,6 @@ def find_strategy_for_race(od: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         n1 = [h for h in horses if h["pop"] == 1][0]["umaban"]
         n2 = [h for h in horses if h["pop"] == 2][0]["umaban"]
         n3 = [h for h in horses if h["pop"] == 3][0]["umaban"]
-        # 戦略②と同じフォーマット要望
         detail = (
             f"【戦略一致】④\n"
             f"3着固定　（{n1}×{n2}）- {n3}（３着固定）、三連単2点"
@@ -252,26 +304,22 @@ def build_message(od: Dict[str, Any], strat: Dict[str, Any],
     body   = strat["buy_detail"]
     footer = f"単勝オッズ確認: {race_url}"
 
-    # 騎手表示ルール（省略運用。将来、馬番→騎手名のマップが入れば拡張）
-    # ③は1番人気のみ表示ルールだが、現状は名前ソースがないためスキップ
-    # ①②④は1〜3番人気の騎手表示ルールも同様にスキップ
-
     return f"{header}\n{body}\n{footer}"
 
 
 # ============ 戦略判定の実行 ============
 def find_strategy_matches() -> List[Dict[str, Any]]:
     """
-    全レース（list_today_raceids）に対して:
+    監視対象レースに対して:
       - オッズ取得
       - 発走→販売締切（発走−CUTOFF_OFFSET_MIN）計算
       - 戦略判定
       - 1件につき {race_id, start_at_iso, cutoff_at_iso, strategy, message} を返却
     """
     results: List[Dict[str, Any]] = []
-    race_ids = list_today_raceids()
+    race_ids = resolve_race_ids()
     if not race_ids:
-        logging.info("対象レースIDがありません（RACEIDSなどの設定を確認）")
+        logging.info("対象レースIDがありません（開催なし or 取得失敗）")
         return results
 
     for rid in race_ids:
@@ -283,7 +331,6 @@ def find_strategy_matches() -> List[Dict[str, Any]]:
         try:
             start_iso = get_race_start_iso(rid)
         except Exception:
-            # 取得失敗時はオッズ側の推定を利用
             start_iso = od.get("start_at_iso")
 
         if not start_iso:
@@ -328,8 +375,8 @@ def main():
         return
 
     for h in hits:
-        race_id   = h.get("race_id", "")
-        strategy  = h.get("strategy", "")
+        race_id    = h.get("race_id", "")
+        strategy   = h.get("strategy", "")
         cutoff_iso = h.get("cutoff_at_iso", "")
         start_iso  = h.get("start_at_iso", "")
 
