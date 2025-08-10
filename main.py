@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-Rakuten競馬：本日の出馬表(一覧)から「投票受付中」のレースを抽出し、
-RACEID を拾って単勝/複勝オッズページにアクセスする最小・堅牢版。
+Rakuten競馬：本日の出馬表(一覧)から RACEID を抽出し、
+単勝/複勝オッズページへ疎通確認する“堅牢版オールインワン”。
 
-ポイント
-- 公式「本日の発売情報」(#todaysTicket)だけを見て、"投票受付中" の <a> の href から RACEID を正規表現で抽出
-- 取得した RACEID で https://keiba.rakuten.co.jp/odds/tanfuku/RACEID/{id} にアクセス
-- どのページ構造でも壊れにくいように、厳密な CSS セレクタには依存しすぎない
-- 既存の環境変数 (DRY_RUN, NOTIFIED_PATH など) があれば軽く対応
+変更点（重要）
+- 「投票受付中/発走」の文言依存をやめ、#todaysTicket 配下の a[href]から
+  RACEID を無条件回収（=取りこぼし防止）。
+- #todaysTicket が無い/崩れている場合は全リンク走査にフォールバックし、RACEID を抽出。
+- 何件拾えたか・どの段に失敗したかを段階ログで可視化。
+- 既存の NOTIFIED_PATH / DRY_RUN / KILL_SWITCH を継承。MAX_CHECK でチェック数を制限可能。
 """
 
 import os
@@ -46,6 +47,7 @@ SLEEP_BETWEEN = (0.8, 1.6)
 NOTIFIED_PATH = os.getenv("NOTIFIED_PATH", "/tmp/notified_races.json")
 DRY_RUN = os.getenv("DRY_RUN", "False").lower() == "true"
 KILL_SWITCH = os.getenv("KILL_SWITCH", "False").lower() == "true"
+MAX_CHECK = int(os.getenv("MAX_CHECK", "50"))  # 念のためチェック上限
 
 # -------------------------
 # ユーティリティ
@@ -60,7 +62,6 @@ def fetch(url: str) -> str:
         try:
             r = SESSION.get(url, timeout=TIMEOUT)
             r.raise_for_status()
-            # 文字コードはサイトがUTF-8宣言済みだが、保険で設定
             r.encoding = "utf-8"
             return r.text
         except Exception as e:
@@ -83,39 +84,50 @@ def save_notified(d: Dict[str, float]) -> None:
         json.dump(d, f, ensure_ascii=False, indent=2)
 
 # -------------------------
-# 1) 今日の出馬表(一覧)から「投票受付中」の RACEID を集める
+# 1) 今日の出馬表(一覧)から RACEID を集める
 # -------------------------
 RACEID_RE = re.compile(r"/RACEID/(\d{18})")
 
 def list_today_raceids() -> List[str]:
+    logging.info("### LIST v3 start ###")
     ymd = get_today_str()
     list_url = f"https://keiba.rakuten.co.jp/race_card/list/RACEID/{ymd}0000000000"
+    logging.info(f"[INFO] fetch(list) => {list_url}")
+
     html = fetch(list_url)
+    logging.info(f"[INFO] fetched html length={len(html)}")
     soup = BeautifulSoup(html, "lxml")
 
-    table = soup.find(id="todaysTicket")
-    if not table:
-        logging.info("[INFO] #todaysTicket が見つからないためフォールバックします（全リンク走査）")
-        links = soup.find_all("a", href=True)
-    else:
-        # 「投票受付中」を含むセル（td.nextRace）配下のリンクを狙う
-        links = table.select("td.nextRace a[href], td a[href]")
-
     raceids: List[str] = []
-    for a in links:
-        text = (a.get_text(strip=True) or "")
-        href = a["href"]
-        m = RACEID_RE.search(href)
-        if not m:
-            continue
-        race_id = m.group(1)
 
-        # 「投票受付中」が含まれる行に限定（厳しめフィルタ）
-        if "投票受付中" in text or "発走" in text:
-            raceids.append(race_id)
+    # まず #todaysTicket を優先（ここに“今日の発売情報”が集約される）
+    table = soup.find(id="todaysTicket")
+    if table:
+        logging.info("[INFO] #todaysTicket found")
+        links = table.select("a[href]")
+        logging.info(f"[INFO] links_in_todaysTicket={len(links)}")
+        for a in links:
+            href = a.get("href", "")
+            m = RACEID_RE.search(href)
+            if m:
+                raceids.append(m.group(1))
+    else:
+        # 全リンク走査フォールバック
+        logging.info("[INFO] #todaysTicket missing -> 全リンク走査へ")
+        links = soup.find_all("a", href=True)
+        logging.info(f"[INFO] links_all={len(links)}")
+        for a in links:
+            href = a["href"]
+            m = RACEID_RE.search(href)
+            if m:
+                raceids.append(m.group(1))
 
     # 重複排除＆安定ソート
     raceids = sorted(set(raceids))
+    logging.info(f"[INFO] RACEID collected={len(raceids)}")
+    if raceids[:5]:
+        logging.info(f"[INFO] sample: {raceids[:5]} ...")
+
     return raceids
 
 # -------------------------
@@ -123,19 +135,24 @@ def list_today_raceids() -> List[str]:
 # -------------------------
 def check_tanfuku_page(race_id: str) -> Optional[Dict]:
     url = f"https://keiba.rakuten.co.jp/odds/tanfuku/RACEID/{race_id}"
-    html = fetch(url)
+    try:
+        html = fetch(url)
+    except Exception as e:
+        logging.warning(f"[WARN] odds fetch失敗: {race_id} {e}")
+        return None
+
     soup = BeautifulSoup(html, "lxml")
 
-    # 見出しや時刻など、最低限のメタを拾う（強すぎる依存は避ける）
+    # 見出しや時刻など、最低限のメタ
     h1 = soup.find("h1")
     nowtime = soup.select_one(".withUpdate .nowTime")
     race_title = h1.get_text(strip=True) if h1 else "N/A"
     now_label = nowtime.get_text(strip=True) if nowtime else ""
 
-    # 単勝のテーブルがあるか軽く確認（壊れてないか）
+    # 単/複のテーブルがあるか（壊れてないか）
     odds_table = soup.find("table", {"summary": re.compile("オッズ")})
     if not odds_table:
-        logging.warning(f"[WARN] 単勝/複勝テーブルが見つかりません: {url}")
+        logging.warning(f"[WARN] 単勝/複勝テーブル見つからず: {url}")
         return None
 
     return {
@@ -155,27 +172,26 @@ def main():
         return
 
     logging.info(f"[INFO] ジョブ開始 JST={datetime.now(JST):%Y-%m-%d %H:%M:%S}")
-    logging.info(f"[INFO] NOTIFIED_PATH={NOTIFIED_PATH} KILL_SWITCH={KILL_SWITCH} DRY_RUN={DRY_RUN}")
+    logging.info(f"[INFO] NOTIFIED_PATH={NOTIFIED_PATH} KILL_SWITCH={KILL_SWITCH} DRY_RUN={DRY_RUN} MAX_CHECK={MAX_CHECK}")
 
     raceids = list_today_raceids()
     if not raceids:
-        logging.info("[INFO] list_today_raceids() は空でした。フォールバックします。")
-        # 念のため：帯広/盛岡/大井の “レース一覧” へのリンク群を拾う
-        # （ページ例: .../race_card/list/RACEID/202508101006060400 等）
-        # ここは最低限の保険なので、何もしないで終了でもOK
+        logging.info("[INFO] RACEID=0。ページ構造変更/メンテ/アクセス拒否の可能性。")
         logging.info("[INFO] HITS=0")
         save_notified({})
         logging.info("[INFO] ジョブ終了")
         return
 
-    logging.info(f"[INFO] 発見RACEID数: {len(raceids)}")
-    for rid in raceids:
-        logging.info(f"  - {rid} -> odds/tanfuku")
+    # ログ：一覧
+    logging.info("[INFO] 発見RACEID一覧(最大10): " + ", ".join(raceids[:10]) + (" ..." if len(raceids) > 10 else ""))
 
     notified = load_notified()
-
     hits = 0
-    for rid in raceids:
+
+    # 上限チェック（念のため）
+    target_ids = raceids[:MAX_CHECK]
+
+    for rid in target_ids:
         meta = check_tanfuku_page(rid)
         if not meta:
             continue
@@ -183,10 +199,10 @@ def main():
         hits += 1
         logging.info(f"[INFO] OK: {meta['race_id']} {meta['title']} {meta['now']} {meta['url']}")
 
-        # 通知/記録の例：既に通知済みなら何もしない（ここでは保存だけ）
+        # 記録（通知は各自の処理に接続）
         notified[rid] = time.time()
 
-        # 実際のLINE通知やシート更新は既存処理に接続してください
+        # 実通知例（必要なら既存の送信関数へ）
         # if not DRY_RUN:
         #     send_line(meta)
 
