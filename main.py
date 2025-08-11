@@ -1,14 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-Rakuten競馬 監視・通知バッチ（人気順テーブル 厳密パース・%/レンジ除外・検出ログ強化）
+Rakuten競馬 監視・通知バッチ（重複抑止=戦略シグネチャ／人気順テーブル 厳密パース）
 - 門限（JST 10:00〜22:00）
 - RACEID列挙：#todaysTicket / 出馬表一覧
 - 人気順テーブルの見出しから “人気/順位” 列と “単勝” 列を厳密特定（複勝・支持率・レンジ値は除外）
 - 検出ヘッダと採用列・先頭数行のセル値を INFO ログで出力
 - LINE Push 成否を完全ログ化（200のみ去重TTL更新）
+- 同一レース・同一内容（戦略＋買い目）は TTL 内に再送しない
 """
 
-import os, re, json, time, random, logging
+import os, re, json, time, random, logging, hashlib
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional, Tuple
 
@@ -38,7 +39,8 @@ DRY_RUN        = os.getenv("DRY_RUN", "False").lower() == "true"
 KILL_SWITCH    = os.getenv("KILL_SWITCH", "False").lower() == "true"
 NOTIFY_ENABLED = os.getenv("NOTIFY_ENABLED", "1") == "1"
 DEBUG_RACEIDS  = [s.strip() for s in os.getenv("DEBUG_RACEIDS", "").split(",") if s.strip()]
-NOTIFY_TTL_SEC = int(os.getenv("NOTIFY_TTL_SEC", "1800"))
+# ★TTLデフォルト=3600秒（環境変数で上書き可）
+NOTIFY_TTL_SEC = int(os.getenv("NOTIFY_TTL_SEC", "3600"))
 START_HOUR     = int(os.getenv("START_HOUR", "10"))
 END_HOUR       = int(os.getenv("END_HOUR",   "22"))
 
@@ -82,11 +84,24 @@ def save_notified(d: Dict[str, float]) -> None:
     with open(NOTIFIED_PATH, "w", encoding="utf-8") as f:
         json.dump(d, f, ensure_ascii=False, indent=2)
 
-def should_skip_by_ttl(notified: Dict[str, float], rid: str) -> bool:
-    ts = notified.get(rid)
+def is_ttl_active(notified: Dict[str, float], key: str) -> bool:
+    ts = notified.get(key)
     if not ts:
         return False
     return (time.time() - ts) < NOTIFY_TTL_SEC
+
+# ======== 通知シグネチャ（重複抑止キー）========
+def make_notify_signature(rid: str, strategy: dict) -> str:
+    """
+    同一と見なしたい軸のみで作成
+    - rid（レース単位で独立）
+    - strategy['strategy']（戦略名/説明）
+    - tickets（買い目、順序を保持）
+    ※ オッズ時刻やオッズ値は含めない→同内容なら1回だけ
+    """
+    ticket_str = ", ".join(strategy.get("tickets", []))
+    base = f"{rid}|{strategy.get('strategy','')}|{ticket_str}"
+    return hashlib.sha1(base.encode("utf-8")).hexdigest()
 
 # ========= RACEID 取得 =========
 def list_raceids_today_ticket(ymd: str) -> List[str]:
@@ -146,10 +161,6 @@ def _as_float(text: str) -> Optional[float]:
     return float(m.group(0)) if m else None
 
 def _find_popular_odds_table(soup: BeautifulSoup) -> Tuple[Optional[BeautifulSoup], Dict[str, int]]:
-    """
-    見出し(TH)から “人気/順位” 列と “単勝” 列のインデックスを特定。
-    戻り値: (table, {"pop": idx_pop, "win": idx_win})
-    """
     for table in soup.find_all("table"):
         thead = table.find("thead")
         if not thead:
@@ -167,7 +178,7 @@ def _find_popular_odds_table(soup: BeautifulSoup) -> Tuple[Optional[BeautifulSou
                 break
 
         # 単勝 列（複・率・% を含むヘッダは除外）
-        win_candidates = []  # (priority, index)
+        win_candidates = []
         for i, h in enumerate(headers):
             if ("複" in h) or ("率" in h) or ("%" in h):
                 continue
@@ -202,7 +213,6 @@ def _find_popular_odds_table(soup: BeautifulSoup) -> Tuple[Optional[BeautifulSou
             last = v
             seq_ok += 1
         if seq_ok >= 2:
-            # どの列を使うかを INFO で出す（上位2行の値も）
             sample = []
             for tr in rows[:2]:
                 tds = tr.find_all(["td", "th"])
@@ -286,14 +296,12 @@ def push_line_text(user_id: str, token: str, text: str, timeout=8, retries=1) ->
             if resp.status_code == 200:
                 return True, 200, body
 
-            # レート制限のときだけ一回リトライ
             if resp.status_code == 429 and attempt < retries:
                 wait = int(resp.headers.get("Retry-After", "1"))
                 logging.warning("[LINE] 429 Too Many Requests -> retry in %ss", wait)
                 time.sleep(max(wait, 1))
                 continue
 
-            # その他の非200は即失敗
             logging.error("[ERROR] LINE push failed status=%s body=%s", resp.status_code, body[:200])
             return False, resp.status_code, body
 
@@ -304,10 +312,8 @@ def push_line_text(user_id: str, token: str, text: str, timeout=8, retries=1) ->
                 continue
             return False, None, str(e)
 
-def notify_strategy_hit(race_id: str, message_text: str) -> bool:
-    """
-    成功時 True を返す。True のときのみ TTL を更新すること。
-    """
+def notify_strategy_hit(message_text: str) -> bool:
+    """成功時 True。True のときのみ TTL を更新する。"""
     if not NOTIFY_ENABLED:
         logging.info("[INFO] NOTIFY_ENABLED=0 のため通知スキップ")
         return False
@@ -335,7 +341,7 @@ def main():
 
     logging.info("[INFO] ジョブ開始")
     logging.info(f"[INFO] NOTIFIED_PATH={NOTIFIED_PATH} KILL_SWITCH={KILL_SWITCH} DRY_RUN={DRY_RUN}")
-    logging.info(f"[INFO] NOTIFY_ENABLED={'1' if NOTIFY_ENABLED else '0'}")
+    logging.info(f"[INFO] NOTIFY_ENABLED={'1' if NOTIFY_ENABLED else '0'} / TTL={NOTIFY_TTL_SEC}s")
 
     notified = load_notified()
     hits = 0; matches = 0
@@ -354,11 +360,10 @@ def main():
             logging.info(f"  - {rid} -> tanfuku")
 
     for rid in target_raceids:
-        if should_skip_by_ttl(notified, rid):
-            logging.info(f"[SKIP] TTL抑制: {rid}"); continue
+        # RACEIDベースのTTLスキップはしない（内容が変われば送りたい）
 
         meta = check_tanfuku_page(rid)
-        if not meta: 
+        if not meta:
             time.sleep(random.uniform(*SLEEP_BETWEEN))
             continue
 
@@ -383,6 +388,15 @@ def main():
             detail = f"{strategy['strategy']} / 買い目: {ticket_str} / {strategy['roi']} / {strategy['hit']}"
             logging.info(f"[MATCH] {rid} 条件詳細: {detail}")
 
+            # 同一内容の重複抑止キー
+            sig = make_notify_signature(rid, strategy)
+            key = f"sig:{sig}"
+
+            if is_ttl_active(notified, key):
+                logging.info(f"[SKIP] 同一内容TTL抑制: {rid} ({sig[:8]}...)")
+                time.sleep(random.uniform(*SLEEP_BETWEEN))
+                continue
+
             message = (
                 "【戦略ヒット】\n"
                 f"RACEID: {rid}\n"
@@ -393,9 +407,9 @@ def main():
                 f"{meta['url']}"
             )
 
-            sent_ok = notify_strategy_hit(rid, message)
+            sent_ok = notify_strategy_hit(message)
             if sent_ok:
-                notified[rid] = time.time()  # ← 成功時のみTTL更新
+                notified[key] = time.time()  # 成功時のみTTL更新
             else:
                 logging.warning("[WARN] TTL未更新（通知未達/スキップ） rid=%s", rid)
         else:
