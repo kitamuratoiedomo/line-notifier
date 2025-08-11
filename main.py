@@ -1,57 +1,52 @@
 # -*- coding: utf-8 -*-
 """
-Rakuten競馬 監視・通知バッチ（修正版）
-- 門限（JST 10:00〜22:00）
+Rakuten競馬 監視・通知バッチ（完全版・DEBUGオッズ出力付き）
+- 門限（JST 10:00〜22:00）で夜間はスキップ
 - RACEID列挙は2系統
-- 戦略①〜④は strategy_rules.eval_strategy() が返す「①〜④ or None」を使用
-- 通知文はここで整形（回収率/的中率の表示は無し）
+  A) 本日の発売情報 (#todaysTicket)
+  B) 出馬表一覧（当日/翌日リンクを広めに走査）
+- DEBUG_RACEIDS で任意RACEIDテスト
+- 戦略①〜④ (strategy_rules.py の eval_strategy) を適用
+- オッズテーブル解析は緩め（複数セレクタ/非数値スキップ）
+- 重複通知制御（NOTIFY_TTL_SEC）
+- DRY_RUN/NOTIFY_ENABLED/KILL_SWITCH/門限時刻(START_HOUR/END_HOUR)を環境変数で制御
+- ★ 取得した人気順オッズを必ずログ出力（[DEBUG] 取得オッズ）
 """
 
-import os
-import re
-import json
-import time
-import random
-import logging
+import os, re, json, time, random, logging
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional, Tuple
 
 import requests
 from bs4 import BeautifulSoup
-from strategy_rules import eval_strategy  # ← ①〜④ を返す
+from strategy_rules import eval_strategy  # ← 戦略①〜④
 
 # ========= 基本設定 =========
 JST = timezone(timedelta(hours=9))
-
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/124.0.0.0 Safari/537.36"),
     "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
     "Cache-Control": "no-cache",
 })
-
 TIMEOUT = (10, 25)
 RETRY = 3
 SLEEP_BETWEEN = (0.6, 1.2)
 
 # ========= 環境変数 =========
-NOTIFIED_PATH    = os.getenv("NOTIFIED_PATH", "/tmp/notified_races.json")
-DRY_RUN          = os.getenv("DRY_RUN", "False").lower() == "true"
-KILL_SWITCH      = os.getenv("KILL_SWITCH", "False").lower() == "true"
-NOTIFY_ENABLED   = os.getenv("NOTIFY_ENABLED", "1") == "1"
-DEBUG_RACEIDS    = [s.strip() for s in os.getenv("DEBUG_RACEIDS", "").split(",") if s.strip()]
-NOTIFY_TTL_SEC   = int(os.getenv("NOTIFY_TTL_SEC", "1800"))
-START_HOUR       = int(os.getenv("START_HOUR", "10"))
-END_HOUR         = int(os.getenv("END_HOUR",   "22"))
+NOTIFIED_PATH  = os.getenv("NOTIFIED_PATH", "/tmp/notified_races.json")
+DRY_RUN        = os.getenv("DRY_RUN", "False").lower() == "true"
+KILL_SWITCH    = os.getenv("KILL_SWITCH", "False").lower() == "true"
+NOTIFY_ENABLED = os.getenv("NOTIFY_ENABLED", "1") == "1"
+DEBUG_RACEIDS  = [s.strip() for s in os.getenv("DEBUG_RACEIDS", "").split(",") if s.strip()]
+NOTIFY_TTL_SEC = int(os.getenv("NOTIFY_TTL_SEC", "1800"))
+START_HOUR     = int(os.getenv("START_HOUR", "10"))
+END_HOUR       = int(os.getenv("END_HOUR",   "22"))
 
-# ========= 正規表現 =========
 RACEID_RE = re.compile(r"/RACEID/(\d{18})")
 
-# ========= ユーティリティ =========
 def now_jst() -> datetime:
     return datetime.now(JST)
 
@@ -92,7 +87,6 @@ def should_skip_by_ttl(notified: Dict[str, float], rid: str) -> bool:
         return False
     return (time.time() - ts) < NOTIFY_TTL_SEC
 
-# ========= RACEID 列挙 =========
 def list_raceids_today_ticket(ymd: str) -> List[str]:
     url = f"https://keiba.rakuten.co.jp/race_card/list/RACEID/{ymd}0000000000"
     html = fetch(url)
@@ -135,7 +129,6 @@ def list_raceids_from_card_lists(ymd: str, ymd_next: str) -> List[str]:
     logging.info(f"[INFO] Rakuten#2 出馬表一覧: {len(rids)}件")
     return rids
 
-# ========= オッズ解析 =========
 def parse_odds_table(soup: BeautifulSoup) -> Tuple[List[Dict[str, float]], Optional[str], Optional[str]]:
     odds_table = soup.find("table", {"summary": re.compile("オッズ")})
     if not odds_table:
@@ -145,10 +138,7 @@ def parse_odds_table(soup: BeautifulSoup) -> Tuple[List[Dict[str, float]], Optio
                 odds_table = t
                 break
 
-    venue_race = None
-    h1 = soup.find("h1")
-    if h1:
-        venue_race = h1.get_text(strip=True)
+    venue_race = (soup.find("h1").get_text(strip=True) if soup.find("h1") else None)
     nowtime = soup.select_one(".withUpdate .nowTime") or soup.select_one(".nowTime")
     now_label = nowtime.get_text(strip=True) if nowtime else None
 
@@ -169,24 +159,18 @@ def parse_odds_table(soup: BeautifulSoup) -> Tuple[List[Dict[str, float]], Optio
             s = cand.get_text(strip=True).replace(",", "")
             if s.isdigit():
                 try:
-                    pop = int(s)
-                    break
-                except:
-                    pass
+                    pop = int(s); break
+                except: pass
 
         odds = None
         for cand in tds[::-1]:
             s = cand.get_text(strip=True).replace(",", "")
-            if s in {"—", "-", ""}:
-                continue
+            if s in {"—", "-", ""}: continue
+            m = re.search(r"\d+(\.\d+)?", s)
+            if not m: continue
             try:
-                m = re.search(r"\d+(\.\d+)?", s)
-                if not m:
-                    continue
-                odds = float(m.group(0))
-                break
-            except:
-                continue
+                odds = float(m.group(0)); break
+            except: continue
 
         if (pop is not None) and (odds is not None):
             horses.append({"pop": pop, "odds": odds})
@@ -201,66 +185,31 @@ def check_tanfuku_page(race_id: str) -> Optional[Dict]:
     url = f"https://keiba.rakuten.co.jp/odds/tanfuku/RACEID/{race_id}"
     html = fetch(url)
     soup = BeautifulSoup(html, "lxml")
-
     horses, venue_race, now_label = parse_odds_table(soup)
     if not horses:
         logging.warning(f"[WARN] オッズテーブル未検出: {url}")
         return None
-
     if not venue_race:
         venue_race = "地方競馬"
+    return {"race_id": race_id, "url": url, "horses": horses,
+            "venue_race": venue_race, "now": now_label or ""}
 
-    return {
-        "race_id": race_id,
-        "url": url,
-        "horses": horses,
-        "venue_race": venue_race,
-        "now": now_label or "",
-    }
-
-# ========= 通知送信（既存連携に差し替え可） =========
 def send_notification(msg: str) -> None:
     logging.info(f"[NOTIFY] {msg}")
 
-# ========= 戦略文＆買い目の整形 =========
-def strategy_desc_and_tickets(mark: str) -> Tuple[str, List[str]]:
-    if mark == "①":
-        # 三連単BOX（1,2,3）6点
-        base = [1, 2, 3]
-        tickets = [f"{a}-{b}-{c}" for a in base for b in base for c in base if len({a,b,c}) == 3]
-        return ("① 1〜3番人気 三連単BOX（6点）", tickets)
-    if mark == "②":
-        return ("② 1番人気1着固定 × 2・3番人気（2点）", ["1-2-3", "1-3-2"])
-    if mark == "③":
-        # 例：1→相手4頭→相手4頭（2〜5番を採用、重複可の16点）
-        ar = [2, 3, 4, 5]
-        tickets = [f"1-{b}-{c}" for b in ar for c in ar]
-        return ("③ 1→相手４頭→相手４頭", tickets)
-    if mark == "④":
-        # 3着固定： (1×2)→3 固定（2点）
-        return ("④ 3着固定（1番人気×2番人気）-3番人気（3着固定）三連単2点",
-                ["1-2-3", "2-1-3"])
-    return ("", [])
-
-# ========= メイン =========
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-
     if KILL_SWITCH:
-        logging.info("[INFO] KILL_SWITCH=True のため終了")
-        return
-
+        logging.info("[INFO] KILL_SWITCH=True のため終了"); return
     if not within_operating_hours():
-        logging.info(f"[INFO] 監視休止時間のためスキップ（JST={now_jst():%H:%M} / 稼働={START_HOUR:02d}:00-{END_HOUR:02d}:00）")
-        return
+        logging.info(f"[INFO] 監視休止（JST={now_jst():%H:%M} 稼働={START_HOUR:02d}:00-{END_HOUR:02d}:00）"); return
 
     logging.info("[INFO] ジョブ開始")
     logging.info(f"[INFO] NOTIFIED_PATH={NOTIFIED_PATH} KILL_SWITCH={KILL_SWITCH} DRY_RUN={DRY_RUN}")
     logging.info(f"[INFO] NOTIFY_ENABLED={'1' if NOTIFY_ENABLED else '0'}")
 
     notified = load_notified()
-    hits = 0
-    matches = 0
+    hits = 0; matches = 0
 
     if DEBUG_RACEIDS:
         logging.info(f"[INFO] DEBUG_RACEIDS 指定: {len(DEBUG_RACEIDS)}件")
@@ -277,41 +226,40 @@ def main():
 
     for rid in target_raceids:
         if should_skip_by_ttl(notified, rid):
-            logging.info(f"[SKIP] TTL抑制: {rid}")
-            continue
+            logging.info(f"[SKIP] TTL抑制: {rid}"); continue
 
         meta = check_tanfuku_page(rid)
-        if not meta:
-            continue
+        if not meta: continue
         horses = meta["horses"]
         if len(horses) < 4:
-            logging.info(f"[NO MATCH] {rid} 条件詳細: horses<4 で判定不可")
-            continue
+            logging.info(f"[NO MATCH] {rid} 条件詳細: horses<4 で判定不可"); continue
+
+        # 取得オッズの可視化
+        try:
+            odds_log = ", ".join([f"{h['pop']}番人気:{h['odds']}" for h in sorted(horses, key=lambda x: x['pop'])])
+        except Exception:
+            odds_log = str(horses)
+        logging.info(f"[DEBUG] {rid} 取得オッズ: {odds_log}")
 
         hits += 1
-
-        # ← ここがポイント：eval_strategy は "①"〜"④" or None を返す
-        mark = eval_strategy(horses)
-        if mark:
+        strategy = eval_strategy(horses)
+        if strategy:
             matches += 1
-            s_text, tickets = strategy_desc_and_tickets(mark)
-            ticket_str = ", ".join(tickets) if tickets else "（買い目算出なし）"
-
-            logging.info(f"[MATCH] {rid} 条件詳細: {s_text} / 買い目: {ticket_str}")
+            ticket_str = ", ".join(strategy["tickets"])
+            detail = f"{strategy['strategy']} / 買い目: {ticket_str} / {strategy['roi']} / {strategy['hit']}"
+            logging.info(f"[MATCH] {rid} 条件詳細: {detail}")
 
             if NOTIFY_ENABLED and not DRY_RUN:
-                msg = (
-                    f"【戦略一致】{mark}\n"
-                    f"RACEID: {rid}\n"
-                    f"{meta['venue_race']} {meta['now']}\n"
-                    f"{s_text}\n"
-                    f"買い目: {ticket_str}\n"
-                    f"{meta['url']}"
-                )
+                msg = (f"【戦略ヒット】\n"
+                       f"RACEID: {rid}\n"
+                       f"{meta['venue_race']} {meta['now']}\n"
+                       f"{strategy['strategy']}\n"
+                       f"買い目: {ticket_str}\n"
+                       f"{strategy['roi']} / {strategy['hit']}\n"
+                       f"{meta['url']}")
                 send_notification(msg)
             else:
                 logging.info("[DRY_RUN] 通知はスキップ")
-
             notified[rid] = time.time()
         else:
             logging.info(f"[NO MATCH] {rid} 条件詳細: パターン①〜④に非該当")
@@ -322,7 +270,6 @@ def main():
     save_notified(notified)
     logging.info(f"[INFO] notified saved: {NOTIFIED_PATH} (bytes={len(json.dumps(notified, ensure_ascii=False))})")
     logging.info("[INFO] ジョブ終了")
-
 
 if __name__ == "__main__":
     main()
