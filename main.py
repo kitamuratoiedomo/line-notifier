@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Rakuten競馬 監視・通知バッチ（Sheet永続TTL・LINE送信ログ強化）
+Rakuten競馬 監視・通知バッチ（Sheet永続TTL + 429クールダウン）
 - 稼働時間: JST 10:00〜22:00
 - RACEID列挙: #todaysTicket + 出馬表一覧
 - 人気順テーブル: “人気/順位”列と“単勝”列のみ厳密抽出（%・複勝レンジ除外）
 - TTLはGoogleスプレッドシートに保存（RACEID単位, 既定3600秒）
-- LINEは200 OK時のみTTL更新
+- LINEは200 OK時のみTTL更新。429はクールダウンTTLを別キーで保存し抑止
 """
 
 import os, re, json, time, random, logging
@@ -37,14 +37,14 @@ SLEEP_BETWEEN = (0.6, 1.2)
 LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
 
 # ========= 環境変数 =========
-# ※ TTL 既定 3600 秒
-NOTIFY_TTL_SEC = int(os.getenv("NOTIFY_TTL_SEC", "3600"))
-START_HOUR     = int(os.getenv("START_HOUR", "10"))
-END_HOUR       = int(os.getenv("END_HOUR",   "22"))
-DRY_RUN        = os.getenv("DRY_RUN", "False").lower() == "true"
-KILL_SWITCH    = os.getenv("KILL_SWITCH", "False").lower() == "true"
-NOTIFY_ENABLED = os.getenv("NOTIFY_ENABLED", "1") == "1"
-DEBUG_RACEIDS  = [s.strip() for s in os.getenv("DEBUG_RACEIDS", "").split(",") if s.strip()]
+NOTIFY_TTL_SEC      = int(os.getenv("NOTIFY_TTL_SEC", "3600"))   # 通常TTL（成功時）
+NOTIFY_COOLDOWN_SEC = int(os.getenv("NOTIFY_COOLDOWN_SEC", "1800"))  # 429クールダウンTTL
+START_HOUR          = int(os.getenv("START_HOUR", "10"))
+END_HOUR            = int(os.getenv("END_HOUR",   "22"))
+DRY_RUN             = os.getenv("DRY_RUN", "False").lower() == "true"
+KILL_SWITCH         = os.getenv("KILL_SWITCH", "False").lower() == "true"
+NOTIFY_ENABLED      = os.getenv("NOTIFY_ENABLED", "1") == "1"
+DEBUG_RACEIDS       = [s.strip() for s in os.getenv("DEBUG_RACEIDS", "").split(",") if s.strip()]
 
 LINE_ACCESS_TOKEN = os.getenv("LINE_ACCESS_TOKEN", "")
 LINE_USER_ID      = os.getenv("LINE_USER_ID", "")
@@ -100,79 +100,78 @@ def _resolve_sheet_title(svc) -> str:
                 return s["properties"]["title"]
         raise RuntimeError(f"指定gidのシートが見つかりません: {gid}")
     else:
-        # 名前一致を優先
         for s in sheets:
             if s["properties"]["title"] == tab:
                 return tab
-        # なければ新規作成
         body = {"requests": [{"addSheet": {"properties": {"title": tab}}}]}
         svc.spreadsheets().batchUpdate(spreadsheetId=GOOGLE_SHEET_ID, body=body).execute()
         return tab
 
 def sheet_load_notified() -> Dict[str, float]:
+    """A列:キー(RACEID or RACEID:cd), B列:epoch, C列:NOTE(任意)"""
     svc = _sheet_service()
     title = _resolve_sheet_title(svc)
     rng = f"'{title}'!A:C"
     res = svc.spreadsheets().values().get(spreadsheetId=GOOGLE_SHEET_ID, range=rng).execute()
     values = res.get("values", [])
-    # 1行目がヘッダなら飛ばす（自動判定）
-    start = 1 if values and values[0][0].upper() in ("RACEID", "RID", "ID") else 0
+    start = 1 if values and values[0] and str(values[0][0]).upper() in ("KEY", "RACEID", "RID", "ID") else 0
     d: Dict[str, float] = {}
     for row in values[start:]:
         if not row or len(row) < 2:
             continue
-        rid = str(row[0]).strip()
+        key = str(row[0]).strip()
         try:
             ts = float(row[1])
         except Exception:
             continue
-        d[rid] = ts
+        d[key] = ts
     return d
 
-def sheet_upsert_notified(rid: str, ts: float, note: str = "") -> None:
+def sheet_upsert_notified(key: str, ts: float, note: str = "") -> None:
+    """keyは RACEID または RACEID:cd（クールダウン）"""
     svc = _sheet_service()
     title = _resolve_sheet_title(svc)
     rng = f"'{title}'!A:C"
-    # まず全件取得して既存行を探す
     res = svc.spreadsheets().values().get(spreadsheetId=GOOGLE_SHEET_ID, range=rng).execute()
     values = res.get("values", [])
-    header = ["RACEID", "TS_EPOCH", "NOTE"]
+    header = ["KEY", "TS_EPOCH", "NOTE"]
     if not values:
-        # ヘッダ + 最初の行として書く
-        body = {"values": [header, [rid, ts, note]]}
+        body = {"values": [header, [key, ts, note]]}
         svc.spreadsheets().values().update(
             spreadsheetId=GOOGLE_SHEET_ID, range=rng, valueInputOption="RAW", body=body
         ).execute()
         return
-
-    # 既存行検索（1行目がヘッダの可能性あり）
     start_row = 1 if values and values[0] and values[0][0] in header else 0
     found_row_idx = None
     for i, row in enumerate(values[start_row:], start=start_row):
-        if row and str(row[0]).strip() == rid:
+        if row and str(row[0]).strip() == key:
             found_row_idx = i
             break
-
+    body = {"values": [[key, ts, note]]}
     if found_row_idx is not None:
-        # 上書き
-        row_no = found_row_idx + 1  # 1-based
+        row_no = found_row_idx + 1
         rng_row = f"'{title}'!A{row_no}:C{row_no}"
-        body = {"values": [[rid, ts, note]]}
         svc.spreadsheets().values().update(
             spreadsheetId=GOOGLE_SHEET_ID, range=rng_row, valueInputOption="RAW", body=body
         ).execute()
     else:
-        # 末尾に追加
-        body = {"values": [[rid, ts, note]]}
         svc.spreadsheets().values().append(
-            spreadsheetId=GOOGLE_SHEET_ID, range=rng, valueInputOption="RAW", insertDataOption="INSERT_ROWS", body=body
+            spreadsheetId=GOOGLE_SHEET_ID, range=rng, valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS", body=body
         ).execute()
 
 def should_skip_by_ttl(notified: Dict[str, float], rid: str) -> bool:
+    """成功TTL または 429クールダウンTTL が生きていればスキップ"""
+    now = time.time()
+    # 429クールダウン（rid:cd）
+    cd_ts = notified.get(f"{rid}:cd")
+    if cd_ts and (now - cd_ts) < NOTIFY_COOLDOWN_SEC:
+        return True
+    # 通常TTL（rid）
     ts = notified.get(rid)
-    if not ts:
-        return False
-    return (time.time() - ts) < NOTIFY_TTL_SEC
+    if ts and (now - ts) < NOTIFY_TTL_SEC:
+        return True
+    return False
 
 # ========= オッズ解析 =========
 def _clean(s: str) -> str:
@@ -199,13 +198,18 @@ def _find_popular_odds_table(soup: BeautifulSoup) -> Tuple[Optional[BeautifulSou
         pop_idx = None
         for i, h in enumerate(headers):
             if h in ("人気", "順位") or ("人気" in h and "順" not in h):
-                pop_idx = i; break
+                pop_idx = i
+                break
         win_candidates = []
         for i, h in enumerate(headers):
-            if ("複" in h) or ("率" in h) or ("%" in h): continue
-            if h == "単勝": win_candidates.append((0, i))
-            elif "単勝" in h: win_candidates.append((1, i))
-            elif "オッズ" in h: win_candidates.append((2, i))
+            if ("複" in h) or ("率" in h) or ("%" in h):
+                continue
+            if h == "単勝":
+                win_candidates.append((0, i))
+            elif "単勝" in h:
+                win_candidates.append((1, i))
+            elif "オッズ" in h:
+                win_candidates.append((2, i))
         win_idx = sorted(win_candidates, key=lambda x: x[0])[0][1] if win_candidates else None
         if pop_idx is None or win_idx is None:
             continue
@@ -214,12 +218,16 @@ def _find_popular_odds_table(soup: BeautifulSoup) -> Tuple[Optional[BeautifulSou
         seq_ok, last = 0, 0
         for tr in rows[:6]:
             tds = tr.find_all(["td", "th"])
-            if len(tds) <= max(pop_idx, win_idx): continue
+            if len(tds) <= max(pop_idx, win_idx):
+                continue
             s = tds[pop_idx].get_text(strip=True)
-            if not s.isdigit(): break
+            if not s.isdigit():
+                break
             v = int(s)
-            if v <= last: break
-            last = v; seq_ok += 1
+            if v <= last:
+                break
+            last = v
+            seq_ok += 1
         if seq_ok >= 2:
             sample = []
             for tr in rows[:2]:
@@ -244,13 +252,17 @@ def parse_odds_table(soup: BeautifulSoup) -> Tuple[List[Dict[str, float]], Optio
     body = table.find("tbody") or table
     for tr in body.find_all("tr"):
         tds = tr.find_all(["td", "th"])
-        if len(tds) <= max(pop_idx, win_idx): continue
+        if len(tds) <= max(pop_idx, win_idx):
+            continue
         pop_txt = tds[pop_idx].get_text(strip=True)
-        if not pop_txt.isdigit(): continue
+        if not pop_txt.isdigit():
+            continue
         pop = int(pop_txt)
-        if not (1 <= pop <= 30): continue
+        if not (1 <= pop <= 30):
+            continue
         odds = _as_float(tds[win_idx].get_text(" ", strip=True))
-        if odds is None: continue
+        if odds is None:
+            continue
         horses.append({"pop": pop, "odds": float(odds)})
 
     uniq = {}
@@ -265,7 +277,7 @@ def check_tanfuku_page(race_id: str) -> Optional[Dict]:
     soup = BeautifulSoup(html, "lxml")
     horses, venue_race, now_label = parse_odds_table(soup)
     if not horses:
-        logging.warning(f"[WARN] オッズテーブル未検出: {url}")
+        logging.info(f"[INFO] オッズテーブル未検出: {url}")
         return None
     if not venue_race:
         venue_race = "地方競馬"
@@ -287,8 +299,8 @@ def push_line_text(user_id: str, token: str, text: str, timeout=8, retries=1) ->
             if resp.status_code == 429 and attempt < retries:
                 wait = int(resp.headers.get("Retry-After", "1"))
                 logging.warning("[LINE] 429 Too Many Requests -> retry in %ss", wait)
-                time.sleep(max(wait, 1)); continue
-            logging.error("[ERROR] LINE push failed status=%s body=%s", resp.status_code, body[:200])
+                time.sleep(max(wait, 1))
+                continue
             return False, resp.status_code, body
         except requests.RequestException as e:
             logging.exception("[ERROR] LINE push exception (attempt %s): %s", attempt + 1, e)
@@ -296,18 +308,18 @@ def push_line_text(user_id: str, token: str, text: str, timeout=8, retries=1) ->
                 time.sleep(2); continue
             return False, None, str(e)
 
-def notify_strategy_hit(message_text: str) -> bool:
+def notify_strategy_hit(message_text: str) -> Tuple[bool, Optional[int]]:
+    """戻り: (ok, http_status)。okは200のみTrue。429などはFalseで返る"""
     if not NOTIFY_ENABLED:
-        logging.info("[INFO] NOTIFY_ENABLED=0 のため通知スキップ"); return False
+        logging.info("[INFO] NOTIFY_ENABLED=0 のため通知スキップ"); return False, None
     if DRY_RUN:
-        logging.info("[DRY_RUN] 通知メッセージ:\n%s", message_text); return False
+        logging.info("[DRY_RUN] 通知メッセージ:\n%s", message_text); return False, None
     if not LINE_ACCESS_TOKEN or not LINE_USER_ID:
-        logging.error("[ERROR] LINE 環境変数不足（LINE_ACCESS_TOKEN/LINE_USER_ID）"); return False
+        logging.error("[ERROR] LINE 環境変数不足（LINE_ACCESS_TOKEN/LINE_USER_ID）"); return False, None
     ok, status, body = push_line_text(LINE_USER_ID, LINE_ACCESS_TOKEN, message_text)
     if not ok:
         logging.warning("[WARN] LINE送信失敗 status=%s body=%s", status, (body or "")[:200])
-        return False
-    return True
+    return ok, status
 
 # ========= RACEID 取得 =========
 def list_raceids_today_ticket(ymd: str) -> List[str]:
@@ -322,7 +334,8 @@ def list_raceids_today_ticket(ymd: str) -> List[str]:
     for a in links:
         text = (a.get_text(strip=True) or "")
         m = RACEID_RE.search(a.get("href", ""))
-        if not m: continue
+        if not m: 
+            continue
         rid = m.group(1)
         if "投票受付中" in text or "発走" in text:
             raceids.append(rid)
@@ -342,7 +355,8 @@ def list_raceids_from_card_lists(ymd: str, ymd_next: str) -> List[str]:
             soup = BeautifulSoup(html, "lxml")
             for a in soup.find_all("a", href=True):
                 m = RACEID_RE.search(a["href"])
-                if m: rids.append(m.group(1))
+                if m:
+                    rids.append(m.group(1))
         except Exception as e:
             logging.warning(f"[WARN] 出馬表一覧スキャン失敗: {e} ({u})")
     rids = sorted(set(rids))
@@ -359,7 +373,7 @@ def main():
         logging.info(f"[INFO] 監視休止（JST={now_jst():%H:%M} 稼働={START_HOUR:02d}:00-{END_HOUR:02d}:00）"); return
 
     logging.info("[INFO] ジョブ開始")
-    logging.info(f"[INFO] DRY_RUN={DRY_RUN} NOTIFY_ENABLED={'1' if NOTIFY_ENABLED else '0'} TTL={NOTIFY_TTL_SEC}s")
+    logging.info(f"[INFO] DRY_RUN={DRY_RUN} NOTIFY_ENABLED={'1' if NOTIFY_ENABLED else '0'} TTL={NOTIFY_TTL_SEC}s CD={NOTIFY_COOLDOWN_SEC}s")
 
     # 永続TTLロード
     try:
@@ -388,7 +402,7 @@ def main():
         if rid in seen_in_this_run:
             logging.info(f"[SKIP] 同一ジョブ内去重: {rid}"); continue
         if should_skip_by_ttl(notified, rid):
-            logging.info(f"[SKIP] TTL抑制: {rid}"); continue
+            logging.info(f"[SKIP] TTL/クールダウン抑制: {rid}"); continue
 
         meta = check_tanfuku_page(rid)
         if not meta:
@@ -423,14 +437,26 @@ def main():
                 f"{meta['url']}"
             )
 
-            if notify_strategy_hit(message):
-                # 送達成功時のみ TTL 更新（Sheet）
+            sent_ok, http_status = notify_strategy_hit(message)
+            now_ts = time.time()
+
+            if sent_ok:
+                # 送達成功 → 通常TTL更新
                 try:
-                    sheet_upsert_notified(rid, time.time(), note=meta['venue_race'])
-                    notified[rid] = time.time()
+                    sheet_upsert_notified(rid, now_ts, note=meta['venue_race'])
+                    notified[rid] = now_ts
                 except Exception as e:
                     logging.exception("[ERROR] TTL更新失敗（Google Sheets）: %s", e)
                 seen_in_this_run.add(rid)
+            elif http_status == 429:
+                # 429 → クールダウンTTL更新（rid:cd）
+                try:
+                    key_cd = f"{rid}:cd"
+                    sheet_upsert_notified(key_cd, now_ts, note=f"429 cooldown {meta['venue_race']}")
+                    notified[key_cd] = now_ts
+                except Exception as e:
+                    logging.exception("[ERROR] CD更新失敗（Google Sheets）: %s", e)
+                logging.warning("[WARN] 429クールダウン発動 rid=%s cool_down=%ss", rid, NOTIFY_COOLDOWN_SEC)
             else:
                 logging.warning("[WARN] TTL未更新（通知未達/スキップ） rid=%s", rid)
         else:
