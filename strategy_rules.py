@@ -1,119 +1,81 @@
 # -*- coding: utf-8 -*-
 """
-戦略判定ロジック（堅牢化版）
- - どの形式で来ても {人気順位(int): 単勝オッズ(float)} に正規化してから判定
- - 戦略②: 1番<2.0 & 2番<10.0 & 3番<10.0 & 4番>=12.0
+戦略ルール判定（人気順オッズを入力して①〜④を返す）
+入力: horses = [{"pop":1,"odds":1.4}, {"pop":2,"odds":6.4}, ...]
+出力: None もしくは {
+  "strategy": "② 1番人気1着固定 × 2・3番人気（2点）",
+  "tickets": ["1-2-3", "1-3-2"],
+  "roi": "想定回収率: —",
+  "hit": "的中率: —"
+}
 """
 
-from typing import Any, Dict
+from typing import List, Dict, Optional
 
+def _to_odds_map(horses: List[Dict]) -> Dict[int, float]:
+    """人気→単勝オッズの辞書へ"""
+    o: Dict[int, float] = {}
+    for h in horses:
+        try:
+            p = int(h.get("pop"))
+            v = float(h.get("odds"))
+            if p not in o:
+                o[p] = v
+        except Exception:
+            continue
+    return o
 
-def _to_float(x: Any, default: float = 99.9) -> float:
-    try:
-        return float(x)
-    except Exception:
-        return default
+def _has_all(o: Dict[int, float], keys) -> bool:
+    return all(k in o for k in keys)
 
+def _tickets_box_3(nums=(1,2,3)) -> List[str]:
+    a,b,c = nums
+    return [f"{a}-{b}-{c}", f"{a}-{c}-{b}",
+            f"{b}-{a}-{c}", f"{b}-{c}-{a}",
+            f"{c}-{a}-{b}", f"{c}-{b}-{a}"]
 
-def _get_odds_map(raw: Any) -> Dict[int, float]:
-    """
-    raw 受け取りの何でも屋:
-      - {1: 2.4, 2: 3.6, ...}
-      - {"odds": {...}} / {"odds": [...]}
-      - [2.4, 3.6, 5.0, ...]   # index0が1番人気
-      - [{"rank":1,"odds":2.4}, {"rank":2,"odds":3.6}, ...]
-      - [{"popular":1,"odds":2.4}, ...] など
-    """
-    if raw is None:
-        return {}
+def eval_strategy(horses: List[Dict]) -> Optional[Dict]:
+    o = _to_odds_map(horses)
+    if not _has_all(o, [1,2,3,4]):
+        return None
 
-    # {"odds": ...} を剥がす
-    if isinstance(raw, dict) and "odds" in raw:
-        raw = raw["odds"]
-
-    # 既に {rank: odds}
-    if isinstance(raw, dict):
-        out = {}
-        for k, v in raw.items():
-            try:
-                rk = int(k)
-            except Exception:
-                # '1位' みたいなのを弾く
-                continue
-            out[rk] = _to_float(v)
-        return out
-
-    # 配列形式
-    if isinstance(raw, (list, tuple)):
-        # 1) 単なる float 配列: [2.4, 3.6, ...]
-        if all(not isinstance(x, (dict, list, tuple)) for x in raw):
-            return {i + 1: _to_float(raw[i]) for i in range(len(raw))}
-
-        # 2) 要素が dict の配列
-        out = {}
-        for item in raw:
-            if isinstance(item, dict):
-                # rank/popu lar 人気順位っぽいキーを探す
-                if "rank" in item:
-                    rk = int(item["rank"])
-                elif "popular" in item:
-                    rk = int(item["popular"])
-                elif "pop" in item:
-                    rk = int(item["pop"])
-                else:
-                    # インデックス順を人気とみなす fallback
-                    rk = len(out) + 1
-
-                # オッズ値っぽいキーを探す
-                if "odds" in item:
-                    ov = item["odds"]
-                elif "value" in item:
-                    ov = item["value"]
-                elif "tanfuku_odds" in item:
-                    ov = item["tanfuku_odds"]
-                else:
-                    # 浮動小数に変換できそうな最初の値を拾う
-                    # （かなり寛容。だめなら 99.9）
-                    ov = next(iter(item.values()))
-                out[rk] = _to_float(ov)
-            else:
-                # サブリストなどはスキップ（想定外）
-                pass
-        if out:
-            return out
-
-    # どれにも当てはまらなかった時の保険
-    return {}
-
-
-def eval_strategy(odds_raw: Any) -> str | None:
-    """
-    引数は「オッズ情報そのもの」を渡す想定（リスト/辞書どちらでもOK）
-    ここで正規化してから判定する。
-    """
-    o = _get_odds_map(odds_raw)
-
-    # キーが欠けていたら大きい値で補完（≒条件に引っ掛からない）
-    def get(rank: int, default: float = 99.9) -> float:
-        return _to_float(o.get(rank, default))
-
-    o1, o2, o3, o4 = get(1), get(2), get(3), get(4)
+    # ① 1〜3番人気 三連単BOX（6点）
+    #    条件: 1番人気2.0〜10.0未満 / 2・3番人気 <10.0 / 4番人気 >=15.0
+    if 2.0 <= o[1] < 10.0 and o[2] < 10.0 and o[3] < 10.0 and o[4] >= 15.0:
+        return {
+            "strategy": "① 1〜3番人気 三連単BOX（6点）",
+            "tickets": _tickets_box_3((1,2,3)),
+            "roi": "想定回収率: —",
+            "hit": "的中率: —",
+        }
 
     # ② 1番人気1着固定 × 2・3番人気（2点）
-    #    1番 < 2.0, 2番 < 10.0, 3番 < 10.0, 4番 >= 12.0
-    if o1 < 2.0 and o2 < 10.0 and o3 < 10.0 and o4 >= 12.0:
-        return "②"
+    #    条件: 1番人気 <2.0 / 2〜3番人気 <10.0 / 4番人気 >=12.0（※ご指定どおり）
+    if o[1] < 2.0 and o[2] < 10.0 and o[3] < 10.0 and o[4] >= 12.0:
+        return {
+            "strategy": "② 1番人気1着固定 × 2・3番人気（2点）",
+            "tickets": ["1-2-3", "1-3-2"],
+            "roi": "想定回収率: —",
+            "hit": "的中率: —",
+        }
 
-    # ① 0〜例：2.0<=1番<10.0, 2・3番<10.0, 4番>=15.0（前の仕様を維持）
-    if 2.0 <= o1 < 10.0 and o2 < 10.0 and o3 < 10.0 and o4 >= 15.0:
-        return "①"
+    # ③ 1番人気 ≤1.5 かつ「2番人気のオッズが10倍以上」
+    #    さらにその他人気に 10〜20倍 帯が1頭以上
+    if o[1] <= 1.5 and o[2] >= 10.0 and any(10.0 <= v <= 20.0 for k, v in o.items() if k > 2):
+        return {
+            "strategy": "③ 1→相手 4頭（相手は10〜20倍帯を含む）",
+            "tickets": ["1-2-3", "1-2-4", "1-3-2", "1-4-2"],  # 最低限の例示（実運用に合わせて拡張可）
+            "roi": "想定回収率: —",
+            "hit": "的中率: —",
+        }
 
-    # ③ 1番<=1.5 かつ その他に10〜20倍が少なくとも1頭
-    if o1 <= 1.5 and any(10.0 <= _to_float(v) <= 20.0 for k, v in o.items() if k > 1):
-        return "③"
-
-    # ④ 1番<=3.0 かつ 2番<=3.0 かつ 3番が6〜10倍 かつ 4番>=15.0
-    if o1 <= 3.0 and o2 <= 3.0 and 6.0 <= o3 <= 10.0 and o4 >= 15.0:
-        return "④"
+    # ④ 1,2番人気 ≤3.0 / 3番人気 6.0〜10.0 / 4番人気 ≥15.0
+    if o[1] <= 3.0 and o[2] <= 3.0 and 6.0 <= o[3] <= 10.0 and o[4] >= 15.0:
+        return {
+            "strategy": "④ @ (1,2)→(1,2)→3固定（2点）",
+            "tickets": ["1-2-3", "2-1-3"],
+            "roi": "想定回収率: —",
+            "hit": "的中率: —",
+        }
 
     return None
