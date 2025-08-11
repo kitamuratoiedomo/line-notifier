@@ -1,6 +1,14 @@
 # -*- coding: utf-8 -*-
 """
 Rakuten競馬 監視・通知バッチ（完全版・DEBUGオッズ出力付き）
+- 門限（JST 10:00〜22:00）
+- RACEID列挙は2系統（#todaysTicket / 出馬表一覧の総なめ）
+- DEBUG_RACEIDS で任意RACEIDテスト
+- 戦略①〜④ (strategy_rules.py の eval_strategy) を適用
+- オッズテーブル解析はヘッダー優先＋フォールバックで強化
+- 重複通知制御（NOTIFY_TTL_SEC）
+- DRY_RUN/NOTIFY_ENABLED/KILL_SWITCH/門限(START_HOUR/END_HOUR) を環境変数で制御
+- 取得人気別オッズを必ずDEBUGログ出力
 """
 
 import os, re, json, time, random, logging
@@ -121,56 +129,120 @@ def list_raceids_from_card_lists(ymd: str, ymd_next: str) -> List[str]:
     logging.info(f"[INFO] Rakuten#2 出馬表一覧: {len(rids)}件")
     return rids
 
-# ========= オッズ解析 =========
+# ========= オッズ解析（強化版：ここが“置き換え”本体） =========
 def parse_odds_table(soup: BeautifulSoup) -> Tuple[List[Dict[str, float]], Optional[str], Optional[str]]:
+    """
+    楽天の単勝/複勝オッズ表から人気(pop)/単勝(odds)を抽出。
+    1) ヘッダーで「人気」「単勝」列を特定（最優先）
+    2) 見つからない場合は行スキャンで (人気っぽい整数, オッズっぽい小数) を拾う
+    返り値: (horses, venue_race, now_label)
+      horses = [{"pop":1,"odds":2.4}, ...] 人気昇順でユニーク化
+    """
+    # レース名・時刻
+    venue_race = None
+    h1 = soup.find("h1")
+    if h1:
+        venue_race = h1.get_text(strip=True) or None
+    if not venue_race:
+        t = soup.find("title")
+        if t:
+            venue_race = t.get_text(strip=True) or None
+    nowtime = soup.select_one(".withUpdate .nowTime") or soup.select_one(".nowTime")
+    now_label = nowtime.get_text(strip=True) if nowtime else None
+
+    # 該当テーブル探索
     odds_table = soup.find("table", {"summary": re.compile("オッズ")})
     if not odds_table:
         for t in soup.find_all("table"):
-            summary = (t.get("summary") or "") + " " + " ".join(t.get("class", []))
-            if "オッズ" in summary:
+            meta = " ".join(t.get("class", [])) + " " + (t.get("summary") or "") + " " + " ".join([f"{k}={v}" for k, v in t.attrs.items()])
+            if ("オッズ" in meta) or ("tanfuku" in meta) or ("odds" in meta.lower()):
                 odds_table = t
                 break
-
-    venue_race = (soup.find("h1").get_text(strip=True) if soup.find("h1") else None)
-    nowtime = soup.select_one(".withUpdate .nowTime") or soup.select_one(".nowTime")
-    now_label = nowtime.get_text(strip=True) if nowtime else None
+    if not odds_table:
+        cand = sorted(soup.find_all("table"),
+                      key=lambda x: len(x.find_all("tr")) * len(x.find_all("td")),
+                      reverse=True)
+        if cand:
+            odds_table = cand[0]
 
     horses: List[Dict[str, float]] = []
     if not odds_table:
         return horses, venue_race, now_label
 
-    trs = odds_table.find_all("tr")
-    start = 1 if trs and ("人気" in trs[0].get_text() or "馬番" in trs[0].get_text()) else 0
+    trs = [tr for tr in odds_table.find_all("tr") if tr.find_all(["td", "th"])]
+    if not trs:
+        return horses, venue_race, now_label
 
-    for tr in trs[start:]:
-        tds = tr.find_all(["td", "th"])
-        if len(tds) < 2:
+    # ヘッダー解析
+    header_cells = [c.get_text(strip=True) for c in trs[0].find_all(["th", "td"])]
+    header_map = {i: v for i, v in enumerate(header_cells)}
+    has_header = any(("人気" in v) or ("単勝" in v) or ("複勝" in v) for v in header_cells)
+
+    pop_idx = None
+    odds_idx = None
+    if has_header:
+        for i, v in header_map.items():
+            if "人気" in v:
+                pop_idx = i
+            if ("単勝" in v) or ("オッズ" in v and "複勝" not in v):
+                odds_idx = i
+
+    def _to_int(s: str) -> Optional[int]:
+        s = (s or "").strip().replace(",", "")
+        return int(s) if re.fullmatch(r"\d{1,2}", s or "") else None
+
+    def _to_float(s: str) -> Optional[float]:
+        s = (s or "").strip().replace(",", "")
+        m = re.search(r"\d+(\.\d+)?", s)
+        if not m:
+            return None
+        try:
+            val = float(m.group(0))
+            return val if 1.0 <= val <= 999.9 else None
+        except:
+            return None
+
+    # 行走査
+    row_start = 1 if has_header else 0
+    for tr in trs[row_start:]:
+        cells = tr.find_all(["td", "th"])
+        if len(cells) < 2:
             continue
 
-        pop = None
-        for cand in tds:
-            s = cand.get_text(strip=True).replace(",", "")
-            if s.isdigit():
-                try:
-                    pop = int(s); break
-                except: pass
+        pop_val: Optional[int] = None
+        odds_val: Optional[float] = None
 
-        odds = None
-        for cand in tds[::-1]:
-            s = cand.get_text(strip=True).replace(",", "")
-            if s in {"—", "-", ""}: continue
-            m = re.search(r"\d+(\.\d+)?", s)
-            if not m: continue
-            try:
-                odds = float(m.group(0)); break
-            except: continue
+        if (pop_idx is not None) and (pop_idx < len(cells)):
+            pop_val = _to_int(cells[pop_idx].get_text())
+        if (odds_idx is not None) and (odds_idx < len(cells)):
+            odds_val = _to_float(cells[odds_idx].get_text())
 
-        if (pop is not None) and (odds is not None):
-            horses.append({"pop": pop, "odds": odds})
+        # フォールバック
+        if pop_val is None:
+            for c in cells[:3]:  # 人気は左寄りが多い
+                pop_val = _to_int(c.get_text())
+                if pop_val is not None:
+                    break
+        if odds_val is None:
+            for c in cells[::-1]:  # オッズは右寄りが多い
+                cand = _to_float(c.get_text(strip=True))
+                if cand is not None:
+                    odds_val = cand
+                    break
 
+        if (pop_val is not None) and (odds_val is not None):
+            horses.append({"pop": pop_val, "odds": odds_val})
+
+    # 人気でユニーク化 & 昇順
     uniq = {}
-    for h in sorted(horses, key=lambda x: x["pop"]):
-        uniq.setdefault(h["pop"], h)
+    for h in horses:
+        p = h.get("pop")
+        o = h.get("odds")
+        if p is None or o is None:
+            continue
+        if p not in uniq or (1.0 <= o < uniq[p]["odds"]):
+            uniq[p] = {"pop": p, "odds": o}
+
     horses = [uniq[k] for k in sorted(uniq.keys())]
     return horses, venue_race, now_label
 
