@@ -242,7 +242,8 @@ def main():
         logging.info(f"[DEBUG] {rid} 取得オッズ: {odds_log}")
 
         hits += 1
-        strategy = eval_strategy(horses)
+        import logging
+        strategy = eval_strategy(horses, logger=logging)
         if strategy:
             matches += 1
             ticket_str = ", ".join(strategy["tickets"])
