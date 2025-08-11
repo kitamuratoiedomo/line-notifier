@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-Rakuten競馬 監視・通知バッチ（人気順テーブル 厳密パース・支持率除外版）
+Rakuten競馬 監視・通知バッチ（人気順テーブル 厳密パース・%/レンジ除外・検出ログ強化）
 - 門限（JST 10:00〜22:00）
 - RACEID列挙：#todaysTicket / 出馬表一覧
-- 人気順テーブルの見出しから “人気” 列と “単勝” 列を厳密特定（支持率/複勝は除外）
-- 取得オッズをDEBUGログ出力（見出しログも追加）
+- 人気順テーブルの見出しから “人気/順位” 列と “単勝” 列を厳密特定（複勝・支持率・レンジ値は除外）
+- 検出ヘッダと採用列・先頭数行のセル値を INFO ログで出力
 - TTLで重複通知抑制
 """
 
@@ -14,7 +14,7 @@ from typing import List, Dict, Optional, Tuple
 
 import requests
 from bs4 import BeautifulSoup
-from strategy_rules import eval_strategy  # horses=[{"pop":1,"odds":1.8}, ...]
+from strategy_rules import eval_strategy
 
 # ========= 基本設定 =========
 JST = timezone(timedelta(hours=9))
@@ -126,20 +126,23 @@ def list_raceids_from_card_lists(ymd: str, ymd_next: str) -> List[str]:
     logging.info(f"[INFO] Rakuten#2 出馬表一覧: {len(rids)}件")
     return rids
 
-# ========= オッズ解析（人気順テーブルを厳密特定） =========
+# ========= オッズ解析（人気順テーブル厳密特定） =========
 def _clean(s: str) -> str:
     return re.sub(r"\s+", "", s or "")
 
 def _as_float(text: str) -> Optional[float]:
-    """数値だけ抽出。% を含む文字列は None を返す（支持率除外）。"""
-    if not text or "%" in text:
+    """数値だけ抽出。% 含む／レンジ（- or ～ or ~）は除外。"""
+    if not text:
         return None
-    m = re.search(r"\d+(?:\.\d+)?", (text or "").replace(",", ""))
+    t = text.replace(",", "").strip()
+    if "%" in t or "-" in t or "～" in t or "~" in t:
+        return None
+    m = re.search(r"\d+(?:\.\d+)?", t)
     return float(m.group(0)) if m else None
 
 def _find_popular_odds_table(soup: BeautifulSoup) -> Tuple[Optional[BeautifulSoup], Dict[str, int]]:
     """
-    見出し(TH)から “人気” 列と “単勝” 列のインデックスを特定。
+    見出し(TH)から “人気/順位” 列と “単勝” 列のインデックスを特定。
     戻り値: (table, {"pop": idx_pop, "win": idx_win})
     """
     for table in soup.find_all("table"):
@@ -151,30 +154,24 @@ def _find_popular_odds_table(soup: BeautifulSoup) -> Tuple[Optional[BeautifulSou
         if not headers:
             continue
 
-        # DEBUG: 見出しをログ
-        logging.debug(f"[DEBUG] table headers: {headers}")
-
-        # 人気列
+        # 人気/順位 列
         pop_idx = None
         for i, h in enumerate(headers):
-            if h == "人気" or ("人気" in h and "順" not in h):
+            if h in ("人気", "順位") or ("人気" in h and "順" not in h):
                 pop_idx = i
                 break
 
-        # 単勝列（厳密に優先度を付けて選ぶ）
+        # 単勝 列（複・率・% を含むヘッダは除外）
         win_candidates = []  # (priority, index)
         for i, h in enumerate(headers):
-            if "複" in h:
-                continue  # 複勝/複の列は除外
-            if "率" in h or "%" in h:
-                continue  # 支持率/％は除外
+            if ("複" in h) or ("率" in h) or ("%" in h):
+                continue
             if h == "単勝":
-                win_candidates.append((0, i))  # 最優先：完全一致
+                win_candidates.append((0, i))
             elif "単勝" in h:
                 win_candidates.append((1, i))
             elif "オッズ" in h:
-                win_candidates.append((2, i))  # 代替：「オッズ」表記
-
+                win_candidates.append((2, i))
         win_idx = None
         if win_candidates:
             win_idx = sorted(win_candidates, key=lambda x: x[0])[0][1]
@@ -182,24 +179,31 @@ def _find_popular_odds_table(soup: BeautifulSoup) -> Tuple[Optional[BeautifulSou
         if pop_idx is None or win_idx is None:
             continue
 
-        # 本文で人気が 1,2,3… と昇順になっているか軽く検証
+        # 軽い妥当性チェック（人気が1→2…で増えていくか）
         body = table.find("tbody") or table
         rows = body.find_all("tr")
-        ok_rows = 0
+        seq_ok = 0
         last = 0
-        for tr in rows[:8]:
+        for tr in rows[:6]:
             tds = tr.find_all(["td", "th"])
             if len(tds) <= max(pop_idx, win_idx):
                 continue
             s = tds[pop_idx].get_text(strip=True)
             if not s.isdigit():
                 break
-            val = int(s)
-            if val <= last:
+            v = int(s)
+            if v <= last:
                 break
-            last = val
-            ok_rows += 1
-        if ok_rows >= 2:
+            last = v
+            seq_ok += 1
+        if seq_ok >= 2:
+            # どの列を使うかを INFO で出す（上位2行の値も）
+            sample = []
+            for tr in rows[:2]:
+                tds = tr.find_all(["td", "th"])
+                if len(tds) > win_idx:
+                    sample.append(tds[win_idx].get_text(" ", strip=True))
+            logging.info(f"[DEBUG] headers={headers} / pop_idx={pop_idx} / win_idx={win_idx} / win_samples={sample}")
             return table, {"pop": pop_idx, "win": win_idx}
 
     return None, {}
@@ -233,7 +237,7 @@ def parse_odds_table(soup: BeautifulSoup) -> Tuple[List[Dict[str, float]], Optio
         win_txt = tds[win_idx].get_text(" ", strip=True)
         odds = _as_float(win_txt)
         if odds is None:
-            continue  # 支持率や空欄などは除外
+            continue  # %・複勝レンジ・空欄等は除外
 
         horses.append({"pop": pop, "odds": float(odds)})
 
@@ -297,7 +301,6 @@ def main():
 
         meta = check_tanfuku_page(rid)
         if not meta: continue
-
         horses = meta["horses"]
         if len(horses) < 4:
             logging.info(f"[NO MATCH] {rid} 条件詳細: horses<4 で判定不可"); continue
