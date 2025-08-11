@@ -1,14 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Rakuten競馬 監視・通知バッチ（完全版・DEBUGオッズ出力付き）
+Rakuten競馬 監視・通知バッチ（人気順テーブル厳密パース版）
 - 門限（JST 10:00〜22:00）
-- RACEID列挙は2系統（#todaysTicket / 出馬表一覧の総なめ）
-- DEBUG_RACEIDS で任意RACEIDテスト
-- 戦略①〜④ (strategy_rules.py の eval_strategy) を適用
-- オッズテーブル解析はヘッダー優先＋フォールバックで強化
-- 重複通知制御（NOTIFY_TTL_SEC）
-- DRY_RUN/NOTIFY_ENABLED/KILL_SWITCH/門限(START_HOUR/END_HOUR) を環境変数で制御
-- 取得人気別オッズを必ずDEBUGログ出力
+- RACEID列挙は2系統（#todaysTicket, 出馬表一覧）
+- オッズは「人気順」テーブルの見出しから“人気”列と“単勝”列を厳密特定して取得
+- 取得オッズは毎回DEBUGログに出力（異常検知しやすくする）
+- TTLで重複通知を抑制
+- eval_strategy(horses, logger=logging) をそのまま適用（horses=[{"pop":1,"odds":1.7}, ...]）
 """
 
 import os, re, json, time, random, logging
@@ -129,121 +127,117 @@ def list_raceids_from_card_lists(ymd: str, ymd_next: str) -> List[str]:
     logging.info(f"[INFO] Rakuten#2 出馬表一覧: {len(rids)}件")
     return rids
 
-# ========= オッズ解析（強化版：ここが“置き換え”本体） =========
+# ========= オッズ解析（人気順テーブルを厳密特定） =========
+def _clean(s: str) -> str:
+    return re.sub(r"\s+", "", s or "")
+
+def _as_float(text: str) -> Optional[float]:
+    if not text:
+        return None
+    m = re.search(r"\d+(?:\.\d+)?", text.replace(",", ""))
+    return float(m.group(0)) if m else None
+
+def _find_popular_odds_table(soup: BeautifulSoup) -> Tuple[Optional[BeautifulSoup], Dict[str, int]]:
+    """
+    見出し(TH)から “人気” 列と “単勝” 列のインデックスを特定して返す。
+    戻り値: (table, {"pop": idx_pop, "win": idx_win})
+    """
+    for table in soup.find_all("table"):
+        thead = table.find("thead")
+        if not thead:
+            continue
+        ths = thead.find_all(["th", "td"])
+        headers = [_clean(th.get_text()) for th in ths]
+        if not headers:
+            continue
+
+        # “人気” か “順位” の列を人気列とみなす
+        pop_idx = None
+        for i, h in enumerate(headers):
+            if "人気" in h or "順位" in h:
+                pop_idx = i
+                break
+
+        # “単勝” 列（「単勝」「単」のどちらかを含む、かつ「複勝」ではない）
+        win_idx = None
+        for i, h in enumerate(headers):
+            if ("単勝" in h or h == "単" or h.startswith("単")) and ("複" not in h):
+                win_idx = i
+                break
+
+        # テーブル本文をざっと見て「人気順っぽい」ことを軽く検証
+        if pop_idx is not None and win_idx is not None:
+            body = table.find("tbody") or table
+            rows = body.find_all("tr")
+            ok_rows = 0
+            ascending_ok = True
+            last_pop = 0
+            for tr in rows[:8]:  # 冒頭数行で検証
+                tds = tr.find_all(["td", "th"])
+                if len(tds) <= max(pop_idx, win_idx):
+                    continue
+                pop_text = tds[pop_idx].get_text(strip=True)
+                if not pop_text.isdigit():
+                    ascending_ok = False
+                    break
+                p = int(pop_text)
+                if p <= last_pop:
+                    ascending_ok = False
+                    break
+                last_pop = p
+                ok_rows += 1
+            if ok_rows >= 2 and ascending_ok:
+                return table, {"pop": pop_idx, "win": win_idx}
+
+    return None, {}
+
 def parse_odds_table(soup: BeautifulSoup) -> Tuple[List[Dict[str, float]], Optional[str], Optional[str]]:
     """
-    楽天の単勝/複勝オッズ表から人気(pop)/単勝(odds)を抽出。
-    1) ヘッダーで「人気」「単勝」列を特定（最優先）
-    2) 見つからない場合は行スキャンで (人気っぽい整数, オッズっぽい小数) を拾う
-    返り値: (horses, venue_race, now_label)
-      horses = [{"pop":1,"odds":2.4}, ...] 人気昇順でユニーク化
+    人気順テーブルから
+      - horses: [{"pop":1,"odds":1.7}, ...]
+      - venue_race: "盛岡競馬場 1R" など
+      - now_label: "12:21時点" 等
+    を返す
     """
-    # レース名・時刻
-    venue_race = None
-    h1 = soup.find("h1")
-    if h1:
-        venue_race = h1.get_text(strip=True) or None
-    if not venue_race:
-        t = soup.find("title")
-        if t:
-            venue_race = t.get_text(strip=True) or None
+    # 付随情報
+    venue_race = (soup.find("h1").get_text(strip=True) if soup.find("h1") else None)
     nowtime = soup.select_one(".withUpdate .nowTime") or soup.select_one(".nowTime")
     now_label = nowtime.get_text(strip=True) if nowtime else None
 
-    # 該当テーブル探索
-    odds_table = soup.find("table", {"summary": re.compile("オッズ")})
-    if not odds_table:
-        for t in soup.find_all("table"):
-            meta = " ".join(t.get("class", [])) + " " + (t.get("summary") or "") + " " + " ".join([f"{k}={v}" for k, v in t.attrs.items()])
-            if ("オッズ" in meta) or ("tanfuku" in meta) or ("odds" in meta.lower()):
-                odds_table = t
-                break
-    if not odds_table:
-        cand = sorted(soup.find_all("table"),
-                      key=lambda x: len(x.find_all("tr")) * len(x.find_all("td")),
-                      reverse=True)
-        if cand:
-            odds_table = cand[0]
+    # 人気順テーブルを見出しから厳密特定
+    table, idx = _find_popular_odds_table(soup)
+    if not table:
+        return [], venue_race, now_label
+
+    pop_idx = idx["pop"]
+    win_idx = idx["win"]
 
     horses: List[Dict[str, float]] = []
-    if not odds_table:
-        return horses, venue_race, now_label
-
-    trs = [tr for tr in odds_table.find_all("tr") if tr.find_all(["td", "th"])]
-    if not trs:
-        return horses, venue_race, now_label
-
-    # ヘッダー解析
-    header_cells = [c.get_text(strip=True) for c in trs[0].find_all(["th", "td"])]
-    header_map = {i: v for i, v in enumerate(header_cells)}
-    has_header = any(("人気" in v) or ("単勝" in v) or ("複勝" in v) for v in header_cells)
-
-    pop_idx = None
-    odds_idx = None
-    if has_header:
-        for i, v in header_map.items():
-            if "人気" in v:
-                pop_idx = i
-            if ("単勝" in v) or ("オッズ" in v and "複勝" not in v):
-                odds_idx = i
-
-    def _to_int(s: str) -> Optional[int]:
-        s = (s or "").strip().replace(",", "")
-        return int(s) if re.fullmatch(r"\d{1,2}", s or "") else None
-
-    def _to_float(s: str) -> Optional[float]:
-        s = (s or "").strip().replace(",", "")
-        m = re.search(r"\d+(\.\d+)?", s)
-        if not m:
-            return None
-        try:
-            val = float(m.group(0))
-            return val if 1.0 <= val <= 999.9 else None
-        except:
-            return None
-
-    # 行走査
-    row_start = 1 if has_header else 0
-    for tr in trs[row_start:]:
-        cells = tr.find_all(["td", "th"])
-        if len(cells) < 2:
+    body = table.find("tbody") or table
+    for tr in body.find_all("tr"):
+        tds = tr.find_all(["td", "th"])
+        if len(tds) <= max(pop_idx, win_idx):
             continue
 
-        pop_val: Optional[int] = None
-        odds_val: Optional[float] = None
+        pop_text = tds[pop_idx].get_text(strip=True)
+        if not pop_text.isdigit():
+            continue
+        pop = int(pop_text)
+        if not (1 <= pop <= 30):  # 異常値は弾く
+            continue
 
-        if (pop_idx is not None) and (pop_idx < len(cells)):
-            pop_val = _to_int(cells[pop_idx].get_text())
-        if (odds_idx is not None) and (odds_idx < len(cells)):
-            odds_val = _to_float(cells[odds_idx].get_text())
+        odds = _as_float(tds[win_idx].get_text(" ", strip=True))
+        if odds is None:
+            continue
 
-        # フォールバック
-        if pop_val is None:
-            for c in cells[:3]:  # 人気は左寄りが多い
-                pop_val = _to_int(c.get_text())
-                if pop_val is not None:
-                    break
-        if odds_val is None:
-            for c in cells[::-1]:  # オッズは右寄りが多い
-                cand = _to_float(c.get_text(strip=True))
-                if cand is not None:
-                    odds_val = cand
-                    break
+        horses.append({"pop": pop, "odds": float(odds)})
 
-        if (pop_val is not None) and (odds_val is not None):
-            horses.append({"pop": pop_val, "odds": odds_val})
-
-    # 人気でユニーク化 & 昇順
+    # 人気でユニーク化＆昇順
     uniq = {}
-    for h in horses:
-        p = h.get("pop")
-        o = h.get("odds")
-        if p is None or o is None:
-            continue
-        if p not in uniq or (1.0 <= o < uniq[p]["odds"]):
-            uniq[p] = {"pop": p, "odds": o}
-
+    for h in sorted(horses, key=lambda x: x["pop"]):
+        uniq[h["pop"]] = h
     horses = [uniq[k] for k in sorted(uniq.keys())]
+
     return horses, venue_race, now_label
 
 def check_tanfuku_page(race_id: str) -> Optional[Dict]:
@@ -266,17 +260,21 @@ def send_notification(msg: str) -> None:
 # ========= メイン =========
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
     if KILL_SWITCH:
-        logging.info("[INFO] KILL_SWITCH=True のため終了"); return
+        logging.info("[INFO] KILL_SWITCH=True のため終了")
+        return
     if not within_operating_hours():
-        logging.info(f"[INFO] 監視休止（JST={now_jst():%H:%M} 稼働={START_HOUR:02d}:00-{END_HOUR:02d}:00）"); return
+        logging.info(f"[INFO] 監視休止（JST={now_jst():%H:%M} 稼働={START_HOUR:02d}:00-{END_HOUR:02d}:00）")
+        return
 
     logging.info("[INFO] ジョブ開始")
     logging.info(f"[INFO] NOTIFIED_PATH={NOTIFIED_PATH} KILL_SWITCH={KILL_SWITCH} DRY_RUN={DRY_RUN}")
     logging.info(f"[INFO] NOTIFY_ENABLED={'1' if NOTIFY_ENABLED else '0'}")
 
     notified = load_notified()
-    hits = 0; matches = 0
+    hits = 0
+    matches = 0
 
     if DEBUG_RACEIDS:
         logging.info(f"[INFO] DEBUG_RACEIDS 指定: {len(DEBUG_RACEIDS)}件")
@@ -292,18 +290,26 @@ def main():
             logging.info(f"  - {rid} -> tanfuku")
 
     for rid in target_raceids:
+        # TTLによる抑制
         if should_skip_by_ttl(notified, rid):
-            logging.info(f"[SKIP] TTL抑制: {rid}"); continue
+            logging.info(f"[SKIP] TTL抑制: {rid}")
+            continue
 
         meta = check_tanfuku_page(rid)
-        if not meta: continue
+        if not meta:
+            continue
+
         horses = meta["horses"]
         if len(horses) < 4:
-            logging.info(f"[NO MATCH] {rid} 条件詳細: horses<4 で判定不可"); continue
+            logging.info(f"[NO MATCH] {rid} 条件詳細: horses<4 で判定不可")
+            continue
 
         # 取得オッズの可視化
         try:
-            odds_log = ", ".join([f"{h['pop']}番人気:{h['odds']}" for h in sorted(horses, key=lambda x: x['pop'])])
+            odds_log = ", ".join(
+                f"{h['pop']}番人気:{h['odds']}"
+                for h in sorted(horses, key=lambda x: x['pop'])
+            )
         except Exception:
             odds_log = str(horses)
         logging.info(f"[DEBUG] {rid} 取得オッズ: {odds_log}")
@@ -327,10 +333,12 @@ def main():
                 send_notification(msg)
             else:
                 logging.info("[DRY_RUN] 通知はスキップ")
+
             notified[rid] = time.time()
         else:
             logging.info(f"[NO MATCH] {rid} 条件詳細: パターン①〜④に非該当")
 
+        # サイト負荷配慮
         time.sleep(random.uniform(*SLEEP_BETWEEN))
 
     logging.info(f"[INFO] HITS={hits} / MATCHES={matches}")
