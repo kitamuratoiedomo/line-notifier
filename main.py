@@ -5,7 +5,7 @@ Rakuten競馬 監視・通知バッチ（人気順テーブル 厳密パース�
 - RACEID列挙：#todaysTicket / 出馬表一覧
 - 人気順テーブルの見出しから “人気/順位” 列と “単勝” 列を厳密特定（複勝・支持率・レンジ値は除外）
 - 検出ヘッダと採用列・先頭数行のセル値を INFO ログで出力
-- TTLで重複通知抑制
+- LINE Push 成否を完全ログ化（200のみ去重TTL更新）
 """
 
 import os, re, json, time, random, logging
@@ -30,6 +30,8 @@ TIMEOUT = (10, 25)
 RETRY = 3
 SLEEP_BETWEEN = (0.6, 1.2)
 
+LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
+
 # ========= 環境変数 =========
 NOTIFIED_PATH  = os.getenv("NOTIFIED_PATH", "/tmp/notified_races.json")
 DRY_RUN        = os.getenv("DRY_RUN", "False").lower() == "true"
@@ -39,6 +41,9 @@ DEBUG_RACEIDS  = [s.strip() for s in os.getenv("DEBUG_RACEIDS", "").split(",") i
 NOTIFY_TTL_SEC = int(os.getenv("NOTIFY_TTL_SEC", "1800"))
 START_HOUR     = int(os.getenv("START_HOUR", "10"))
 END_HOUR       = int(os.getenv("END_HOUR",   "22"))
+
+LINE_ACCESS_TOKEN = os.getenv("LINE_ACCESS_TOKEN", "")
+LINE_USER_ID      = os.getenv("LINE_USER_ID", "")
 
 RACEID_RE = re.compile(r"/RACEID/(\d{18})")
 
@@ -262,9 +267,62 @@ def check_tanfuku_page(race_id: str) -> Optional[Dict]:
     return {"race_id": race_id, "url": url, "horses": horses,
             "venue_race": venue_race, "now": now_label or ""}
 
-# ========= 通知 =========
-def send_notification(msg: str) -> None:
-    logging.info(f"[NOTIFY] {msg}")
+# ========= LINE送信 =========
+def push_line_text(user_id: str, token: str, text: str, timeout=8, retries=1) -> Tuple[bool, Optional[int], str]:
+    """
+    戻り値: (ok, status_code, body_text)
+    ok=True（status=200）のときのみ送信成功とみなす
+    """
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    payload = {"to": user_id, "messages": [{"type": "text", "text": text}]}
+
+    for attempt in range(retries + 1):
+        try:
+            resp = requests.post(LINE_PUSH_URL, headers=headers, json=payload, timeout=timeout)
+            req_id = resp.headers.get("X-Line-Request-Id", "-")
+            body   = resp.text
+            logging.info("[LINE] status=%s req_id=%s body=%s", resp.status_code, req_id, body[:200])
+
+            if resp.status_code == 200:
+                return True, 200, body
+
+            # レート制限のときだけ一回リトライ
+            if resp.status_code == 429 and attempt < retries:
+                wait = int(resp.headers.get("Retry-After", "1"))
+                logging.warning("[LINE] 429 Too Many Requests -> retry in %ss", wait)
+                time.sleep(max(wait, 1))
+                continue
+
+            # その他の非200は即失敗
+            logging.error("[ERROR] LINE push failed status=%s body=%s", resp.status_code, body[:200])
+            return False, resp.status_code, body
+
+        except requests.RequestException as e:
+            logging.exception("[ERROR] LINE push exception (attempt %s): %s", attempt + 1, e)
+            if attempt < retries:
+                time.sleep(2)
+                continue
+            return False, None, str(e)
+
+def notify_strategy_hit(race_id: str, message_text: str) -> bool:
+    """
+    成功時 True を返す。True のときのみ TTL を更新すること。
+    """
+    if not NOTIFY_ENABLED:
+        logging.info("[INFO] NOTIFY_ENABLED=0 のため通知スキップ")
+        return False
+    if DRY_RUN:
+        logging.info("[DRY_RUN] 通知メッセージ:\n%s", message_text)
+        return False
+    if not LINE_ACCESS_TOKEN or not LINE_USER_ID:
+        logging.error("[ERROR] LINE 環境変数不足（LINE_ACCESS_TOKEN/LINE_USER_ID）")
+        return False
+
+    ok, status, body = push_line_text(LINE_USER_ID, LINE_ACCESS_TOKEN, message_text)
+    if not ok:
+        logging.warning("[WARN] LINE送信失敗 status=%s body=%s", status, (body or "")[:200])
+        return False
+    return True
 
 # ========= メイン =========
 def main():
@@ -300,10 +358,15 @@ def main():
             logging.info(f"[SKIP] TTL抑制: {rid}"); continue
 
         meta = check_tanfuku_page(rid)
-        if not meta: continue
+        if not meta: 
+            time.sleep(random.uniform(*SLEEP_BETWEEN))
+            continue
+
         horses = meta["horses"]
         if len(horses) < 4:
-            logging.info(f"[NO MATCH] {rid} 条件詳細: horses<4 で判定不可"); continue
+            logging.info(f"[NO MATCH] {rid} 条件詳細: horses<4 で判定不可")
+            time.sleep(random.uniform(*SLEEP_BETWEEN))
+            continue
 
         # 取得オッズの可視化
         try:
@@ -320,18 +383,21 @@ def main():
             detail = f"{strategy['strategy']} / 買い目: {ticket_str} / {strategy['roi']} / {strategy['hit']}"
             logging.info(f"[MATCH] {rid} 条件詳細: {detail}")
 
-            if NOTIFY_ENABLED and not DRY_RUN:
-                msg = (f"【戦略ヒット】\n"
-                       f"RACEID: {rid}\n"
-                       f"{meta['venue_race']} {meta['now']}\n"
-                       f"{strategy['strategy']}\n"
-                       f"買い目: {ticket_str}\n"
-                       f"{strategy['roi']} / {strategy['hit']}\n"
-                       f"{meta['url']}")
-                send_notification(msg)
+            message = (
+                "【戦略ヒット】\n"
+                f"RACEID: {rid}\n"
+                f"{meta['venue_race']} {meta['now']}\n"
+                f"{strategy['strategy']}\n"
+                f"買い目: {ticket_str}\n"
+                f"{strategy['roi']} / {strategy['hit']}\n"
+                f"{meta['url']}"
+            )
+
+            sent_ok = notify_strategy_hit(rid, message)
+            if sent_ok:
+                notified[rid] = time.time()  # ← 成功時のみTTL更新
             else:
-                logging.info("[DRY_RUN] 通知はスキップ")
-            notified[rid] = time.time()
+                logging.warning("[WARN] TTL未更新（通知未達/スキップ） rid=%s", rid)
         else:
             logging.info(f"[NO MATCH] {rid} 条件詳細: パターン①〜④に非該当")
 
