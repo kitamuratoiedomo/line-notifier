@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Rakuten競馬 監視・通知バッチ（発走時刻=一覧ページから取得 / 窓内1回通知 / 429クールダウン / Sheet永続TTL）
-- 稼働時間: JST 10:00〜22:00（環境変数 START_HOUR / END_HOUR）
+Rakuten競馬 監視・通知バッチ（一覧のみで発走時刻取得 / 窓内1回通知 / 429クールダウン / Sheet永続TTL）
+- 稼働時間: JST 10:00〜22:00（START_HOUR / END_HOUR）
 - RACEID列挙: #todaysTicket + 出馬表一覧（当日/翌日）
-- 発走時刻: 上記一覧ページのテーブルから抽出（race_card/RACEID/* にはアクセスしない）
+- 発走時刻: 上記一覧から抽出（<time datetime> / data-starttime系 / 行テキストのHH:MM）
 - 人気順テーブル: “人気/順位”列と“単勝/オッズ”列のみ厳密抽出（%・複勝レンジ除外）
 - 通知ウィンドウ: 発走 { -WINDOW_BEFORE_MIN 分 〜 WINDOW_AFTER_MIN 分 } に入った時のみ判定・送信
-- 通知は LINE 200 OK の時だけTTL更新（RACEIDキー）。429時は RACEID:cd キーにクールダウンTSを記録して抑止。
+- LINEは 200 OK の時だけTTL更新。429は :cd キーにクールダウンTSを記録。
 """
 
 import os, re, json, time, random, logging
@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional, Tuple, Set
 
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 from strategy_rules import eval_strategy
 
 # ===== Google Sheets =====
@@ -45,16 +45,16 @@ KILL_SWITCH         = os.getenv("KILL_SWITCH", "False").lower() == "true"
 NOTIFY_ENABLED      = os.getenv("NOTIFY_ENABLED", "1") == "1"
 DEBUG_RACEIDS       = [s.strip() for s in os.getenv("DEBUG_RACEIDS", "").split(",") if s.strip()]
 
-# 通常TTL（送達成功時のみ有効化）
+# 通常TTL（送達成功時のみ）
 NOTIFY_TTL_SEC      = int(os.getenv("NOTIFY_TTL_SEC", "3600"))
-# 429クールダウンTTL（429時に RACEID:cd キーに記録）
+# 429クールダウンTTL（:cd キー）
 NOTIFY_COOLDOWN_SEC = int(os.getenv("NOTIFY_COOLDOWN_SEC", "1800"))
 
-# 通知ウィンドウ（例: BEFORE=15, AFTER=-10 → 発走15分前〜10分前の“間”に1回）
+# 通知ウィンドウ（例: BEFORE=15, AFTER=-10 → 発走15分前〜10分前の間に1回）
 WINDOW_BEFORE_MIN   = int(os.getenv("WINDOW_BEFORE_MIN", "15"))
 WINDOW_AFTER_MIN    = int(os.getenv("WINDOW_AFTER_MIN", "-10"))
 
-# 任意：競走直前のデータ変化を考慮して直近数分は送らない等（0なら無効）
+# 任意：直前の変化を考慮して、発走−N分以降は送らない
 CUTOFF_OFFSET_MIN   = int(os.getenv("CUTOFF_OFFSET_MIN", "0"))
 FORCE_RUN           = os.getenv("FORCE_RUN", "0") == "1"
 
@@ -65,9 +65,9 @@ GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "")
 GOOGLE_SHEET_ID         = os.getenv("GOOGLE_SHEET_ID", "")
 GOOGLE_SHEET_TAB        = os.getenv("GOOGLE_SHEET_TAB", "notified")  # シート名 or gid(数値)
 
-RACEID_RE = re.compile(r"/RACEID/(\d{18})")
-# 全角コロンにも一応対応（保険）
-TIME_RE   = re.compile(r"(\d{1,2})[:：](\d{2})")
+RACEID_RE   = re.compile(r"/RACEID/(\d{18})")
+TIME_RE     = re.compile(r"\b(\d{1,2}):(\d{2})\b")
+PLACEHOLDER = re.compile(r"\d{8}0000000000$")
 
 # ========= 共通 =========
 def now_jst() -> datetime:
@@ -93,15 +93,6 @@ def fetch(url: str) -> str:
             logging.warning(f"[WARN] fetch失敗({i}/{RETRY}) {e} -> {wait:.1f}s待機: {url}")
             time.sleep(wait)
     raise last_err
-
-# ========= RACEIDバリデーション =========
-def is_valid_raceid(rid: str) -> bool:
-    """個別レースIDのみTrue。一覧用プレースホルダ（…0000000000）は除外。"""
-    if not rid or len(rid) != 18 or not rid.isdigit():
-        return False
-    if rid.endswith("0000000000"):
-        return False
-    return True
 
 # ========= Google Sheets 永続TTL =========
 def _sheet_service():
@@ -196,90 +187,171 @@ def should_skip_by_ttl(notified: Dict[str, float], rid: str) -> bool:
         return True
     return False
 
+# ========= RACEID抽出（共通） =========
+def _extract_raceids_from_soup(soup: BeautifulSoup) -> List[str]:
+    rids: List[str] = []
+    for a in soup.find_all("a", href=True):
+        m = RACEID_RE.search(a["href"])
+        if m:
+            rid = m.group(1)
+            if not PLACEHOLDER.search(rid):  # 無効なプレースホルダ除外
+                rids.append(rid)
+    return sorted(set(rids))
+
 # ========= 発走時刻（一覧ページ） =========
-def parse_post_times_from_table(table: BeautifulSoup) -> Dict[str, datetime]:
-    """テーブルの各行から RACEID と 発走時刻(HH:MM) を拾って JST datetime を返す"""
-    post_map: Dict[str, datetime] = {}
-    thead = table.find("thead")
-    ths = (thead.find_all(["th", "td"]) if thead else [])
-    headers = ["".join(th.stripped_strings) for th in ths] if ths else []
-    # 発走時刻の列インデックスを推定（ヘッダ優先、無ければパターンで抽出）
-    post_col = None
-    for i, h in enumerate(headers):
-        if "発走時刻" in h:
-            post_col = i
-            break
+def _row_text_snippet(el: Tag, maxlen: int = 80) -> str:
+    try:
+        t = " ".join(list(el.stripped_strings))
+        return (t[:maxlen] + "…") if len(t) > maxlen else t
+    except Exception:
+        return "-"
 
-    body = table.find("tbody") or table
-    for tr in body.find_all("tr"):
-        tds = tr.find_all(["td", "th"])
-        # RACEID探索（行内のリンクから）
-        rid = None
-        for a in tr.find_all("a", href=True):
-            m = RACEID_RE.search(a["href"])
+def _rid_date_parts(rid: str) -> Tuple[int, int, int]:
+    return int(rid[0:4]), int(rid[4:6]), int(rid[6:8])
+
+def _make_dt_from_hhmm(rid: str, hh: int, mm: int) -> Optional[datetime]:
+    try:
+        y, mon, d = _rid_date_parts(rid)
+        return datetime(y, mon, d, hh, mm, tzinfo=JST)
+    except Exception:
+        return None
+
+def _find_time_nearby(el: Tag) -> Tuple[Optional[str], str]:
+    """行やカード要素から、近傍の <time> / data-* / HH:MM テキストを探す。戻り: (HH:MM, reason)"""
+    # 1) <time datetime="YYYY-MM-DDTHH:MM"> / <time data-time="HH:MM">
+    t = el.find("time")
+    if t:
+        # datetime 属性優先
+        for attr in ("datetime", "data-time"):
+            v = t.get(attr) or ""
+            m = TIME_RE.search(v)
             if m:
-                candidate = m.group(1)
-                if is_valid_raceid(candidate):
-                    rid = candidate
-                    break
-        if not rid:
+                return m.group(0), f"time@{attr}"
+        # 要素内テキスト
+        m = TIME_RE.search(t.get_text(" ", strip=True))
+        if m:
+            return m.group(0), "time@text"
+
+    # 2) data-starttime / data-start-time / data-time を持つ要素
+    for node in el.find_all(True, recursive=True):
+        for attr in ("data-starttime", "data-start-time", "data-time"):
+            v = node.get(attr)
+            if not v:
+                continue
+            m = TIME_RE.search(v)
+            if m:
+                return m.group(0), f"data:{attr}"
+
+    # 3) よくあるクラス名
+    for sel in [".startTime", ".cellStartTime", ".raceTime", ".time", ".start-time"]:
+        node = el.select_one(sel)
+        if node:
+            m = TIME_RE.search(node.get_text(" ", strip=True))
+            if m:
+                return m.group(0), f"sel:{sel}"
+
+    # 4) 最後の手段: 要素全体テキストから HH:MM
+    m = TIME_RE.search(el.get_text(" ", strip=True))
+    if m:
+        return m.group(0), "row:text"
+
+    return None, "-"
+
+def parse_post_times_from_table_like(root: Tag) -> Dict[str, datetime]:
+    """table行 or カード風ブロックから RACEID と 発走HH:MM を拾う万能パーサ"""
+    post_map: Dict[str, datetime] = {}
+
+    # 1) テーブル（theadに“発走/発走時刻/レース”が含まれるものを優先）
+    for table in root.find_all("table"):
+        thead = table.find("thead")
+        if thead:
+            head_text = "".join(thead.stripped_strings)
+            if not any(k in head_text for k in ("発走", "発走時刻", "レース")):
+                continue
+        body = table.find("tbody") or table
+        for tr in body.find_all("tr"):
+            # RID
+            rid = None
+            link = tr.find("a", href=True)
+            if link:
+                m = RACEID_RE.search(link["href"])
+                if m:
+                    rid = m.group(1)
+            if not rid or PLACEHOLDER.search(rid):
+                continue
+
+            # 時刻
+            hhmm, reason = _find_time_nearby(tr)
+            if not hhmm:
+                logging.debug(f"[DEBUG] 発走見つからず(table row) rid={rid} row='{_row_text_snippet(tr)}'")
+                continue
+            m = TIME_RE.search(hhmm)
+            if not m:
+                continue
+            hh, mm = int(m.group(1)), int(m.group(2))
+            dt = _make_dt_from_hhmm(rid, hh, mm)
+            if dt:
+                post_map[rid] = dt
+                logging.debug(f"[DEBUG] 発走抽出 OK rid={rid} {dt:%H:%M} via {reason}")
+
+    # 2) テーブル以外（カード型リストなど）。/RACEID/リンクを基点に親要素から探す
+    for a in root.find_all("a", href=True):
+        m = RACEID_RE.search(a["href"])
+        if not m:
+            continue
+        rid = m.group(1)
+        if PLACEHOLDER.search(rid) or rid in post_map:
             continue
 
-        # 時刻テキスト抽出
-        time_text = None
-        if post_col is not None and len(tds) > post_col:
-            time_text = "".join(tds[post_col].stripped_strings)
-        if not time_text or not TIME_RE.search(time_text):
-            # セルに見当たらない場合は行全体から検索
-            row_text = " ".join([" ".join(td.stripped_strings) for td in tds])
-            m = TIME_RE.search(row_text)
-            time_text = m.group(0) if m else None
-        if not time_text:
+        # 近い先祖（tr / li / div.card 相当）を辿る
+        host = None
+        for parent in a.parents:
+            if isinstance(parent, Tag) and parent.name in ("tr", "li", "div", "section", "article"):
+                host = parent
+                break
+        host = host or a
+
+        hhmm, reason = _find_time_nearby(host)
+        if not hhmm:
+            # a自身の兄弟方向も軽く見る
+            sib_text = " ".join([x.get_text(" ", strip=True) for x in a.find_all_next(limit=3) if isinstance(x, Tag)])
+            m2 = TIME_RE.search(sib_text)
+            if m2:
+                hhmm, reason = m2.group(0), "next:text"
+        if not hhmm:
             continue
 
-        m = TIME_RE.search(time_text)
+        m = TIME_RE.search(hhmm)
         if not m:
             continue
         hh, mm = int(m.group(1)), int(m.group(2))
-        # 日付は RACEID のYYYYMMDD先頭8桁を使う
-        y = int(rid[0:4]); mon = int(rid[4:6]); d = int(rid[6:8])
-        try:
-            dt = datetime(y, mon, d, hh, mm, tzinfo=JST)
-        except Exception:
-            continue
-        post_map[rid] = dt
+        dt = _make_dt_from_hhmm(rid, hh, mm)
+        if dt:
+            post_map[rid] = dt
+            logging.debug(f"[DEBUG] 発走抽出 OK rid={rid} {dt:%H:%M} via {reason} (card)")
+
     return post_map
 
 def collect_post_time_map(ymd: str, ymd_next: str) -> Dict[str, datetime]:
     """#todaysTicket と 出馬表一覧（当日/翌日）の両方から発走時刻マップを構築"""
     post_map: Dict[str, datetime] = {}
-    # 本日の発売情報
-    try:
-        url = f"https://keiba.rakuten.co.jp/race_card/list/RACEID/{ymd}0000000000"
-        soup = BeautifulSoup(fetch(url), "lxml")
-        ticket = soup.find(id="todaysTicket")
-        if ticket:
-            post_map.update(parse_post_times_from_table(ticket))
-    except Exception as e:
-        logging.warning(f"[WARN] #todaysTicket 読み込み失敗: {e}")
+
+    def _merge_from(url: str, label: str):
+        try:
+            soup = BeautifulSoup(fetch(url), "lxml")
+            got = parse_post_times_from_table_like(soup)
+            if got:
+                post_map.update(got)
+        except Exception as e:
+            logging.warning(f"[WARN] {label} 読み込み失敗: {e} ({url})")
+
+    # 本日の発売情報（同URLに #todaysTicket があることが多い）
+    url_today = f"https://keiba.rakuten.co.jp/race_card/list/RACEID/{ymd}0000000000"
+    _merge_from(url_today, "#today")
 
     # 出馬表一覧（当日/翌日）
-    for u in [
-        f"https://keiba.rakuten.co.jp/race_card/list/RACEID/{ymd}0000000000",
-        f"https://keiba.rakuten.co.jp/race_card/list/RACEID/{ymd_next}0000000000",
-    ]:
-        try:
-            soup = BeautifulSoup(fetch(u), "lxml")
-            for table in soup.find_all("table"):
-                # ヘッダに「発走時刻」があるテーブルを対象
-                thead = table.find("thead")
-                if not thead:
-                    continue
-                head_text = "".join(thead.stripped_strings)
-                if "発走" in head_text or "発走時刻" in head_text or "レース" in head_text:
-                    post_map.update(parse_post_times_from_table(table))
-        except Exception as e:
-            logging.warning(f"[WARN] 出馬表一覧 読み込み失敗: {e} ({u})")
+    _merge_from(f"https://keiba.rakuten.co.jp/race_card/list/RACEID/{ymd}0000000000", "list:today")
+    _merge_from(f"https://keiba.rakuten.co.jp/race_card/list/RACEID/{ymd_next}0000000000", "list:tomorrow")
 
     logging.info(f"[INFO] 発走時刻取得: {len(post_map)}件")
     return post_map
@@ -422,51 +494,36 @@ def notify_strategy_hit(message_text: str) -> Tuple[bool, Optional[int]]:
 # ========= RACEID 取得 =========
 def list_raceids_today_ticket(ymd: str) -> List[str]:
     url = f"https://keiba.rakuten.co.jp/race_card/list/RACEID/{ymd}0000000000"
-    html = fetch(url)
-    soup = BeautifulSoup(html, "lxml")
-    table = soup.find(id="todaysTicket")
-    if not table:
-        logging.info("[INFO] #todaysTicket なし"); return []
-    links = table.select("td.nextRace a[href], td a[href]")
-    raceids = sorted({
-        m.group(1) for a in links
-        for m in [RACEID_RE.search(a.get("href", ""))]
-        if m and is_valid_raceid(m.group(1))
-    })
-    logging.info(f"[INFO] Rakuten#1 本日の発売情報: {len(raceids)}件")
-    return raceids
+    soup = BeautifulSoup(fetch(url), "lxml")
+    ids = _extract_raceids_from_soup(soup)
+
+    # #todaysTicket 限定にすると漏れやすいので、ページ全体から抽出しつつ重複排除
+    logging.info(f"[INFO] Rakuten#1 本日の発売情報: {len(ids)}件")
+    return ids
 
 def list_raceids_from_card_lists(ymd: str, ymd_next: str) -> List[str]:
     urls = [
         f"https://keiba.rakuten.co.jp/race_card/list/RACEID/{ymd}0000000000",
         f"https://keiba.rakuten.co.jp/race_card/list/RACEID/{ymd_next}0000000000",
     ]
-    rids: Set[str] = set()
+    rids: List[str] = []
     for u in urls:
         try:
-            html = fetch(u)
-            soup = BeautifulSoup(html, "lxml")
-            for a in soup.find_all("a", href=True):
-                m = RACEID_RE.search(a["href"])
-                if m:
-                    rid = m.group(1)
-                    if is_valid_raceid(rid):
-                        rids.add(rid)
+            soup = BeautifulSoup(fetch(u), "lxml")
+            rids.extend(_extract_raceids_from_soup(soup))
         except Exception as e:
             logging.warning(f"[WARN] 出馬表一覧スキャン失敗: {e} ({u})")
-    rids = sorted(rids)
+    rids = sorted(set(rids))
     logging.info(f"[INFO] Rakuten#2 出馬表一覧: {len(rids)}件")
     return rids
 
 # ========= ウィンドウ判定 =========
 def is_within_window(post_time: datetime, now: datetime) -> bool:
     """発走時刻を基準に、[ -WINDOW_BEFORE_MIN, WINDOW_AFTER_MIN ] に入っているか"""
-    # 直前カット（例: CUTOFF_OFFSET_MIN=3 → 発走-3分以降は送らない）
     if CUTOFF_OFFSET_MIN > 0 and now >= (post_time - timedelta(minutes=CUTOFF_OFFSET_MIN)):
         return False
     win_start = post_time - timedelta(minutes=WINDOW_BEFORE_MIN)
     win_end   = post_time + timedelta(minutes=WINDOW_AFTER_MIN)
-    # AFTER_MIN が負なら “発走前のみ” の窓になる（例: -10）
     return (win_start <= now <= win_end)
 
 # ========= メイン =========
@@ -493,20 +550,21 @@ def main():
     # RACEID列挙
     if DEBUG_RACEIDS:
         logging.info(f"[INFO] DEBUG_RACEIDS 指定: {len(DEBUG_RACEIDS)}件")
-        target_raceids = [rid for rid in DEBUG_RACEIDS if is_valid_raceid(rid)]
+        target_raceids = [rid for rid in DEBUG_RACEIDS if not PLACEHOLDER.search(rid)]
         post_time_map = {}
     else:
         ymd = now_jst().strftime("%Y%m%d")
         ymd_next = (now_jst() + timedelta(days=1)).strftime("%Y%m%d")
         r1 = list_raceids_today_ticket(ymd)
         r2 = list_raceids_from_card_lists(ymd, ymd_next)
-        # 有効なRACEIDのみに限定
-        target_raceids = [rid for rid in sorted(set(r1) | set(r2)) if is_valid_raceid(rid)]
-        # 発走時刻マップを構築（詳細ページは叩かない）
+        target_raceids = sorted(set(r1) | set(r2))
+        # 発走時刻マップを構築（一覧のみ）
         post_time_map = collect_post_time_map(ymd, ymd_next)
-        logging.info(f"[INFO] 発見RACEID数(有効のみ): {len(target_raceids)}")
-        for rid in target_raceids:
+        valid = [rid for rid in target_raceids if not PLACEHOLDER.search(rid)]
+        logging.info(f"[INFO] 発見RACEID数(有効のみ): {len(valid)}")
+        for rid in valid:
             logging.info(f"  - {rid} -> tanfuku")
+        target_raceids = valid
 
     hits = 0; matches = 0
     seen_in_this_run: Set[str] = set()  # 同一ジョブ内の二重送信防止
@@ -526,7 +584,6 @@ def main():
         # ウィンドウ判定
         now = now_jst()
         if not is_within_window(post_time, now):
-            # デバッグしやすいよう距離も出す
             delta_min = int((post_time - now).total_seconds() // 60)
             logging.info(f"[SKIP] 窓外({delta_min:+}m) rid={rid} 発走={post_time:%H:%M}")
             continue
@@ -569,7 +626,6 @@ def main():
             now_ts = time.time()
 
             if sent_ok:
-                # 送達成功 → 通常TTL更新
                 try:
                     sheet_upsert_notified(rid, now_ts, note=f"{meta['venue_race']} {post_time:%H:%M}")
                     notified[rid] = now_ts
@@ -577,7 +633,6 @@ def main():
                     logging.exception("[ERROR] TTL更新失敗（Google Sheets）: %s", e)
                 seen_in_this_run.add(rid)
             elif http_status == 429:
-                # 429 → クールダウンTTL更新（rid:cd）
                 try:
                     key_cd = f"{rid}:cd"
                     sheet_upsert_notified(key_cd, now_ts, note=f"429 cooldown {meta['venue_race']} {post_time:%H:%M}")
