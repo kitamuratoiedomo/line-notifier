@@ -6,7 +6,7 @@ Rakuten競馬 監視・通知バッチ（発走時刻=一覧ページから取�
 - 発走時刻: 上記一覧ページのテーブルから抽出（race_card/RACEID/* にはアクセスしない）
 - 人気順テーブル: “人気/順位”列と“単勝/オッズ”列のみ厳密抽出（%・複勝レンジ除外）
 - 通知ウィンドウ: 発走 { -WINDOW_BEFORE_MIN 分 〜 WINDOW_AFTER_MIN 分 } に入った時のみ判定・送信
-- 通知は LINE 200 OK の時だけTTL更新（RACEIDキー）。429時は RACEID:cd キーにクールダウンTSを記録して抑制。
+- 通知は LINE 200 OK の時だけTTL更新（RACEIDキー）。429時は RACEID:cd キーにクールダウンTSを記録して抑止。
 """
 
 import os, re, json, time, random, logging
@@ -487,7 +487,7 @@ def main():
         r1 = list_raceids_today_ticket(ymd)
         r2 = list_raceids_from_card_lists(ymd, ymd_next)
         target_raceids = sorted(set(r1) | set(r2))
-        # 発走時刻マップを構築
+        # 発走時刻マップを構築（詳細ページは叩かない）
         post_time_map = collect_post_time_map(ymd, ymd_next)
         logging.info(f"[INFO] 発見RACEID数: {len(target_raceids)}")
         for rid in target_raceids:
