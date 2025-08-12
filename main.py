@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Rakuten競馬 監視・通知バッチ（一覧のみで発走時刻取得 / 窓内1回通知 / 429クールダウン / Sheet永続TTL）
+Rakuten競馬 監視・通知バッチ（一覧→詳細フォールバックで発走時刻取得 / 窓内1回通知 / 429クールダウン / Sheet永続TTL）
 """
 
 import os, re, json, time, random, logging
@@ -56,11 +56,11 @@ GOOGLE_SHEET_ID         = os.getenv("GOOGLE_SHEET_ID", "")
 GOOGLE_SHEET_TAB        = os.getenv("GOOGLE_SHEET_TAB", "notified")
 
 RACEID_RE   = re.compile(r"/RACEID/(\d{18})")
-# 半角コロン, 全角コロン, 「時分」表記の3系統に対応
+# 半角/全角コロン、「時分」表記に対応
 TIME_PATS = [
     re.compile(r"\b(\d{1,2}):(\d{2})\b"),
-    re.compile(r"\b(\d{1,2})：(\d{2})\b"),          # 全角コロン
-    re.compile(r"\b(\d{1,2})\s*時\s*(\d{1,2})\s*分\b"),  # 12時50分
+    re.compile(r"\b(\d{1,2})：(\d{2})\b"),
+    re.compile(r"\b(\d{1,2})\s*時\s*(\d{1,2})\s*分\b"),
 ]
 PLACEHOLDER = re.compile(r"\d{8}0000000000$")
 
@@ -201,15 +201,14 @@ def _rid_date_parts(rid: str) -> Tuple[int, int, int]:
     return int(rid[0:4]), int(rid[4:6]), int(rid[6:8])
 
 def _norm_hhmm_from_text(text: str) -> Optional[Tuple[int,int,str]]:
-    """テキスト/属性文字列から時刻を見つけて (HH,MM, reason) を返す"""
+    """任意の文字列から時刻を見つけ (HH,MM, why) を返す"""
     if not text:
         return None
     s = str(text)
     for pat, tag in zip(TIME_PATS, ("half", "full", "kanji")):
         m = pat.search(s)
         if m:
-            hh = int(m.group(1))
-            mm = int(m.group(2))
+            hh = int(m.group(1)); mm = int(m.group(2))
             if 0 <= hh <= 23 and 0 <= mm <= 59:
                 return hh, mm, tag
     return None
@@ -223,7 +222,7 @@ def _make_dt_from_hhmm(rid: str, hh: int, mm: int) -> Optional[datetime]:
 
 def _find_time_nearby(el: Tag) -> Tuple[Optional[str], str]:
     """行/カード要素から <time> / data-* / 属性 / テキスト の順で探索"""
-    # <time>要素
+    # <time>タグ優先
     t = el.find("time")
     if t:
         for attr in ("datetime", "data-time", "title", "aria-label"):
@@ -238,7 +237,7 @@ def _find_time_nearby(el: Tag) -> Tuple[Optional[str], str]:
             hh, mm, why = got
             return f"{hh:02d}:{mm:02d}", f"time@text/{why}"
 
-    # data-*属性
+    # data-*やtitle/aria
     for node in el.find_all(True, recursive=True):
         for attr in ("data-starttime", "data-start-time", "data-time", "title", "aria-label"):
             v = node.get(attr)
@@ -270,7 +269,7 @@ def _find_time_nearby(el: Tag) -> Tuple[Optional[str], str]:
 def parse_post_times_from_table_like(root: Tag) -> Dict[str, datetime]:
     post_map: Dict[str, datetime] = {}
 
-    # 1) テーブル
+    # 1) テーブル行から
     for table in root.find_all("table"):
         thead = table.find("thead")
         if thead:
@@ -279,7 +278,6 @@ def parse_post_times_from_table_like(root: Tag) -> Dict[str, datetime]:
                 continue
         body = table.find("tbody") or table
         for tr in body.find_all("tr"):
-            # RID
             rid = None
             link = tr.find("a", href=True)
             if link:
@@ -299,7 +297,7 @@ def parse_post_times_from_table_like(root: Tag) -> Dict[str, datetime]:
                 post_map[rid] = dt
                 logging.debug(f"[DEBUG] 発走抽出 OK rid={rid} {dt:%H:%M} via {reason}")
 
-    # 2) カード型: /RACEID/ を基点に親要素から探す
+    # 2) カード型（tr以外）
     for a in root.find_all("a", href=True):
         m = RACEID_RE.search(a["href"])
         if not m:
@@ -308,7 +306,6 @@ def parse_post_times_from_table_like(root: Tag) -> Dict[str, datetime]:
         if PLACEHOLDER.search(rid) or rid in post_map:
             continue
 
-        # 近い先祖（tr/li/div/section/article）を辿る
         host = None
         depth = 0
         for parent in a.parents:
@@ -322,7 +319,6 @@ def parse_post_times_from_table_like(root: Tag) -> Dict[str, datetime]:
 
         hhmm, reason = _find_time_nearby(host)
         if not hhmm:
-            # 兄弟方向（次の数要素）も見る
             sib_text = " ".join([x.get_text(" ", strip=True) for x in a.find_all_next(limit=4) if isinstance(x, Tag)])
             got = _norm_hhmm_from_text(sib_text)
             if got:
@@ -358,6 +354,71 @@ def collect_post_time_map(ymd: str, ymd_next: str) -> Dict[str, datetime]:
 
     logging.info(f"[INFO] 発走時刻取得: {len(post_map)}件")
     return post_map
+
+# ========= 詳細ページ フォールバック =========
+def _post_time_from_detail_soup(race_id: str, soup: BeautifulSoup) -> Tuple[Optional[datetime], str]:
+    # 1) timeタグ直取り
+    t = soup.find("time")
+    if t:
+        for attr in ("datetime", "data-time", "title", "aria-label"):
+            v = t.get(attr) or ""
+            got = _norm_hhmm_from_text(v) or _norm_hhmm_from_text(t.get_text(" ", strip=True))
+            if got:
+                hh, mm, why = got
+                dt = _make_dt_from_hhmm(race_id, hh, mm)
+                if dt: return dt, f"time@{attr or 'text'}/{why}"
+
+    # 2) メタタグ/タイトル
+    for meta_name in ("description", "og:description", "og:title", "twitter:title"):
+        m = soup.find("meta", attrs={"name": meta_name}) or soup.find("meta", property=meta_name)
+        if m:
+            v = m.get("content") or ""
+            got = _norm_hhmm_from_text(v)
+            if got:
+                hh, mm, why = got
+                dt = _make_dt_from_hhmm(race_id, hh, mm)
+                if dt: return dt, f"meta:{meta_name}/{why}"
+
+    # 3) よくある見出し・情報ブロック
+    for sel in ("#raceTit", ".raceTit", ".race__time", ".raceData", ".racedata", "h1", "h2", "h3"):
+        node = soup.select_one(sel)
+        if node:
+            got = _norm_hhmm_from_text(node.get_text(" ", strip=True))
+            if got:
+                hh, mm, why = got
+                dt = _make_dt_from_hhmm(race_id, hh, mm)
+                if dt: return dt, f"sel:{sel}/{why}"
+
+    # 4) ページ全体（重いので最後）
+    got = _norm_hhmm_from_text(soup.get_text(" ", strip=True))
+    if got:
+        hh, mm, why = got
+        dt = _make_dt_from_hhmm(race_id, hh, mm)
+        if dt: return dt, f"fulltext/{why}"
+
+    return None, "-"
+
+def fetch_post_time_via_detail(race_id: str) -> Optional[datetime]:
+    """一覧で取れなかったレースの詳細ページから発走時刻を抽出"""
+    # 試行候補（将来の微変更に備えて複数）
+    candidates = [
+        f"https://keiba.rakuten.co.jp/race_card/RACEID/{race_id}",
+        f"https://keiba.rakuten.co.jp/race_card/list/RACEID/{race_id}",  # 稀に直接リストが返るケース対策
+        f"https://keiba.rakuten.co.jp/odds/tanfuku/RACEID/{race_id}",    # 最後の保険（時刻が出る場合あり）
+    ]
+    for url in candidates:
+        try:
+            logging.info(f"[INFO] 詳細fallback開始 rid={race_id} url={url}")
+            html = fetch(url)
+            soup = BeautifulSoup(html, "lxml")
+            dt, why = _post_time_from_detail_soup(race_id, soup)
+            if dt:
+                logging.info(f"[INFO] 発走(詳細fallback)取得 rid={race_id} 発走={dt:%H:%M} via {why} ({url})")
+                return dt
+        except Exception as e:
+            logging.warning(f"[WARN] 詳細fallback例外 rid={race_id}: {e} ({url})")
+        time.sleep(random.uniform(*SLEEP_BETWEEN))
+    return None
 
 # ========= オッズ解析（単複ページ） =========
 def _clean(s: str) -> str:
@@ -573,17 +634,27 @@ def main():
         if should_skip_by_ttl(notified, rid):
             logging.info(f"[SKIP] TTL/クールダウン抑制: {rid}"); continue
 
+        # 一覧に無ければ詳細フォールバック
         post_time = post_time_map.get(rid)
+        if not post_time:
+            try:
+                post_time = fetch_post_time_via_detail(rid)
+            except Exception as e:
+                logging.warning(f"[WARN] 詳細fallback例外 rid={rid}: {e}")
+                post_time = None
+
         if not post_time:
             logging.info(f"[SKIP] 発走時刻不明のため通知保留: {rid}")
             continue
 
+        # ウィンドウ判定
         now = now_jst()
         if not is_within_window(post_time, now):
             delta_min = int((post_time - now).total_seconds() // 60)
             logging.info(f"[SKIP] 窓外({delta_min:+}m) rid={rid} 発走={post_time:%H:%M}")
             continue
 
+        # 窓内でオッズ確認
         meta = check_tanfuku_page(rid)
         if not meta:
             time.sleep(random.uniform(*SLEEP_BETWEEN)); continue
