@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Rakuten競馬 監視・通知バッチ（Sheet永続TTL + 429クールダウン）
+Rakuten競馬 監視・通知バッチ（Sheet永続TTL + 発走時刻ウィンドウ + 429クールダウン）
 - 稼働時間: JST 10:00〜22:00
 - RACEID列挙: #todaysTicket + 出馬表一覧
 - 人気順テーブル: “人気/順位”列と“単勝”列のみ厳密抽出（%・複勝レンジ除外）
 - TTLはGoogleスプレッドシートに保存（RACEID単位, 既定3600秒）
-- LINEは200 OK時のみTTL更新。429はクールダウンTTLを別キーで保存し抑止
+- 通知は「発走の指定ウィンドウ（前後分）」に入ったレースのみ
+- LINEは200 OK時のみ通常TTL更新。429はクールダウンTTLを別キーで保存し抑止
 """
 
 import os, re, json, time, random, logging
@@ -37,14 +38,18 @@ SLEEP_BETWEEN = (0.6, 1.2)
 LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
 
 # ========= 環境変数 =========
-NOTIFY_TTL_SEC      = int(os.getenv("NOTIFY_TTL_SEC", "3600"))   # 通常TTL（成功時）
-NOTIFY_COOLDOWN_SEC = int(os.getenv("NOTIFY_COOLDOWN_SEC", "1800"))  # 429クールダウンTTL
+NOTIFY_TTL_SEC      = int(os.getenv("NOTIFY_TTL_SEC", "3600"))      # 通常TTL（成功時）
+NOTIFY_COOLDOWN_SEC = int(os.getenv("NOTIFY_COOLDOWN_SEC", "1800")) # 429クールダウンTTL
 START_HOUR          = int(os.getenv("START_HOUR", "10"))
 END_HOUR            = int(os.getenv("END_HOUR",   "22"))
 DRY_RUN             = os.getenv("DRY_RUN", "False").lower() == "true"
 KILL_SWITCH         = os.getenv("KILL_SWITCH", "False").lower() == "true"
 NOTIFY_ENABLED      = os.getenv("NOTIFY_ENABLED", "1") == "1"
 DEBUG_RACEIDS       = [s.strip() for s in os.getenv("DEBUG_RACEIDS", "").split(",") if s.strip()]
+
+# 発走ウィンドウ（分）。例: 5分前〜1分後
+WINDOW_BEFORE_MIN   = int(os.getenv("WINDOW_BEFORE_MIN", "5"))
+WINDOW_AFTER_MIN    = int(os.getenv("WINDOW_AFTER_MIN",  "1"))
 
 LINE_ACCESS_TOKEN = os.getenv("LINE_ACCESS_TOKEN", "")
 LINE_USER_ID      = os.getenv("LINE_USER_ID", "")
@@ -77,6 +82,46 @@ def fetch(url: str) -> str:
             logging.warning(f"[WARN] fetch失敗({i}/{RETRY}) {e} -> {wait:.1f}s待機: {url}")
             time.sleep(wait)
     raise last_err
+
+# ========= 発走時刻（レースカード） =========
+RACE_TIME_RE = re.compile(r"(\d{1,2}:\d{2})\s*発走")
+
+def fetch_post_time_jst(race_id: str) -> Optional[datetime]:
+    """
+    レースカードから「HH:MM発走」を拾い、RACEIDの年月日と合成してJST datetimeを返す。
+    取得できなければ None。
+    """
+    url = f"https://keiba.rakuten.co.jp/race_card/RACEID/{race_id}"
+    try:
+        html = fetch(url)
+    except Exception as e:
+        logging.warning(f"[WARN] 発走時刻取得失敗(fetch): {e} ({url})")
+        return None
+
+    soup = BeautifulSoup(html, "lxml")
+    text = soup.get_text(" ", strip=True)
+    m = RACE_TIME_RE.search(text)
+    if not m:
+        # 予備：ページ内の「発走」近辺の時刻も拾う
+        cand = soup.find(string=re.compile(r"発走"))
+        if cand:
+            m = re.search(r"(\d{1,2}:\d{2})", str(cand))
+    if not m:
+        logging.warning(f"[WARN] 発走時刻未検出: {url}")
+        return None
+
+    hh, mm = m.group(1).split(":")
+    # RACEID 先頭 8 桁が YYYYMMDD
+    y = int(race_id[0:4]); mo = int(race_id[4:6]); d = int(race_id[6:8])
+    try:
+        return datetime(y, mo, d, int(hh), int(mm), tzinfo=JST)
+    except Exception as e:
+        logging.warning(f"[WARN] 発走時刻パース失敗: {e} ({y}-{mo}-{d} {hh}:{mm})")
+        return None
+
+def within_window(now_dt: datetime, post_dt: datetime, before_min: int, after_min: int) -> bool:
+    """now が [post - before, post + after] に収まるか"""
+    return (post_dt - timedelta(minutes=before_min) <= now_dt <= post_dt + timedelta(minutes=after_min))
 
 # ========= Google Sheets 永続TTL =========
 def _sheet_service():
@@ -198,18 +243,13 @@ def _find_popular_odds_table(soup: BeautifulSoup) -> Tuple[Optional[BeautifulSou
         pop_idx = None
         for i, h in enumerate(headers):
             if h in ("人気", "順位") or ("人気" in h and "順" not in h):
-                pop_idx = i
-                break
+                pop_idx = i; break
         win_candidates = []
         for i, h in enumerate(headers):
-            if ("複" in h) or ("率" in h) or ("%" in h):
-                continue
-            if h == "単勝":
-                win_candidates.append((0, i))
-            elif "単勝" in h:
-                win_candidates.append((1, i))
-            elif "オッズ" in h:
-                win_candidates.append((2, i))
+            if ("複" in h) or ("率" in h) or ("%" in h): continue
+            if h == "単勝": win_candidates.append((0, i))
+            elif "単勝" in h: win_candidates.append((1, i))
+            elif "オッズ" in h: win_candidates.append((2, i))
         win_idx = sorted(win_candidates, key=lambda x: x[0])[0][1] if win_candidates else None
         if pop_idx is None or win_idx is None:
             continue
@@ -218,16 +258,12 @@ def _find_popular_odds_table(soup: BeautifulSoup) -> Tuple[Optional[BeautifulSou
         seq_ok, last = 0, 0
         for tr in rows[:6]:
             tds = tr.find_all(["td", "th"])
-            if len(tds) <= max(pop_idx, win_idx):
-                continue
+            if len(tds) <= max(pop_idx, win_idx): continue
             s = tds[pop_idx].get_text(strip=True)
-            if not s.isdigit():
-                break
+            if not s.isdigit(): break
             v = int(s)
-            if v <= last:
-                break
-            last = v
-            seq_ok += 1
+            if v <= last: break
+            last = v; seq_ok += 1
         if seq_ok >= 2:
             sample = []
             for tr in rows[:2]:
@@ -252,17 +288,13 @@ def parse_odds_table(soup: BeautifulSoup) -> Tuple[List[Dict[str, float]], Optio
     body = table.find("tbody") or table
     for tr in body.find_all("tr"):
         tds = tr.find_all(["td", "th"])
-        if len(tds) <= max(pop_idx, win_idx):
-            continue
+        if len(tds) <= max(pop_idx, win_idx): continue
         pop_txt = tds[pop_idx].get_text(strip=True)
-        if not pop_txt.isdigit():
-            continue
+        if not pop_txt.isdigit(): continue
         pop = int(pop_txt)
-        if not (1 <= pop <= 30):
-            continue
+        if not (1 <= pop <= 30): continue
         odds = _as_float(tds[win_idx].get_text(" ", strip=True))
-        if odds is None:
-            continue
+        if odds is None: continue
         horses.append({"pop": pop, "odds": float(odds)})
 
     uniq = {}
@@ -299,8 +331,7 @@ def push_line_text(user_id: str, token: str, text: str, timeout=8, retries=1) ->
             if resp.status_code == 429 and attempt < retries:
                 wait = int(resp.headers.get("Retry-After", "1"))
                 logging.warning("[LINE] 429 Too Many Requests -> retry in %ss", wait)
-                time.sleep(max(wait, 1))
-                continue
+                time.sleep(max(wait, 1)); continue
             return False, resp.status_code, body
         except requests.RequestException as e:
             logging.exception("[ERROR] LINE push exception (attempt %s): %s", attempt + 1, e)
@@ -334,8 +365,7 @@ def list_raceids_today_ticket(ymd: str) -> List[str]:
     for a in links:
         text = (a.get_text(strip=True) or "")
         m = RACEID_RE.search(a.get("href", ""))
-        if not m: 
-            continue
+        if not m: continue
         rid = m.group(1)
         if "投票受付中" in text or "発走" in text:
             raceids.append(rid)
@@ -355,8 +385,7 @@ def list_raceids_from_card_lists(ymd: str, ymd_next: str) -> List[str]:
             soup = BeautifulSoup(html, "lxml")
             for a in soup.find_all("a", href=True):
                 m = RACEID_RE.search(a["href"])
-                if m:
-                    rids.append(m.group(1))
+                if m: rids.append(m.group(1))
         except Exception as e:
             logging.warning(f"[WARN] 出馬表一覧スキャン失敗: {e} ({u})")
     rids = sorted(set(rids))
@@ -373,7 +402,9 @@ def main():
         logging.info(f"[INFO] 監視休止（JST={now_jst():%H:%M} 稼働={START_HOUR:02d}:00-{END_HOUR:02d}:00）"); return
 
     logging.info("[INFO] ジョブ開始")
-    logging.info(f"[INFO] DRY_RUN={DRY_RUN} NOTIFY_ENABLED={'1' if NOTIFY_ENABLED else '0'} TTL={NOTIFY_TTL_SEC}s CD={NOTIFY_COOLDOWN_SEC}s")
+    logging.info(f"[INFO] DRY_RUN={DRY_RUN} NOTIFY_ENABLED={'1' if NOTIFY_ENABLED else '0'} "
+                 f"TTL={NOTIFY_TTL_SEC}s CD={NOTIFY_COOLDOWN_SEC}s "
+                 f"WIN=-{WINDOW_BEFORE_MIN}m/+{WINDOW_AFTER_MIN}m")
 
     # 永続TTLロード
     try:
@@ -401,9 +432,24 @@ def main():
     for rid in target_raceids:
         if rid in seen_in_this_run:
             logging.info(f"[SKIP] 同一ジョブ内去重: {rid}"); continue
+
+        # --- 発走時刻ウィンドウ判定（TTLより先に判定して早すぎ通知を防止） ---
+        post_dt = fetch_post_time_jst(rid)
+        if not post_dt:
+            logging.info(f"[SKIP] 発走時刻不明のため通知保留: {rid}")
+            time.sleep(random.uniform(*SLEEP_BETWEEN)); continue
+
+        now_dt = now_jst()
+        if not within_window(now_dt, post_dt, WINDOW_BEFORE_MIN, WINDOW_AFTER_MIN):
+            logging.info(f"[SKIP] 時間外: now={now_dt:%H:%M} post={post_dt:%H:%M} "
+                         f"win=[-{WINDOW_BEFORE_MIN}m, +{WINDOW_AFTER_MIN}m] rid={rid}")
+            time.sleep(random.uniform(*SLEEP_BETWEEN)); continue
+
+        # --- TTL/クールダウン抑止 ---
         if should_skip_by_ttl(notified, rid):
             logging.info(f"[SKIP] TTL/クールダウン抑制: {rid}"); continue
 
+        # --- オッズ取得＆戦略判定 ---
         meta = check_tanfuku_page(rid)
         if not meta:
             time.sleep(random.uniform(*SLEEP_BETWEEN)); continue
