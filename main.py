@@ -67,7 +67,7 @@ TIME_PATS = [
 ]
 PLACEHOLDER = re.compile(r"\d{8}0000000000$")
 
-# ノイズ／優先ラベル（★新規）
+# ノイズ／優先ラベル
 IGNORE_NEAR_PAT = re.compile(r"(現在|更新|発売|締切|投票|オッズ|確定|払戻|実況)")
 LABEL_NEAR_PAT  = re.compile(r"(発走|発走予定|発走時刻|発送|出走)")
 
@@ -490,11 +490,11 @@ def fallback_post_time_for_rid(rid: str) -> Optional[Tuple[datetime, str, str]]:
 
         hh, mm = map(int, hhmm.split(":"))
         dt = _make_dt_from_hhmm(rid, hh, mm)
-        if not dt:
-            return None
-        logging.info("[INFO] 発走(詳細fallback)取得 rid=%s 発走=%s via %s (%s)",
-                     rid, dt.strftime("%H:%M"), f"list-anchor/{reason}", url)
-        return dt, f"list-anchor/{reason}", url
+        if dt:
+            logging.info("[INFO] 発走(詳細fallback)取得 rid=%s 発走=%s via %s (%s)",
+                         rid, dt.strftime("%H:%M"), f"list-anchor/{reason}", url)
+            return dt, f"list-anchor/{reason}", url
+        return None
 
     def _from_tanfuku_page() -> Optional[Tuple[datetime, str, str]]:
         url = f"https://keiba.rakuten.co.jp/odds/tanfuku/RACEID/{rid}"
@@ -679,6 +679,81 @@ def notify_strategy_hit(message_text: str):
         logging.warning("[WARN] LINE送信失敗 status=%s body=%s", status, (body or "")[:200])
     return ok, status
 
+# ========= 通知メッセージ生成（回収率・的中率なし） =========
+_CIRCLED = "①②③④⑤⑥⑦⑧⑨"
+def _circled(n: int) -> str:
+    return _CIRCLED[n-1] if 1 <= n <= 9 else f"{n}."
+
+def _extract_hhmm_label(s: str) -> Optional[str]:
+    """任意の文字列から HH:MM を抽出して返す"""
+    got = _norm_hhmm_from_text(s)
+    if not got: return None
+    hh, mm, _ = got
+    return f"{hh:02d}:{mm:02d}"
+
+def _infer_pattern_no(strategy_text: str) -> int:
+    """'③ 1→...' / '3 1→...' の先頭番号を抽出（なければ0）"""
+    if not strategy_text: return 0
+    m = re.match(r"\s*([①-⑨])", strategy_text)
+    if m:
+        circ = m.group(1)
+        return _CIRCLED.index(circ) + 1
+    m = re.match(r"\s*(\d+)", strategy_text)
+    if m:
+        try: return int(m.group(1))
+        except: return 0
+    return 0
+
+def _strip_pattern_prefix(strategy_text: str) -> str:
+    """'③ 1→相手…' から先頭番号＋空白を除去して条件文だけに"""
+    if not strategy_text: return ""
+    s = re.sub(r"^\s*[①-⑨]\s*", "", strategy_text)
+    s = re.sub(r"^\s*\d+\s*", "", s)
+    return s.strip()
+
+def _split_venue_race(venue_race: str) -> Tuple[str, str]:
+    """h1テキストから (会場表示, R表記) を推定。失敗時はそのまま返す"""
+    if not venue_race:
+        return "地方競馬", ""
+    # 例: "大井 4R 単勝・複勝オッズ | 楽天競馬"
+    m = re.search(r"^\s*([^\s\d]+)\s*(\d{1,2}R)\b", venue_race)
+    if m:
+        venue = m.group(1)
+        race = m.group(2)
+        if "競馬" not in venue:
+            venue_disp = f"{venue}競馬場"
+        else:
+            venue_disp = venue
+        return venue_disp, race
+    # フォールバック
+    return venue_race, ""
+
+def build_line_notification(
+    pattern_no: int,
+    venue: str,
+    race_no: str,
+    time_label: str,     # "発走" or "締切"
+    time_hm: str,        # "HH:MM"
+    condition_text: str,
+    bets: List[str],
+    odds_timestamp_hm: Optional[str],
+    odds_url: str,
+    header_emoji: str = "🚨",
+) -> str:
+    lines = [
+        f"{header_emoji}【戦略{pattern_no if pattern_no>0 else ''} ヒット】".replace("戦略 ヒット","戦略ヒット"),
+        f"{venue} {race_no}（{time_label} {time_hm}）".strip(),
+        f"条件: {condition_text}",
+        "",
+        "買い目:",
+    ]
+    for i, bet in enumerate(bets, 1):
+        lines.append(f"{_circled(i)} {bet}")
+    if odds_timestamp_hm:
+        lines += ["", f"📅 オッズ時点: {odds_timestamp_hm}"]
+    lines += ["🔗 オッズ詳細:", odds_url]
+    return "\n".join(lines)
+
 # ========= メイン =========
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -769,19 +844,48 @@ def main():
         strategy = eval_strategy(horses, logger=logging)
         if strategy:
             matches += 1
-            ticket_str = ", ".join(strategy["tickets"])
-            detail = f"{strategy['strategy']} / 買い目: {ticket_str} / {strategy['roi']} / {strategy['hit']}"
-            logging.info(f"[MATCH] {rid} 条件詳細: {detail}")
 
-            message = (
-                "【戦略ヒット】\n"
-                f"RACEID: {rid}\n"
-                f"{meta['venue_race']} 発走{post_time:%H:%M} JST（{meta['now']}）\n"
-                f"{strategy['strategy']}\n"
-                f"買い目: {ticket_str}\n"
-                f"{strategy['roi']} / {strategy['hit']}\n"
-                f"{meta['url']}"
+            # --- 通知本文の新フォーマット（回収率・的中率なし） ---
+            # 1) パターン番号と条件文
+            strategy_text = strategy.get("strategy", "")  # 例: "③ 1→相手（10〜20倍含む）"
+            pattern_no = _infer_pattern_no(strategy_text)
+            condition_text = _strip_pattern_prefix(strategy_text) or strategy_text
+
+            # 2) 会場名とR数を分離
+            venue_disp, race_no = _split_venue_race(meta.get("venue_race", ""))
+
+            # 3) 時刻ラベル（発走 or 締切）と表示時刻
+            time_label = "発走" if CUTOFF_OFFSET_MIN == 0 else "締切"
+            display_dt = post_time if CUTOFF_OFFSET_MIN == 0 else (post_time - timedelta(minutes=CUTOFF_OFFSET_MIN))
+            time_hm = display_dt.strftime("%H:%M")
+
+            # 4) オッズ時点（HH:MM抽出）
+            odds_hm = _extract_hhmm_label(meta.get("now", ""))
+
+            # 5) 買い目配列
+            tickets = strategy.get("tickets", [])
+            if isinstance(tickets, str):
+                tickets = [s.strip() for s in tickets.split(",") if s.strip()]
+
+            message = build_line_notification(
+                pattern_no=pattern_no,
+                venue=venue_disp,
+                race_no=race_no,
+                time_label=time_label,
+                time_hm=time_hm,
+                condition_text=condition_text,
+                bets=tickets,
+                odds_timestamp_hm=odds_hm,
+                odds_url=meta["url"],
             )
+
+            # ログ用の詳細（回収率/的中率はログに残す）
+            ticket_str = ", ".join(tickets)
+            detail = f"{strategy_text} / 買い目: {ticket_str}"
+            if "roi" in strategy or "hit" in strategy:
+                detail += f" / {strategy.get('roi','-')} / {strategy.get('hit','-')}"
+            logging.info(f"[MATCH] {rid} 条件詳細: {detail}")
+            # -----------------------------------------------
 
             sent_ok, http_status = notify_strategy_hit(message)
             now_ts = time.time()
