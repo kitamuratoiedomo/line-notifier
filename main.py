@@ -4,9 +4,7 @@ Rakuten競馬 監視・通知バッチ
 - 一覧で発走時刻取得
 - 詳細/オッズ フォールバック（RIDアンカー近傍 & 「発走」文脈優先、ノイズ語除外）
 - 窓内1回通知 / 429クールダウン / Sheet永続TTL
-- 通知先：Googleシート(タブA=USERS_SHEET_NAME)の **H列に流れてくる LINE userId** を全件採用
-  * ヘッダー名は不問、enabled列も不要（全員送信）
-  * フォールバックで環境変数 LINE_USER_IDS / LINE_USER_ID も可
+- 通知先：Googleシート(タブA=名称「1」)のH列から userId を収集
 """
 
 import os, re, json, time, random, logging, pathlib, hashlib
@@ -55,13 +53,18 @@ CUTOFF_OFFSET_MIN   = int(os.getenv("CUTOFF_OFFSET_MIN", "0"))
 FORCE_RUN           = os.getenv("FORCE_RUN", "0") == "1"
 
 LINE_ACCESS_TOKEN   = os.getenv("LINE_ACCESS_TOKEN", "")
+# 後方互換の単一宛先（フォールバック用）
 LINE_USER_ID        = os.getenv("LINE_USER_ID", "")
 LINE_USER_IDS       = [s.strip() for s in os.getenv("LINE_USER_IDS", "").split(",") if s.strip()]
 
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "")
 GOOGLE_SHEET_ID         = os.getenv("GOOGLE_SHEET_ID", "")
-GOOGLE_SHEET_TAB        = os.getenv("GOOGLE_SHEET_TAB", "notified")  # TTL用（タブ名 or gid）
-USERS_SHEET_NAME        = os.getenv("USERS_SHEET_NAME", "users")     # 送信先一覧（タブ名。今回は "1" を想定）
+# TTL管理タブ（名前 or gid）。あなたの運用では「2」(名前) か 1830595589(gid)
+GOOGLE_SHEET_TAB        = os.getenv("GOOGLE_SHEET_TAB", "notified")
+
+# 送信先ユーザーを読むタブA（=「1」）と列（=H）
+USERS_SHEET_NAME        = os.getenv("USERS_SHEET_NAME", "1")
+USERS_USERID_COL        = os.getenv("USERS_USERID_COL", "H")
 
 RACEID_RE   = re.compile(r"/RACEID/(\d{18})")
 # 半角コロン, 全角コロン, 「時分」表記の3系統に対応
@@ -101,7 +104,7 @@ def fetch(url: str) -> str:
             time.sleep(wait)
     raise last_err
 
-# ========= Google Sheets =========
+# ========= Google Sheets 共通 =========
 def _sheet_service():
     if not GOOGLE_CREDENTIALS_JSON or not GOOGLE_SHEET_ID:
         raise RuntimeError("Google Sheets の環境変数不足")
@@ -112,24 +115,27 @@ def _sheet_service():
     return build("sheets", "v4", credentials=creds, cache_discovery=False)
 
 def _resolve_sheet_title(svc) -> str:
+    """TTL管理用タブ（GOOGLE_SHEET_TAB）をタイトルに正規化"""
     tab = GOOGLE_SHEET_TAB
     meta = svc.spreadsheets().get(spreadsheetId=GOOGLE_SHEET_ID).execute()
     sheets = meta.get("sheets", [])
-    if tab.isdigit():
+    # 数値(gid)指定のときタイトルに解決
+    if tab.isdigit() and len(tab) > 3:
         gid = int(tab)
         for s in sheets:
             if s["properties"]["sheetId"] == gid:
                 return s["properties"]["title"]
         raise RuntimeError(f"指定gidのシートが見つかりません: {gid}")
-    else:
-        for s in sheets:
-            if s["properties"]["title"] == tab:
-                return tab
-        body = {"requests": [{"addSheet": {"properties": {"title": tab}}}]}
-        svc.spreadsheets().batchUpdate(spreadsheetId=GOOGLE_SHEET_ID, body=body).execute()
-        return tab
+    # 名前指定
+    for s in sheets:
+        if s["properties"]["title"] == tab:
+            return tab
+    # なければ作成
+    body = {"requests": [{"addSheet": {"properties": {"title": tab}}}]}
+    svc.spreadsheets().batchUpdate(spreadsheetId=GOOGLE_SHEET_ID, body=body).execute()
+    return tab
 
-# --- TTL（通知済み） ---
+# ========= Google Sheets 永続TTL =========
 def sheet_load_notified() -> Dict[str, float]:
     svc = _sheet_service()
     title = _resolve_sheet_title(svc)
@@ -181,48 +187,43 @@ def sheet_upsert_notified(key: str, ts: float, note: str = "") -> None:
             insertDataOption="INSERT_ROWS", body=body
         ).execute()
 
-# --- ユーザー一覧（H列固定で読み込み） ---
-def load_users_from_sheet() -> List[Dict[str, str]]:
+# ========= 送信先ユーザー読み込み（タブA=名称「1」のH列） =========
+def load_user_ids_from_simple_col() -> List[str]:
     """
-    USERS_SHEET_NAME（タブ名。今回は '1' を想定）の H 列（8列目）から LINE userId を取得する。
-    - 1行目はヘッダーとしてスキップ
-    - enabled 列は使わず、全員 TRUE 扱い
-    - 'U' で始まる長めの英数字のみを userId と認定
+    USERS_SHEET_NAME（既定 '1'）の USERS_USERID_COL（既定 'H'）列から userId を収集。
+    - 空白/ヘッダーっぽい値は除外
+    - 'U' で始まる文字列のみ採用
+    - 重複排除
     """
-    import re
-
-    def _looks_like_line_user_id(v: str) -> bool:
-        if not v:
-            return False
-        v = str(v).strip()
-        return bool(re.match(r"^U[0-9A-Za-z]{20,}$", v))
-
     svc = _sheet_service()
-    title = USERS_SHEET_NAME  # 例: "1"
-    rng = f"'{title}'!A:Z"     # H列を含む範囲
-    res = svc.spreadsheets().values().get(
-        spreadsheetId=GOOGLE_SHEET_ID, range=rng
-    ).execute()
-
+    title = USERS_SHEET_NAME
+    col = USERS_USERID_COL.upper()
+    rng = f"'{title}'!{col}:{col}"
+    res = svc.spreadsheets().values().get(spreadsheetId=GOOGLE_SHEET_ID, range=rng).execute()
     values = res.get("values", [])
-    if not values or len(values) < 2:
-        logging.warning("[WARN] usersシートが空、またはヘッダーのみです: %s", title)
-        return []
+    user_ids: List[str] = []
+    for i, row in enumerate(values):
+        v = (row[0].strip() if row and row[0] is not None else "")
+        if not v:
+            continue
+        low = v.replace(" ", "").lower()
+        if i == 0 and ("userid" in low or "user id" in low or "line" in low):
+            # 1行目のヘッダー回避
+            continue
+        if not v.startswith("U"):
+            continue
+        user_ids.append(v)
 
-    users: List[Dict[str, str]] = []
-    for row in values[1:]:  # 2行目以降
-        uid = row[7].strip() if len(row) > 7 else ""  # H列(0-based index=7)
-        if _looks_like_line_user_id(uid):
-            users.append({"userId": uid, "enabled": "TRUE"})
+    # 重複除去
+    uniq: Dict[str, bool] = {}
+    out: List[str] = []
+    for uid in user_ids:
+        if uid not in uniq:
+            uniq[uid] = True
+            out.append(uid)
 
-    # 重複除去（最後の出現を優先）
-    uniq = {}
-    for u in users:
-        uniq[u["userId"]] = u
-    users = list(uniq.values())
-
-    logging.info("[INFO] usersシート読込(H列固定): %d件 from tab=%s", len(users), title)
-    return users
+    logging.info("[INFO] usersシート読込(H列固定): %d件 from tab=%s", len(out), title)
+    return out
 
 # ========= ユーティリティ =========
 def _extract_raceids_from_soup(soup: BeautifulSoup) -> List[str]:
@@ -537,12 +538,17 @@ def fallback_post_time_for_rid(rid: str) -> Optional[Tuple[datetime, str, str]]:
                     if isinstance(parent, Tag) and parent.name in ("div", "section", "article", "li"):
                         container = parent
                         break
+
                 chunks = []
-                try: chunks.append(container.get_text(" ", strip=True))
-                except Exception: pass
+                try:
+                    chunks.append(container.get_text(" ", strip=True))
+                except Exception:
+                    pass
                 for sub in container.find_all(True, limit=6):
-                    try: chunks.append(sub.get_text(" ", strip=True))
-                    except Exception: pass
+                    try:
+                        chunks.append(sub.get_text(" ", strip=True))
+                    except Exception:
+                        pass
                 near = " ".join(chunks)
 
                 if IGNORE_NEAR_PAT.search(near):
@@ -559,7 +565,8 @@ def fallback_post_time_for_rid(rid: str) -> Optional[Tuple[datetime, str, str]]:
         for t in soup.find_all("time"):
             for attr in ("datetime", "data-time", "title", "aria-label"):
                 v = t.get(attr)
-                if not v: continue
+                if not v:
+                    continue
                 around = f"{v} {t.get_text(' ', strip=True)}"
                 if IGNORE_NEAR_PAT.search(around) and not LABEL_NEAR_PAT.search(around):
                     continue
@@ -593,7 +600,7 @@ def fallback_post_time_for_rid(rid: str) -> Optional[Tuple[datetime, str, str]]:
                              rid, dt.strftime("%H:%M"), "tanfuku-fulltext/label-inline", url)
                 return dt, "tanfuku-fulltext/label-inline", url
 
-        best = None
+        best = None  # (hh, mm, score)
         for m in re.finditer(r"\b(\d{1,2})[:：](\d{2})\b", full):
             hh, mm = int(m.group(1)), int(m.group(2))
             if not (0 <= hh <= 23 and 0 <= mm <= 59):
@@ -613,15 +620,18 @@ def fallback_post_time_for_rid(rid: str) -> Optional[Tuple[datetime, str, str]]:
 
         return None
 
+    # 実行順序：list → tanfuku
     try:
         got = _from_list_page()
-        if got: return got
+        if got:
+            return got
     except Exception as e:
         logging.warning("[WARN] 詳細fallback(list)失敗 rid=%s: %s", rid, e)
 
     try:
         got = _from_tanfuku_page()
-        if got: return got
+        if got:
+            return got
     except Exception as e:
         logging.warning("[WARN] 詳細fallback(tanfuku)失敗 rid=%s: %s", rid, e)
 
@@ -701,21 +711,8 @@ def notify_strategy_hit_to_many(message_text: str, targets: List[str]):
         if not ok:
             all_ok = False
             logging.warning("[WARN] LINE送信失敗 user=%s status=%s body=%s", uid, status, (body or "")[:200])
-        time.sleep(0.2)  # 連投間隔（429対策）
+        time.sleep(0.2)  # 軽い間隔（429対策）
     return all_ok, last_status
-
-# 互換：単一宛て版（未使用でも残す）
-def notify_strategy_hit(message_text: str):
-    if not NOTIFY_ENABLED:
-        logging.info("[INFO] NOTIFY_ENABLED=0 のため通知スキップ"); return False, None
-    if DRY_RUN:
-        logging.info("[DRY_RUN] 通知メッセージ:\n%s", message_text); return False, None
-    if not LINE_ACCESS_TOKEN or not LINE_USER_ID:
-        logging.error("[ERROR] LINE 環境変数不足（LINE_ACCESS_TOKEN/LINE_USER_ID）"); return False, None
-    ok, status, body = push_line_text(LINE_USER_ID, LINE_ACCESS_TOKEN, message_text)
-    if not ok:
-        logging.warning("[WARN] LINE送信失敗 status=%s body=%s", status, (body or "")[:200])
-    return ok, status
 
 # ========= 通知メッセージ生成（回収率・的中率なし） =========
 _CIRCLED = "①②③④⑤⑥⑦⑧⑨"
@@ -753,7 +750,10 @@ def _split_venue_race(venue_race: str) -> Tuple[str, str]:
     if m:
         venue = m.group(1)
         race = m.group(2)
-        venue_disp = f"{venue}競馬場" if "競馬" not in venue else venue
+        if "競馬" not in venue:
+            venue_disp = f"{venue}競馬場"
+        else:
+            venue_disp = venue
         return venue_disp, race
     return venue_race, ""
 
@@ -790,7 +790,7 @@ def main():
     # ビルド識別
     p = pathlib.Path(__file__).resolve()
     sha = hashlib.sha1(p.read_bytes()).hexdigest()[:12]
-    logging.info(f"[BUILD] file={p} mtime={p.stat().st_mtime:.0f} sha1={sha} Fallback=ON v2025-08-12Hcol")
+    logging.info(f"[BUILD] file={p} mtime={p.stat().st_mtime:.0f} sha1={sha} Fallback=ON v2025-08-12E")
 
     if KILL_SWITCH:
         logging.info("[INFO] KILL_SWITCH=True のため終了"); return
@@ -802,10 +802,9 @@ def main():
                  f"TTL={NOTIFY_TTL_SEC}s CD={NOTIFY_COOLDOWN_SEC}s WIN=-{WINDOW_BEFORE_MIN}m/{WINDOW_AFTER_MIN:+}m "
                  f"CUTOFF={CUTOFF_OFFSET_MIN}m")
 
-    # 送信対象（usersシート H列 → 環境変数フォールバック）
+    # 送信対象ユーザーの読み込み（タブA=「1」のH列 → フォールバック: 環境変数）
     try:
-        users = load_users_from_sheet()
-        targets = [u["userId"] for u in users]
+        targets = load_user_ids_from_simple_col()
         if not targets:
             fb = LINE_USER_IDS if LINE_USER_IDS else ([LINE_USER_ID] if LINE_USER_ID else [])
             targets = fb
@@ -816,7 +815,7 @@ def main():
         targets = fb
         logging.info("[INFO] フォールバック送信ターゲット数: %d", len(targets))
 
-    # 永続TTLロード
+    # 永続TTLロード（タブB=「2」相当）
     try:
         notified = sheet_load_notified()
     except Exception as e:
@@ -847,8 +846,14 @@ def main():
     for rid in target_raceids:
         if rid in seen_in_this_run:
             logging.info(f"[SKIP] 同一ジョブ内去重: {rid}"); continue
-        if should_skip_by_ttl(notified, rid):
-            logging.info(f"[SKIP] TTL/クールダウン抑制: {rid}"); continue
+        # TTL/CD 抑制
+        now_ts = time.time()
+        cd_ts = notified.get(f"{rid}:cd")
+        if cd_ts and (now_ts - cd_ts) < NOTIFY_COOLDOWN_SEC:
+            logging.info(f"[SKIP] クールダウン中: {rid}"); continue
+        ts = notified.get(rid)
+        if ts and (now_ts - ts) < NOTIFY_TTL_SEC:
+            logging.info(f"[SKIP] TTL内再通知抑制: {rid}"); continue
 
         post_time = post_time_map.get(rid)
         via = "list"
@@ -888,7 +893,6 @@ def main():
         if strategy:
             matches += 1
 
-            # --- 通知本文（回収率・的中率は非表示） ---
             strategy_text = strategy.get("strategy", "")
             pattern_no = _infer_pattern_no(strategy_text)
             condition_text = _strip_pattern_prefix(strategy_text) or strategy_text
@@ -917,29 +921,28 @@ def main():
                 odds_url=meta["url"],
             )
 
-            # ログ詳細（回収率/的中率はログのみ任意保持）
+            # ログ詳細
             ticket_str = ", ".join(tickets)
             detail = f"{strategy_text} / 買い目: {ticket_str}"
             if "roi" in strategy or "hit" in strategy:
                 detail += f" / {strategy.get('roi','-')} / {strategy.get('hit','-')}"
             logging.info(f"[MATCH] {rid} 条件詳細: {detail}")
-            # ---------------------------------------------
 
             sent_ok, http_status = notify_strategy_hit_to_many(message, targets)
-            now_ts = time.time()
 
+            now_epoch = time.time()
             if sent_ok:
                 try:
-                    sheet_upsert_notified(rid, now_ts, note=f"{meta['venue_race']} {post_time:%H:%M}")
-                    notified[rid] = now_ts
+                    sheet_upsert_notified(rid, now_epoch, note=f"{meta['venue_race']} {post_time:%H:%M}")
+                    notified[rid] = now_epoch
                 except Exception as e:
                     logging.exception("[ERROR] TTL更新失敗（Google Sheets）: %s", e)
                 seen_in_this_run.add(rid)
             elif http_status == 429:
                 try:
                     key_cd = f"{rid}:cd"
-                    sheet_upsert_notified(key_cd, now_ts, note=f"429 cooldown {meta['venue_race']} {post_time:%H:%M}")
-                    notified[key_cd] = now_ts
+                    sheet_upsert_notified(key_cd, now_epoch, note=f"429 cooldown {meta['venue_race']} {post_time:%H:%M}")
+                    notified[key_cd] = now_epoch
                 except Exception as e:
                     logging.exception("[ERROR] CD更新失敗（Google Sheets）: %s", e)
                 logging.warning("[WARN] 429クールダウン発動 rid=%s cool_down=%ss", rid, NOTIFY_COOLDOWN_SEC)
