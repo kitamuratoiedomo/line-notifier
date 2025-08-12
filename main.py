@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Rakuten競馬 監視・通知バッチ（一覧→詳細フォールバックで発走時刻取得 / 窓内1回通知 / 429クールダウン / Sheet永続TTL）
+Rakuten競馬 監視・通知バッチ（一覧で発走時刻取得 + 詳細/オッズ フォールバック / 窓内1回通知 / 429クールダウン / Sheet永続TTL）
 """
 
-import os, re, json, time, random, logging
+import os, re, json, time, random, logging, pathlib, hashlib
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional, Tuple, Set
 
@@ -56,11 +56,11 @@ GOOGLE_SHEET_ID         = os.getenv("GOOGLE_SHEET_ID", "")
 GOOGLE_SHEET_TAB        = os.getenv("GOOGLE_SHEET_TAB", "notified")
 
 RACEID_RE   = re.compile(r"/RACEID/(\d{18})")
-# 半角/全角コロン、「時分」表記に対応
+# 半角コロン, 全角コロン, 「時分」表記の3系統に対応
 TIME_PATS = [
     re.compile(r"\b(\d{1,2}):(\d{2})\b"),
-    re.compile(r"\b(\d{1,2})：(\d{2})\b"),
-    re.compile(r"\b(\d{1,2})\s*時\s*(\d{1,2})\s*分\b"),
+    re.compile(r"\b(\d{1,2})：(\d{2})\b"),               # 全角コロン
+    re.compile(r"\b(\d{1,2})\s*時\s*(\d{1,2})\s*分\b"),  # 12時50分
 ]
 PLACEHOLDER = re.compile(r"\d{8}0000000000$")
 
@@ -178,7 +178,7 @@ def should_skip_by_ttl(notified: Dict[str, float], rid: str) -> bool:
         return True
     return False
 
-# ========= RACEID抽出 =========
+# ========= ユーティリティ =========
 def _extract_raceids_from_soup(soup: BeautifulSoup) -> List[str]:
     rids: List[str] = []
     for a in soup.find_all("a", href=True):
@@ -189,7 +189,6 @@ def _extract_raceids_from_soup(soup: BeautifulSoup) -> List[str]:
                 rids.append(rid)
     return sorted(set(rids))
 
-# ========= 発走時刻 抽出ユーティリティ =========
 def _row_text_snippet(el: Tag, maxlen: int = 80) -> str:
     try:
         t = " ".join(list(el.stripped_strings))
@@ -201,7 +200,6 @@ def _rid_date_parts(rid: str) -> Tuple[int, int, int]:
     return int(rid[0:4]), int(rid[4:6]), int(rid[6:8])
 
 def _norm_hhmm_from_text(text: str) -> Optional[Tuple[int,int,str]]:
-    """任意の文字列から時刻を見つけ (HH,MM, why) を返す"""
     if not text:
         return None
     s = str(text)
@@ -221,8 +219,7 @@ def _make_dt_from_hhmm(rid: str, hh: int, mm: int) -> Optional[datetime]:
         return None
 
 def _find_time_nearby(el: Tag) -> Tuple[Optional[str], str]:
-    """行/カード要素から <time> / data-* / 属性 / テキスト の順で探索"""
-    # <time>タグ優先
+    # <time>要素
     t = el.find("time")
     if t:
         for attr in ("datetime", "data-time", "title", "aria-label"):
@@ -237,12 +234,11 @@ def _find_time_nearby(el: Tag) -> Tuple[Optional[str], str]:
             hh, mm, why = got
             return f"{hh:02d}:{mm:02d}", f"time@text/{why}"
 
-    # data-*やtitle/aria
+    # data-*属性
     for node in el.find_all(True, recursive=True):
         for attr in ("data-starttime", "data-start-time", "data-time", "title", "aria-label"):
             v = node.get(attr)
-            if not v:
-                continue
+            if not v: continue
             got = _norm_hhmm_from_text(v)
             if got:
                 hh, mm, why = got
@@ -262,14 +258,13 @@ def _find_time_nearby(el: Tag) -> Tuple[Optional[str], str]:
     if got:
         hh, mm, why = got
         return f"{hh:02d}:{mm:02d}", f"row:text/{why}"
-
     return None, "-"
 
 # ========= 発走時刻（一覧ページ） =========
 def parse_post_times_from_table_like(root: Tag) -> Dict[str, datetime]:
     post_map: Dict[str, datetime] = {}
 
-    # 1) テーブル行から
+    # 1) テーブル
     for table in root.find_all("table"):
         thead = table.find("thead")
         if thead:
@@ -286,7 +281,6 @@ def parse_post_times_from_table_like(root: Tag) -> Dict[str, datetime]:
                     rid = m.group(1)
             if not rid or PLACEHOLDER.search(rid):
                 continue
-
             hhmm, reason = _find_time_nearby(tr)
             if not hhmm:
                 logging.debug(f"[DEBUG] 発走見つからず(table row) rid={rid} row='{_row_text_snippet(tr)}'")
@@ -297,11 +291,10 @@ def parse_post_times_from_table_like(root: Tag) -> Dict[str, datetime]:
                 post_map[rid] = dt
                 logging.debug(f"[DEBUG] 発走抽出 OK rid={rid} {dt:%H:%M} via {reason}")
 
-    # 2) カード型（tr以外）
+    # 2) カード型
     for a in root.find_all("a", href=True):
         m = RACEID_RE.search(a["href"])
-        if not m:
-            continue
+        if not m: continue
         rid = m.group(1)
         if PLACEHOLDER.search(rid) or rid in post_map:
             continue
@@ -310,11 +303,9 @@ def parse_post_times_from_table_like(root: Tag) -> Dict[str, datetime]:
         depth = 0
         for parent in a.parents:
             if isinstance(parent, Tag) and parent.name in ("tr", "li", "div", "section", "article"):
-                host = parent
-                break
+                host = parent; break
             depth += 1
-            if depth >= 6:
-                break
+            if depth >= 6: break
         host = host or a
 
         hhmm, reason = _find_time_nearby(host)
@@ -332,7 +323,6 @@ def parse_post_times_from_table_like(root: Tag) -> Dict[str, datetime]:
         if dt:
             post_map[rid] = dt
             logging.debug(f"[DEBUG] 発走抽出 OK rid={rid} {dt:%H:%M} via {reason} (card)")
-
     return post_map
 
 def collect_post_time_map(ymd: str, ymd_next: str) -> Dict[str, datetime]:
@@ -347,78 +337,11 @@ def collect_post_time_map(ymd: str, ymd_next: str) -> Dict[str, datetime]:
         except Exception as e:
             logging.warning(f"[WARN] {label} 読み込み失敗: {e} ({url})")
 
-    url_today = f"https://keiba.rakuten.co.jp/race_card/list/RACEID/{ymd}0000000000"
-    _merge_from(url_today, "#today")
     _merge_from(f"https://keiba.rakuten.co.jp/race_card/list/RACEID/{ymd}0000000000", "list:today")
     _merge_from(f"https://keiba.rakuten.co.jp/race_card/list/RACEID/{ymd_next}0000000000", "list:tomorrow")
 
     logging.info(f"[INFO] 発走時刻取得: {len(post_map)}件")
     return post_map
-
-# ========= 詳細ページ フォールバック =========
-def _post_time_from_detail_soup(race_id: str, soup: BeautifulSoup) -> Tuple[Optional[datetime], str]:
-    # 1) timeタグ直取り
-    t = soup.find("time")
-    if t:
-        for attr in ("datetime", "data-time", "title", "aria-label"):
-            v = t.get(attr) or ""
-            got = _norm_hhmm_from_text(v) or _norm_hhmm_from_text(t.get_text(" ", strip=True))
-            if got:
-                hh, mm, why = got
-                dt = _make_dt_from_hhmm(race_id, hh, mm)
-                if dt: return dt, f"time@{attr or 'text'}/{why}"
-
-    # 2) メタタグ/タイトル
-    for meta_name in ("description", "og:description", "og:title", "twitter:title"):
-        m = soup.find("meta", attrs={"name": meta_name}) or soup.find("meta", property=meta_name)
-        if m:
-            v = m.get("content") or ""
-            got = _norm_hhmm_from_text(v)
-            if got:
-                hh, mm, why = got
-                dt = _make_dt_from_hhmm(race_id, hh, mm)
-                if dt: return dt, f"meta:{meta_name}/{why}"
-
-    # 3) よくある見出し・情報ブロック
-    for sel in ("#raceTit", ".raceTit", ".race__time", ".raceData", ".racedata", "h1", "h2", "h3"):
-        node = soup.select_one(sel)
-        if node:
-            got = _norm_hhmm_from_text(node.get_text(" ", strip=True))
-            if got:
-                hh, mm, why = got
-                dt = _make_dt_from_hhmm(race_id, hh, mm)
-                if dt: return dt, f"sel:{sel}/{why}"
-
-    # 4) ページ全体（重いので最後）
-    got = _norm_hhmm_from_text(soup.get_text(" ", strip=True))
-    if got:
-        hh, mm, why = got
-        dt = _make_dt_from_hhmm(race_id, hh, mm)
-        if dt: return dt, f"fulltext/{why}"
-
-    return None, "-"
-
-def fetch_post_time_via_detail(race_id: str) -> Optional[datetime]:
-    """一覧で取れなかったレースの詳細ページから発走時刻を抽出"""
-    # 試行候補（将来の微変更に備えて複数）
-    candidates = [
-        f"https://keiba.rakuten.co.jp/race_card/RACEID/{race_id}",
-        f"https://keiba.rakuten.co.jp/race_card/list/RACEID/{race_id}",  # 稀に直接リストが返るケース対策
-        f"https://keiba.rakuten.co.jp/odds/tanfuku/RACEID/{race_id}",    # 最後の保険（時刻が出る場合あり）
-    ]
-    for url in candidates:
-        try:
-            logging.info(f"[INFO] 詳細fallback開始 rid={race_id} url={url}")
-            html = fetch(url)
-            soup = BeautifulSoup(html, "lxml")
-            dt, why = _post_time_from_detail_soup(race_id, soup)
-            if dt:
-                logging.info(f"[INFO] 発走(詳細fallback)取得 rid={race_id} 発走={dt:%H:%M} via {why} ({url})")
-                return dt
-        except Exception as e:
-            logging.warning(f"[WARN] 詳細fallback例外 rid={race_id}: {e} ({url})")
-        time.sleep(random.uniform(*SLEEP_BETWEEN))
-    return None
 
 # ========= オッズ解析（単複ページ） =========
 def _clean(s: str) -> str:
@@ -518,41 +441,75 @@ def check_tanfuku_page(race_id: str) -> Optional[Dict]:
     return {"race_id": race_id, "url": url, "horses": horses,
             "venue_race": venue_race, "now": now_label or ""}
 
-# ========= LINE送信 =========
-def push_line_text(user_id: str, token: str, text: str, timeout=8, retries=1) -> Tuple[bool, Optional[int], str]:
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    payload = {"to": user_id, "messages": [{"type": "text", "text": text}]}
-    for attempt in range(retries + 1):
-        try:
-            resp = requests.post(LINE_PUSH_URL, headers=headers, json=payload, timeout=timeout)
-            req_id = resp.headers.get("X-Line-Request-Id", "-")
-            body   = resp.text
-            logging.info("[LINE] status=%s req_id=%s body=%s", resp.status_code, req_id, body[:200])
-            if resp.status_code == 200:
-                return True, 200, body
-            if resp.status_code == 429 and attempt < retries:
-                wait = int(resp.headers.get("Retry-After", "1"))
-                logging.warning("[LINE] 429 Too Many Requests -> retry in %ss", wait)
-                time.sleep(max(wait, 1)); continue
-            logging.error("[ERROR] LINE push failed status=%s body=%s", resp.status_code, body[:200])
-            return False, resp.status_code, body
-        except requests.RequestException as e:
-            logging.exception("[ERROR] LINE push exception (attempt %s): %s", attempt + 1, e)
-            if attempt < retries:
-                time.sleep(2); continue
-            return False, None, str(e)
+# ========= 発走時刻フォールバック（詳細/オッズ） =========
+def _extract_hhmm_anywhere(soup: BeautifulSoup) -> Optional[Tuple[str, str]]:
+    """
+    ページ内からHH:MMを抽出。'発走' や '出走' などの近傍は優先。
+    戻り: ("HH:MM", "via=...") / None
+    """
+    # 1) ラベル近傍優先
+    for key in ("発走", "発走時刻", "出走", "発送", "レース"):
+        for tag in soup.find_all(text=re.compile(key)):
+            host = tag.parent if isinstance(tag, (str,)) else getattr(tag, "parent", None)
+            host = host or soup
+            # 近傍数要素
+            chunk = []
+            for n in (host, *host.find_all(True, limit=6)):
+                try:
+                    chunk.append(n.get_text(" ", strip=True))
+                except Exception:
+                    pass
+            text = " ".join(chunk)
+            got = _norm_hhmm_from_text(text)
+            if got:
+                hh, mm, why = got
+                return f"{hh:02d}:{mm:02d}", f"label:{key}/{why}"
 
-def notify_strategy_hit(message_text: str) -> Tuple[bool, Optional[int]]:
-    if not NOTIFY_ENABLED:
-        logging.info("[INFO] NOTIFY_ENABLED=0 のため通知スキップ"); return False, None
-    if DRY_RUN:
-        logging.info("[DRY_RUN] 通知メッセージ:\n%s", message_text); return False, None
-    if not LINE_ACCESS_TOKEN or not LINE_USER_ID:
-        logging.error("[ERROR] LINE 環境変数不足（LINE_ACCESS_TOKEN/LINE_USER_ID）"); return False, None
-    ok, status, body = push_line_text(LINE_USER_ID, LINE_ACCESS_TOKEN, message_text)
-    if not ok:
-        logging.warning("[WARN] LINE送信失敗 status=%s body=%s", status, (body or "")[:200])
-    return ok, status
+    # 2) <time> / aria-label 等
+    for node in soup.find_all(True):
+        for attr in ("datetime", "data-time", "title", "aria-label"):
+            v = node.get(attr)
+            if not v: continue
+            got = _norm_hhmm_from_text(v)
+            if got:
+                hh, mm, why = got
+                return f"{hh:02d}:{mm:02d}", f"attr:{node.name}@{attr}/{why}"
+
+    # 3) テキスト全体（最後の手段）
+    text = soup.get_text(" ", strip=True)[:3000]
+    got = _norm_hhmm_from_text(text)
+    if got:
+        hh, mm, why = got
+        return f"{hh:02d}:{mm:02d}", f"page:text/{why}"
+    return None
+
+def fetch_post_time_via_detail(rid: str) -> Optional[Tuple[datetime, str]]:
+    """
+    レース詳細やオッズページから HH:MM を拾って datetime を返す。
+    """
+    candidates = [
+        f"https://keiba.rakuten.co.jp/race_card/race_detail/RACEID/{rid}",
+        f"https://keiba.rakuten.co.jp/race_card/race_result/RACEID/{rid}",
+        f"https://keiba.rakuten.co.jp/odds/tanfuku/RACEID/{rid}",
+    ]
+    for url in candidates:
+        try:
+            html = fetch(url)
+            soup = BeautifulSoup(html, "lxml")
+            got = _extract_hhmm_anywhere(soup)
+            if not got:
+                logging.info(f"[DEBUG] 詳細fallback 時刻見つからず rid={rid} url={url}")
+                continue
+            hhmm, via = got
+            hh, mm = map(int, hhmm.split(":"))
+            dt = _make_dt_from_hhmm(rid, hh, mm)
+            if dt:
+                logging.info(f"[INFO] 詳細fallback成功 rid={rid} {dt:%H:%M} via {via} ({url})")
+                return dt, via
+        except Exception as e:
+            logging.warning(f"[WARN] 詳細fallback取得失敗 rid={rid}: {e} ({url})")
+            continue
+    return None
 
 # ========= RACEID 取得 =========
 def list_raceids_today_ticket(ymd: str) -> List[str]:
@@ -590,6 +547,11 @@ def is_within_window(post_time: datetime, now: datetime) -> bool:
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
+    # 実ファイル・ビルド識別
+    p = pathlib.Path(__file__).resolve()
+    sha = hashlib.sha1(p.read_bytes()).hexdigest()[:12]
+    logging.info(f"[BUILD] file={p} mtime={p.stat().st_mtime:.0f} sha1={sha} Fallback=ON v2025-08-12B")
+
     if KILL_SWITCH:
         logging.info("[INFO] KILL_SWITCH=True のため終了"); return
     if not within_operating_hours():
@@ -611,7 +573,8 @@ def main():
     if DEBUG_RACEIDS:
         logging.info(f"[INFO] DEBUG_RACEIDS 指定: {len(DEBUG_RACEIDS)}件")
         target_raceids = [rid for rid in DEBUG_RACEIDS if not PLACEHOLDER.search(rid)]
-        post_time_map = {}
+        # DEBUGでもフォールバックで時刻を狙うため、post_time_mapは空のままOK
+        post_time_map: Dict[str, datetime] = {}
     else:
         ymd = now_jst().strftime("%Y%m%d")
         ymd_next = (now_jst() + timedelta(days=1)).strftime("%Y%m%d")
@@ -634,27 +597,23 @@ def main():
         if should_skip_by_ttl(notified, rid):
             logging.info(f"[SKIP] TTL/クールダウン抑制: {rid}"); continue
 
-        # 一覧に無ければ詳細フォールバック
         post_time = post_time_map.get(rid)
+        via = "list"
         if not post_time:
-            try:
-                post_time = fetch_post_time_via_detail(rid)
-            except Exception as e:
-                logging.warning(f"[WARN] 詳細fallback例外 rid={rid}: {e}")
-                post_time = None
+            logging.info(f"[DEBUG] post_time not found in list, try fallback rid={rid}")
+            got = fetch_post_time_via_detail(rid)
+            if got:
+                post_time, via = got[0], f"detail:{got[1]}"
+            else:
+                logging.info(f"[SKIP] 発走時刻不明のため通知保留: {rid}")
+                continue
 
-        if not post_time:
-            logging.info(f"[SKIP] 発走時刻不明のため通知保留: {rid}")
-            continue
-
-        # ウィンドウ判定
         now = now_jst()
         if not is_within_window(post_time, now):
             delta_min = int((post_time - now).total_seconds() // 60)
-            logging.info(f"[SKIP] 窓外({delta_min:+}m) rid={rid} 発走={post_time:%H:%M}")
+            logging.info(f"[SKIP] 窓外({delta_min:+}m) rid={rid} 発走={post_time:%H:%M} via={via}")
             continue
 
-        # 窓内でオッズ確認
         meta = check_tanfuku_page(rid)
         if not meta:
             time.sleep(random.uniform(*SLEEP_BETWEEN)); continue
@@ -687,6 +646,41 @@ def main():
                 f"{strategy['roi']} / {strategy['hit']}\n"
                 f"{meta['url']}"
             )
+
+            def push_line_text(user_id: str, token: str, text: str, timeout=8, retries=1):
+                headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+                payload = {"to": user_id, "messages": [{"type": "text", "text": text}]}
+                for attempt in range(retries + 1):
+                    try:
+                        resp = requests.post(LINE_PUSH_URL, headers=headers, json=payload, timeout=timeout)
+                        req_id = resp.headers.get("X-Line-Request-Id", "-")
+                        body   = resp.text
+                        logging.info("[LINE] status=%s req_id=%s body=%s", resp.status_code, req_id, body[:200])
+                        if resp.status_code == 200:
+                            return True, 200, body
+                        if resp.status_code == 429 and attempt < retries:
+                            wait = int(resp.headers.get("Retry-After", "1"))
+                            logging.warning("[LINE] 429 Too Many Requests -> retry in %ss", wait)
+                            time.sleep(max(wait, 1)); continue
+                        logging.error("[ERROR] LINE push failed status=%s body=%s", resp.status_code, body[:200])
+                        return False, resp.status_code, body
+                    except requests.RequestException as e:
+                        logging.exception("[ERROR] LINE push exception (attempt %s): %s", attempt + 1, e)
+                        if attempt < retries:
+                            time.sleep(2); continue
+                        return False, None, str(e)
+
+            def notify_strategy_hit(message_text: str):
+                if not NOTIFY_ENABLED:
+                    logging.info("[INFO] NOTIFY_ENABLED=0 のため通知スキップ"); return False, None
+                if DRY_RUN:
+                    logging.info("[DRY_RUN] 通知メッセージ:\n%s", message_text); return False, None
+                if not LINE_ACCESS_TOKEN or not LINE_USER_ID:
+                    logging.error("[ERROR] LINE 環境変数不足（LINE_ACCESS_TOKEN/LINE_USER_ID）"); return False, None
+                ok, status, body = push_line_text(LINE_USER_ID, LINE_ACCESS_TOKEN, message_text)
+                if not ok:
+                    logging.warning("[WARN] LINE送信失敗 status=%s body=%s", status, (body or "")[:200])
+                return ok, status
 
             sent_ok, http_status = notify_strategy_hit(message)
             now_ts = time.time()
