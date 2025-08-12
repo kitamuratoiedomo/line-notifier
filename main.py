@@ -66,7 +66,8 @@ GOOGLE_SHEET_ID         = os.getenv("GOOGLE_SHEET_ID", "")
 GOOGLE_SHEET_TAB        = os.getenv("GOOGLE_SHEET_TAB", "notified")  # シート名 or gid(数値)
 
 RACEID_RE = re.compile(r"/RACEID/(\d{18})")
-TIME_RE   = re.compile(r"(\d{1,2}):(\d{2})")
+# 全角コロンにも一応対応（保険）
+TIME_RE   = re.compile(r"(\d{1,2})[:：](\d{2})")
 
 # ========= 共通 =========
 def now_jst() -> datetime:
@@ -92,6 +93,15 @@ def fetch(url: str) -> str:
             logging.warning(f"[WARN] fetch失敗({i}/{RETRY}) {e} -> {wait:.1f}s待機: {url}")
             time.sleep(wait)
     raise last_err
+
+# ========= RACEIDバリデーション =========
+def is_valid_raceid(rid: str) -> bool:
+    """個別レースIDのみTrue。一覧用プレースホルダ（…0000000000）は除外。"""
+    if not rid or len(rid) != 18 or not rid.isdigit():
+        return False
+    if rid.endswith("0000000000"):
+        return False
+    return True
 
 # ========= Google Sheets 永続TTL =========
 def _sheet_service():
@@ -208,8 +218,10 @@ def parse_post_times_from_table(table: BeautifulSoup) -> Dict[str, datetime]:
         for a in tr.find_all("a", href=True):
             m = RACEID_RE.search(a["href"])
             if m:
-                rid = m.group(1)
-                break
+                candidate = m.group(1)
+                if is_valid_raceid(candidate):
+                    rid = candidate
+                    break
         if not rid:
             continue
 
@@ -416,12 +428,11 @@ def list_raceids_today_ticket(ymd: str) -> List[str]:
     if not table:
         logging.info("[INFO] #todaysTicket なし"); return []
     links = table.select("td.nextRace a[href], td a[href]")
-    raceids: List[str] = []
-    for a in links:
-        m = RACEID_RE.search(a.get("href", ""))
-        if m:
-            raceids.append(m.group(1))
-    raceids = sorted(set(raceids))
+    raceids = sorted({
+        m.group(1) for a in links
+        for m in [RACEID_RE.search(a.get("href", ""))]
+        if m and is_valid_raceid(m.group(1))
+    })
     logging.info(f"[INFO] Rakuten#1 本日の発売情報: {len(raceids)}件")
     return raceids
 
@@ -430,17 +441,20 @@ def list_raceids_from_card_lists(ymd: str, ymd_next: str) -> List[str]:
         f"https://keiba.rakuten.co.jp/race_card/list/RACEID/{ymd}0000000000",
         f"https://keiba.rakuten.co.jp/race_card/list/RACEID/{ymd_next}0000000000",
     ]
-    rids: List[str] = []
+    rids: Set[str] = set()
     for u in urls:
         try:
             html = fetch(u)
             soup = BeautifulSoup(html, "lxml")
             for a in soup.find_all("a", href=True):
                 m = RACEID_RE.search(a["href"])
-                if m: rids.append(m.group(1))
+                if m:
+                    rid = m.group(1)
+                    if is_valid_raceid(rid):
+                        rids.add(rid)
         except Exception as e:
             logging.warning(f"[WARN] 出馬表一覧スキャン失敗: {e} ({u})")
-    rids = sorted(set(rids))
+    rids = sorted(rids)
     logging.info(f"[INFO] Rakuten#2 出馬表一覧: {len(rids)}件")
     return rids
 
@@ -479,17 +493,18 @@ def main():
     # RACEID列挙
     if DEBUG_RACEIDS:
         logging.info(f"[INFO] DEBUG_RACEIDS 指定: {len(DEBUG_RACEIDS)}件")
-        target_raceids = DEBUG_RACEIDS
+        target_raceids = [rid for rid in DEBUG_RACEIDS if is_valid_raceid(rid)]
         post_time_map = {}
     else:
         ymd = now_jst().strftime("%Y%m%d")
         ymd_next = (now_jst() + timedelta(days=1)).strftime("%Y%m%d")
         r1 = list_raceids_today_ticket(ymd)
         r2 = list_raceids_from_card_lists(ymd, ymd_next)
-        target_raceids = sorted(set(r1) | set(r2))
+        # 有効なRACEIDのみに限定
+        target_raceids = [rid for rid in sorted(set(r1) | set(r2)) if is_valid_raceid(rid)]
         # 発走時刻マップを構築（詳細ページは叩かない）
         post_time_map = collect_post_time_map(ymd, ymd_next)
-        logging.info(f"[INFO] 発見RACEID数: {len(target_raceids)}")
+        logging.info(f"[INFO] 発見RACEID数(有効のみ): {len(target_raceids)}")
         for rid in target_raceids:
             logging.info(f"  - {rid} -> tanfuku")
 
