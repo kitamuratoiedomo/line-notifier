@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Rakuten競馬 監視・通知バッチ（Sheet永続TTL + 発走時刻ウィンドウ + 429クールダウン）
-- 稼働時間: JST 10:00〜22:00
-- RACEID列挙: #todaysTicket + 出馬表一覧
-- 人気順テーブル: “人気/順位”列と“単勝”列のみ厳密抽出（%・複勝レンジ除外）
-- TTLはGoogleスプレッドシートに保存（RACEID単位, 既定3600秒）
-- 通知は「発走の指定ウィンドウ（前後分）」に入ったレースのみ
-- LINEは200 OK時のみ通常TTL更新。429はクールダウンTTLを別キーで保存し抑止
+Rakuten競馬 監視・通知バッチ（発走時刻=一覧ページから取得 / 窓内1回通知 / 429クールダウン / Sheet永続TTL）
+- 稼働時間: JST 10:00〜22:00（環境変数 START_HOUR / END_HOUR）
+- RACEID列挙: #todaysTicket + 出馬表一覧（当日/翌日）
+- 発走時刻: 上記一覧ページのテーブルから抽出（race_card/RACEID/* にはアクセスしない）
+- 人気順テーブル: “人気/順位”列と“単勝/オッズ”列のみ厳密抽出（%・複勝レンジ除外）
+- 通知ウィンドウ: 発走 { -WINDOW_BEFORE_MIN 分 〜 WINDOW_AFTER_MIN 分 } に入った時のみ判定・送信
+- 通知は LINE 200 OK の時だけTTL更新（RACEIDキー）。429時は RACEID:cd キーにクールダウンTSを記録して抑制。
 """
 
 import os, re, json, time, random, logging
@@ -38,8 +38,6 @@ SLEEP_BETWEEN = (0.6, 1.2)
 LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
 
 # ========= 環境変数 =========
-NOTIFY_TTL_SEC      = int(os.getenv("NOTIFY_TTL_SEC", "3600"))      # 通常TTL（成功時）
-NOTIFY_COOLDOWN_SEC = int(os.getenv("NOTIFY_COOLDOWN_SEC", "1800")) # 429クールダウンTTL
 START_HOUR          = int(os.getenv("START_HOUR", "10"))
 END_HOUR            = int(os.getenv("END_HOUR",   "22"))
 DRY_RUN             = os.getenv("DRY_RUN", "False").lower() == "true"
@@ -47,9 +45,18 @@ KILL_SWITCH         = os.getenv("KILL_SWITCH", "False").lower() == "true"
 NOTIFY_ENABLED      = os.getenv("NOTIFY_ENABLED", "1") == "1"
 DEBUG_RACEIDS       = [s.strip() for s in os.getenv("DEBUG_RACEIDS", "").split(",") if s.strip()]
 
-# 発走ウィンドウ（分）。例: 5分前〜1分後
-WINDOW_BEFORE_MIN   = int(os.getenv("WINDOW_BEFORE_MIN", "5"))
-WINDOW_AFTER_MIN    = int(os.getenv("WINDOW_AFTER_MIN",  "1"))
+# 通常TTL（送達成功時のみ有効化）
+NOTIFY_TTL_SEC      = int(os.getenv("NOTIFY_TTL_SEC", "3600"))
+# 429クールダウンTTL（429時に RACEID:cd キーに記録）
+NOTIFY_COOLDOWN_SEC = int(os.getenv("NOTIFY_COOLDOWN_SEC", "1800"))
+
+# 通知ウィンドウ（例: BEFORE=15, AFTER=-10 → 発走15分前〜10分前の“間”に1回）
+WINDOW_BEFORE_MIN   = int(os.getenv("WINDOW_BEFORE_MIN", "15"))
+WINDOW_AFTER_MIN    = int(os.getenv("WINDOW_AFTER_MIN", "-10"))
+
+# 任意：競走直前のデータ変化を考慮して直近数分は送らない等（0なら無効）
+CUTOFF_OFFSET_MIN   = int(os.getenv("CUTOFF_OFFSET_MIN", "0"))
+FORCE_RUN           = os.getenv("FORCE_RUN", "0") == "1"
 
 LINE_ACCESS_TOKEN = os.getenv("LINE_ACCESS_TOKEN", "")
 LINE_USER_ID      = os.getenv("LINE_USER_ID", "")
@@ -59,12 +66,15 @@ GOOGLE_SHEET_ID         = os.getenv("GOOGLE_SHEET_ID", "")
 GOOGLE_SHEET_TAB        = os.getenv("GOOGLE_SHEET_TAB", "notified")  # シート名 or gid(数値)
 
 RACEID_RE = re.compile(r"/RACEID/(\d{18})")
+TIME_RE   = re.compile(r"(\d{1,2}):(\d{2})")
 
 # ========= 共通 =========
 def now_jst() -> datetime:
     return datetime.now(JST)
 
 def within_operating_hours() -> bool:
+    if FORCE_RUN:
+        return True
     h = now_jst().hour
     return START_HOUR <= h < END_HOUR
 
@@ -82,46 +92,6 @@ def fetch(url: str) -> str:
             logging.warning(f"[WARN] fetch失敗({i}/{RETRY}) {e} -> {wait:.1f}s待機: {url}")
             time.sleep(wait)
     raise last_err
-
-# ========= 発走時刻（レースカード） =========
-RACE_TIME_RE = re.compile(r"(\d{1,2}:\d{2})\s*発走")
-
-def fetch_post_time_jst(race_id: str) -> Optional[datetime]:
-    """
-    レースカードから「HH:MM発走」を拾い、RACEIDの年月日と合成してJST datetimeを返す。
-    取得できなければ None。
-    """
-    url = f"https://keiba.rakuten.co.jp/race_card/RACEID/{race_id}"
-    try:
-        html = fetch(url)
-    except Exception as e:
-        logging.warning(f"[WARN] 発走時刻取得失敗(fetch): {e} ({url})")
-        return None
-
-    soup = BeautifulSoup(html, "lxml")
-    text = soup.get_text(" ", strip=True)
-    m = RACE_TIME_RE.search(text)
-    if not m:
-        # 予備：ページ内の「発走」近辺の時刻も拾う
-        cand = soup.find(string=re.compile(r"発走"))
-        if cand:
-            m = re.search(r"(\d{1,2}:\d{2})", str(cand))
-    if not m:
-        logging.warning(f"[WARN] 発走時刻未検出: {url}")
-        return None
-
-    hh, mm = m.group(1).split(":")
-    # RACEID 先頭 8 桁が YYYYMMDD
-    y = int(race_id[0:4]); mo = int(race_id[4:6]); d = int(race_id[6:8])
-    try:
-        return datetime(y, mo, d, int(hh), int(mm), tzinfo=JST)
-    except Exception as e:
-        logging.warning(f"[WARN] 発走時刻パース失敗: {e} ({y}-{mo}-{d} {hh}:{mm})")
-        return None
-
-def within_window(now_dt: datetime, post_dt: datetime, before_min: int, after_min: int) -> bool:
-    """now が [post - before, post + after] に収まるか"""
-    return (post_dt - timedelta(minutes=before_min) <= now_dt <= post_dt + timedelta(minutes=after_min))
 
 # ========= Google Sheets 永続TTL =========
 def _sheet_service():
@@ -208,17 +178,101 @@ def sheet_upsert_notified(key: str, ts: float, note: str = "") -> None:
 def should_skip_by_ttl(notified: Dict[str, float], rid: str) -> bool:
     """成功TTL または 429クールダウンTTL が生きていればスキップ"""
     now = time.time()
-    # 429クールダウン（rid:cd）
     cd_ts = notified.get(f"{rid}:cd")
     if cd_ts and (now - cd_ts) < NOTIFY_COOLDOWN_SEC:
         return True
-    # 通常TTL（rid）
     ts = notified.get(rid)
     if ts and (now - ts) < NOTIFY_TTL_SEC:
         return True
     return False
 
-# ========= オッズ解析 =========
+# ========= 発走時刻（一覧ページ） =========
+def parse_post_times_from_table(table: BeautifulSoup) -> Dict[str, datetime]:
+    """テーブルの各行から RACEID と 発走時刻(HH:MM) を拾って JST datetime を返す"""
+    post_map: Dict[str, datetime] = {}
+    thead = table.find("thead")
+    ths = (thead.find_all(["th", "td"]) if thead else [])
+    headers = ["".join(th.stripped_strings) for th in ths] if ths else []
+    # 発走時刻の列インデックスを推定（ヘッダ優先、無ければパターンで抽出）
+    post_col = None
+    for i, h in enumerate(headers):
+        if "発走時刻" in h:
+            post_col = i
+            break
+
+    body = table.find("tbody") or table
+    for tr in body.find_all("tr"):
+        tds = tr.find_all(["td", "th"])
+        # RACEID探索（行内のリンクから）
+        rid = None
+        for a in tr.find_all("a", href=True):
+            m = RACEID_RE.search(a["href"])
+            if m:
+                rid = m.group(1)
+                break
+        if not rid:
+            continue
+
+        # 時刻テキスト抽出
+        time_text = None
+        if post_col is not None and len(tds) > post_col:
+            time_text = "".join(tds[post_col].stripped_strings)
+        if not time_text or not TIME_RE.search(time_text):
+            # セルに見当たらない場合は行全体から検索
+            row_text = " ".join([" ".join(td.stripped_strings) for td in tds])
+            m = TIME_RE.search(row_text)
+            time_text = m.group(0) if m else None
+        if not time_text:
+            continue
+
+        m = TIME_RE.search(time_text)
+        if not m:
+            continue
+        hh, mm = int(m.group(1)), int(m.group(2))
+        # 日付は RACEID のYYYYMMDD先頭8桁を使う
+        y = int(rid[0:4]); mon = int(rid[4:6]); d = int(rid[6:8])
+        try:
+            dt = datetime(y, mon, d, hh, mm, tzinfo=JST)
+        except Exception:
+            continue
+        post_map[rid] = dt
+    return post_map
+
+def collect_post_time_map(ymd: str, ymd_next: str) -> Dict[str, datetime]:
+    """#todaysTicket と 出馬表一覧（当日/翌日）の両方から発走時刻マップを構築"""
+    post_map: Dict[str, datetime] = {}
+    # 本日の発売情報
+    try:
+        url = f"https://keiba.rakuten.co.jp/race_card/list/RACEID/{ymd}0000000000"
+        soup = BeautifulSoup(fetch(url), "lxml")
+        ticket = soup.find(id="todaysTicket")
+        if ticket:
+            post_map.update(parse_post_times_from_table(ticket))
+    except Exception as e:
+        logging.warning(f"[WARN] #todaysTicket 読み込み失敗: {e}")
+
+    # 出馬表一覧（当日/翌日）
+    for u in [
+        f"https://keiba.rakuten.co.jp/race_card/list/RACEID/{ymd}0000000000",
+        f"https://keiba.rakuten.co.jp/race_card/list/RACEID/{ymd_next}0000000000",
+    ]:
+        try:
+            soup = BeautifulSoup(fetch(u), "lxml")
+            for table in soup.find_all("table"):
+                # ヘッダに「発走時刻」があるテーブルを対象
+                thead = table.find("thead")
+                if not thead:
+                    continue
+                head_text = "".join(thead.stripped_strings)
+                if "発走" in head_text or "発走時刻" in head_text or "レース" in head_text:
+                    post_map.update(parse_post_times_from_table(table))
+        except Exception as e:
+            logging.warning(f"[WARN] 出馬表一覧 読み込み失敗: {e} ({u})")
+
+    logging.info(f"[INFO] 発走時刻取得: {len(post_map)}件")
+    return post_map
+
+# ========= オッズ解析（単複ページ） =========
 def _clean(s: str) -> str:
     return re.sub(r"\s+", "", s or "")
 
@@ -332,6 +386,7 @@ def push_line_text(user_id: str, token: str, text: str, timeout=8, retries=1) ->
                 wait = int(resp.headers.get("Retry-After", "1"))
                 logging.warning("[LINE] 429 Too Many Requests -> retry in %ss", wait)
                 time.sleep(max(wait, 1)); continue
+            logging.error("[ERROR] LINE push failed status=%s body=%s", resp.status_code, body[:200])
             return False, resp.status_code, body
         except requests.RequestException as e:
             logging.exception("[ERROR] LINE push exception (attempt %s): %s", attempt + 1, e)
@@ -363,12 +418,9 @@ def list_raceids_today_ticket(ymd: str) -> List[str]:
     links = table.select("td.nextRace a[href], td a[href]")
     raceids: List[str] = []
     for a in links:
-        text = (a.get_text(strip=True) or "")
         m = RACEID_RE.search(a.get("href", ""))
-        if not m: continue
-        rid = m.group(1)
-        if "投票受付中" in text or "発走" in text:
-            raceids.append(rid)
+        if m:
+            raceids.append(m.group(1))
     raceids = sorted(set(raceids))
     logging.info(f"[INFO] Rakuten#1 本日の発売情報: {len(raceids)}件")
     return raceids
@@ -392,6 +444,17 @@ def list_raceids_from_card_lists(ymd: str, ymd_next: str) -> List[str]:
     logging.info(f"[INFO] Rakuten#2 出馬表一覧: {len(rids)}件")
     return rids
 
+# ========= ウィンドウ判定 =========
+def is_within_window(post_time: datetime, now: datetime) -> bool:
+    """発走時刻を基準に、[ -WINDOW_BEFORE_MIN, WINDOW_AFTER_MIN ] に入っているか"""
+    # 直前カット（例: CUTOFF_OFFSET_MIN=3 → 発走-3分以降は送らない）
+    if CUTOFF_OFFSET_MIN > 0 and now >= (post_time - timedelta(minutes=CUTOFF_OFFSET_MIN)):
+        return False
+    win_start = post_time - timedelta(minutes=WINDOW_BEFORE_MIN)
+    win_end   = post_time + timedelta(minutes=WINDOW_AFTER_MIN)
+    # AFTER_MIN が負なら “発走前のみ” の窓になる（例: -10）
+    return (win_start <= now <= win_end)
+
 # ========= メイン =========
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -403,8 +466,8 @@ def main():
 
     logging.info("[INFO] ジョブ開始")
     logging.info(f"[INFO] DRY_RUN={DRY_RUN} NOTIFY_ENABLED={'1' if NOTIFY_ENABLED else '0'} "
-                 f"TTL={NOTIFY_TTL_SEC}s CD={NOTIFY_COOLDOWN_SEC}s "
-                 f"WIN=-{WINDOW_BEFORE_MIN}m/+{WINDOW_AFTER_MIN}m")
+                 f"TTL={NOTIFY_TTL_SEC}s CD={NOTIFY_COOLDOWN_SEC}s WIN=-{WINDOW_BEFORE_MIN}m/{WINDOW_AFTER_MIN:+}m "
+                 f"CUTOFF={CUTOFF_OFFSET_MIN}m")
 
     # 永続TTLロード
     try:
@@ -413,43 +476,47 @@ def main():
         logging.exception("[ERROR] TTLロード失敗（Google Sheets）: %s", e)
         notified = {}
 
-    hits = 0; matches = 0
-    seen_in_this_run: Set[str] = set()  # 同一ジョブ内の二重送信防止
-
+    # RACEID列挙
     if DEBUG_RACEIDS:
         logging.info(f"[INFO] DEBUG_RACEIDS 指定: {len(DEBUG_RACEIDS)}件")
         target_raceids = DEBUG_RACEIDS
+        post_time_map = {}
     else:
         ymd = now_jst().strftime("%Y%m%d")
         ymd_next = (now_jst() + timedelta(days=1)).strftime("%Y%m%d")
         r1 = list_raceids_today_ticket(ymd)
         r2 = list_raceids_from_card_lists(ymd, ymd_next)
         target_raceids = sorted(set(r1) | set(r2))
+        # 発走時刻マップを構築
+        post_time_map = collect_post_time_map(ymd, ymd_next)
         logging.info(f"[INFO] 発見RACEID数: {len(target_raceids)}")
         for rid in target_raceids:
             logging.info(f"  - {rid} -> tanfuku")
 
+    hits = 0; matches = 0
+    seen_in_this_run: Set[str] = set()  # 同一ジョブ内の二重送信防止
+
     for rid in target_raceids:
         if rid in seen_in_this_run:
             logging.info(f"[SKIP] 同一ジョブ内去重: {rid}"); continue
-
-        # --- 発走時刻ウィンドウ判定（TTLより先に判定して早すぎ通知を防止） ---
-        post_dt = fetch_post_time_jst(rid)
-        if not post_dt:
-            logging.info(f"[SKIP] 発走時刻不明のため通知保留: {rid}")
-            time.sleep(random.uniform(*SLEEP_BETWEEN)); continue
-
-        now_dt = now_jst()
-        if not within_window(now_dt, post_dt, WINDOW_BEFORE_MIN, WINDOW_AFTER_MIN):
-            logging.info(f"[SKIP] 時間外: now={now_dt:%H:%M} post={post_dt:%H:%M} "
-                         f"win=[-{WINDOW_BEFORE_MIN}m, +{WINDOW_AFTER_MIN}m] rid={rid}")
-            time.sleep(random.uniform(*SLEEP_BETWEEN)); continue
-
-        # --- TTL/クールダウン抑止 ---
         if should_skip_by_ttl(notified, rid):
             logging.info(f"[SKIP] TTL/クールダウン抑制: {rid}"); continue
 
-        # --- オッズ取得＆戦略判定 ---
+        # 発走時刻の取得（一覧からのみ）
+        post_time = post_time_map.get(rid)
+        if not post_time:
+            logging.info(f"[SKIP] 発走時刻不明のため通知保留: {rid}")
+            continue
+
+        # ウィンドウ判定
+        now = now_jst()
+        if not is_within_window(post_time, now):
+            # デバッグしやすいよう距離も出す
+            delta_min = int((post_time - now).total_seconds() // 60)
+            logging.info(f"[SKIP] 窓外({delta_min:+}m) rid={rid} 発走={post_time:%H:%M}")
+            continue
+
+        # 窓内に入った場合のみ、オッズページを見に行く
         meta = check_tanfuku_page(rid)
         if not meta:
             time.sleep(random.uniform(*SLEEP_BETWEEN)); continue
@@ -476,7 +543,7 @@ def main():
             message = (
                 "【戦略ヒット】\n"
                 f"RACEID: {rid}\n"
-                f"{meta['venue_race']} {meta['now']}\n"
+                f"{meta['venue_race']} 発走{post_time:%H:%M} JST（{meta['now']}）\n"
                 f"{strategy['strategy']}\n"
                 f"買い目: {ticket_str}\n"
                 f"{strategy['roi']} / {strategy['hit']}\n"
@@ -489,7 +556,7 @@ def main():
             if sent_ok:
                 # 送達成功 → 通常TTL更新
                 try:
-                    sheet_upsert_notified(rid, now_ts, note=meta['venue_race'])
+                    sheet_upsert_notified(rid, now_ts, note=f"{meta['venue_race']} {post_time:%H:%M}")
                     notified[rid] = now_ts
                 except Exception as e:
                     logging.exception("[ERROR] TTL更新失敗（Google Sheets）: %s", e)
@@ -498,7 +565,7 @@ def main():
                 # 429 → クールダウンTTL更新（rid:cd）
                 try:
                     key_cd = f"{rid}:cd"
-                    sheet_upsert_notified(key_cd, now_ts, note=f"429 cooldown {meta['venue_race']}")
+                    sheet_upsert_notified(key_cd, now_ts, note=f"429 cooldown {meta['venue_race']} {post_time:%H:%M}")
                     notified[key_cd] = now_ts
                 except Exception as e:
                     logging.exception("[ERROR] CD更新失敗（Google Sheets）: %s", e)
