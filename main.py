@@ -2,7 +2,7 @@
 """
 Rakuten競馬 監視・通知バッチ
 - 一覧で発走時刻取得
-- 詳細/オッズ フォールバック（RIDアンカー近傍 & 「発走」文脈優先）
+- 詳細/オッズ フォールバック（RIDアンカー近傍 & 「発走」文脈優先、ノイズ語除外）
 - 窓内1回通知 / 429クールダウン / Sheet永続TTL
 """
 
@@ -62,10 +62,14 @@ RACEID_RE   = re.compile(r"/RACEID/(\d{18})")
 # 半角コロン, 全角コロン, 「時分」表記の3系統に対応
 TIME_PATS = [
     re.compile(r"\b(\d{1,2}):(\d{2})\b"),
-    re.compile(r"\b(\d{1,2})：(\d{2})\b"),               # 全角コロン
-    re.compile(r"\b(\d{1,2})\s*時\s*(\d{1,2})\s*分\b"),  # 12時50分
+    re.compile(r"\b(\d{1,2})：(\d{2})\b"),
+    re.compile(r"\b(\d{1,2})\s*時\s*(\d{1,2})\s*分\b"),
 ]
 PLACEHOLDER = re.compile(r"\d{8}0000000000$")
+
+# ノイズ／優先ラベル（★新規）
+IGNORE_NEAR_PAT = re.compile(r"(現在|更新|発売|締切|投票|オッズ|確定|払戻|実況)")
+LABEL_NEAR_PAT  = re.compile(r"(発走|発走予定|発走時刻|発送|出走)")
 
 # ========= 共通 =========
 def now_jst() -> datetime:
@@ -448,8 +452,9 @@ def check_tanfuku_page(race_id: str) -> Optional[Dict]:
 def fallback_post_time_for_rid(rid: str) -> Optional[Tuple[datetime, str, str]]:
     """
     RIDの発走時刻を厳密取得。
-    1) listページ: RIDアンカー近傍のみ探索
-    2) tanfukuページ: 「発走」文脈 or <time> 優先、最後の手段で全文から「発走」近傍スコア
+    1) listページ: RIDアンカー近傍のみ探索（兄弟要素を少し見る）
+    2) tanfukuページ: 「発走」ラベル近傍 / <time>属性 を優先
+       最後の手段でも「発走」文脈に重み、ノイズ語(現在/更新/発売/締切/オッズ/確定/払戻/実況 等)は除外
     戻り: (dt, why, url) or None
     """
     def _from_list_page() -> Optional[Tuple[datetime, str, str]]:
@@ -461,6 +466,7 @@ def fallback_post_time_for_rid(rid: str) -> Optional[Tuple[datetime, str, str]]:
         if not a:
             return None
 
+        # 近傍ホスト（tr/li/div/section/article）を基点に
         host = None
         for parent in a.parents:
             if isinstance(parent, Tag) and parent.name in ("tr", "li", "div", "section", "article"):
@@ -470,12 +476,15 @@ def fallback_post_time_for_rid(rid: str) -> Optional[Tuple[datetime, str, str]]:
 
         hhmm, reason = _find_time_nearby(host)
         if not hhmm:
+            # 兄弟方向の数要素も確認
             sibs = [n for n in host.find_all_next(limit=6) if isinstance(n, Tag)]
             text = " ".join([n.get_text(" ", strip=True) for n in sibs])
-            got = _norm_hhmm_from_text(text)
-            if got:
-                hh, mm, why = got
-                hhmm, reason = f"{hh:02d}:{mm:02d}", f"sibling:text/{why}"
+            # ノイズ語は無視
+            if not IGNORE_NEAR_PAT.search(text):
+                got = _norm_hhmm_from_text(text)
+                if got:
+                    hh, mm, why = got
+                    hhmm, reason = f"{hh:02d}:{mm:02d}", f"sibling:text/{why}"
         if not hhmm:
             return None
 
@@ -483,72 +492,111 @@ def fallback_post_time_for_rid(rid: str) -> Optional[Tuple[datetime, str, str]]:
         dt = _make_dt_from_hhmm(rid, hh, mm)
         if not dt:
             return None
-        logging.info("[INFO] 発走(詳細fallback)取得 rid=%s 発走=%s via %s (%s)", rid, dt.strftime("%H:%M"), f"list-anchor/{reason}", url)
+        logging.info("[INFO] 発走(詳細fallback)取得 rid=%s 発走=%s via %s (%s)",
+                     rid, dt.strftime("%H:%M"), f"list-anchor/{reason}", url)
         return dt, f"list-anchor/{reason}", url
 
     def _from_tanfuku_page() -> Optional[Tuple[datetime, str, str]]:
         url = f"https://keiba.rakuten.co.jp/odds/tanfuku/RACEID/{rid}"
         soup = BeautifulSoup(fetch(url), "lxml")
 
-        # 1) 「発走」「発走時刻」ラベル近傍
-        for key in ("発走", "発走時刻"):
-            for tag in soup.find_all(string=re.compile(key)):
-                el = tag.parent if not isinstance(tag, Tag) else tag
+        # 1) 「発走/発走時刻」ラベル近傍（ノイズ語を含む近傍は除外）
+        for key in ("発走", "発走時刻", "発走予定", "発送", "出走"):
+            for node in soup.find_all(string=re.compile(key)):
+                el = getattr(node, "parent", None) or soup
                 container = el
                 for parent in el.parents:
                     if isinstance(parent, Tag) and parent.name in ("div", "section", "article", "li"):
                         container = parent
                         break
-                hhmm, why = _find_time_nearby(container)
-                if hhmm:
-                    hh, mm = map(int, hhmm.split(":"))
+
+                # 近傍テキスト
+                chunks = []
+                try:
+                    chunks.append(container.get_text(" ", strip=True))
+                except Exception:
+                    pass
+                for sub in container.find_all(True, limit=6):
+                    try:
+                        chunks.append(sub.get_text(" ", strip=True))
+                    except Exception:
+                        pass
+                near = " ".join(chunks)
+
+                if IGNORE_NEAR_PAT.search(near):
+                    continue
+                got = _norm_hhmm_from_text(near)
+                if got:
+                    hh, mm, why = got
                     dt = _make_dt_from_hhmm(rid, hh, mm)
                     if dt:
-                        logging.info("[INFO] 詳細fallback成功 rid=%s %s via %s (%s)", rid, dt.strftime("%H:%M"), f"tanfuku-label/{key}/{why}", url)
+                        logging.info("[INFO] 詳細fallback成功 rid=%s %s via %s (%s)",
+                                     rid, dt.strftime("%H:%M"), f"tanfuku-label/{key}/{why}", url)
                         return dt, f"tanfuku-label/{key}/{why}", url
 
-        # 2) <time> 要素
+        # 2) <time>要素（属性 or テキスト）— ノイズ語を含む場合は除外
         for t in soup.find_all("time"):
             for attr in ("datetime", "data-time", "title", "aria-label"):
                 v = t.get(attr)
-                if v:
-                    got = _norm_hhmm_from_text(v)
-                    if got:
-                        hh, mm, why = got
-                        dt = _make_dt_from_hhmm(rid, hh, mm)
-                        if dt:
-                            logging.info("[INFO] 詳細fallback成功 rid=%s %s via %s (%s)", rid, dt.strftime("%H:%M"), f"tanfuku-time@{attr}/{why}", url)
-                            return dt, f"tanfuku-time@{attr}/{why}", url
-            got = _norm_hhmm_from_text(t.get_text(" ", strip=True))
+                if not v:
+                    continue
+                around = f"{v} {t.get_text(' ', strip=True)}"
+                if IGNORE_NEAR_PAT.search(around) and not LABEL_NEAR_PAT.search(around):
+                    continue
+                got = _norm_hhmm_from_text(around)
+                if got:
+                    hh, mm, why = got
+                    dt = _make_dt_from_hhmm(rid, hh, mm)
+                    if dt:
+                        logging.info("[INFO] 詳細fallback成功 rid=%s %s via %s (%s)",
+                                     rid, dt.strftime("%H:%M"), f"tanfuku-time@{attr}/{why}", url)
+                        return dt, f"tanfuku-time@{attr}/{why}", url
+            txt = t.get_text(" ", strip=True)
+            if IGNORE_NEAR_PAT.search(txt) and not LABEL_NEAR_PAT.search(txt):
+                continue
+            got = _norm_hhmm_from_text(txt)
             if got:
                 hh, mm, why = got
                 dt = _make_dt_from_hhmm(rid, hh, mm)
                 if dt:
-                    logging.info("[INFO] 詳細fallback成功 rid=%s %s via %s (%s)", rid, dt.strftime("%H:%M"), f"tanfuku-time@text/{why}", url)
+                    logging.info("[INFO] 詳細fallback成功 rid=%s %s via %s (%s)",
+                                 rid, dt.strftime("%H:%M"), f"tanfuku-time@text/{why}", url)
                     return dt, f"tanfuku-time@text/{why}", url
 
-        # 3) 全文から候補抽出（「発走」近傍に重み付け）
-        text = soup.get_text(" ", strip=True)
-        cands = list(re.finditer(r"\b(\d{1,2})[:：](\d{2})\b", text))
+        # 3) 最後の手段：全文（「発走」近傍に重み、ノイズ語は除外）
+        full = soup.get_text(" ", strip=True)
+
+        # ラベル＋時刻のパターンを優先
+        m = re.search(r"(発走|発走予定|発走時刻|発送|出走)[^0-9]{0,10}(\d{1,2})[:：](\d{2})", full)
+        if m:
+            hh, mm = int(m.group(2)), int(m.group(3))
+            dt = _make_dt_from_hhmm(rid, hh, mm)
+            if dt:
+                logging.info("[INFO] 詳細fallback成功 rid=%s %s via %s (%s)",
+                             rid, dt.strftime("%H:%M"), "tanfuku-fulltext/label-inline", url)
+                return dt, "tanfuku-fulltext/label-inline", url
+
         best = None  # (hh, mm, score)
-        for m in cands:
+        for m in re.finditer(r"\b(\d{1,2})[:：](\d{2})\b", full):
             hh, mm = int(m.group(1)), int(m.group(2))
             if not (0 <= hh <= 23 and 0 <= mm <= 59):
                 continue
-            start = max(0, m.start() - 120)
-            end   = min(len(text), m.end() + 120)
-            ctx = text[start:end]
-            score = 1 + (2 if ("発走" in ctx or "発走時刻" in ctx) else 0)
+            ctx = full[max(0, m.start()-120):min(len(full), m.end()+120)]
+            if IGNORE_NEAR_PAT.search(ctx):
+                continue
+            score = 1 + (2 if LABEL_NEAR_PAT.search(ctx) else 0)
             if not best or score > best[2]:
                 best = (hh, mm, score)
         if best:
             dt = _make_dt_from_hhmm(rid, best[0], best[1])
             if dt:
-                logging.info("[INFO] 詳細fallback成功 rid=%s %s via %s (%s)", rid, dt.strftime("%H:%M"), "tanfuku-fulltext/with-context", url)
+                logging.info("[INFO] 詳細fallback成功 rid=%s %s via %s (%s)",
+                             rid, dt.strftime("%H:%M"), "tanfuku-fulltext/with-context", url)
                 return dt, "tanfuku-fulltext/with-context", url
+
         return None
 
-    # 実行順
+    # 実行順序：list → tanfuku
     try:
         got = _from_list_page()
         if got: return got
@@ -638,7 +686,7 @@ def main():
     # ビルド識別
     p = pathlib.Path(__file__).resolve()
     sha = hashlib.sha1(p.read_bytes()).hexdigest()[:12]
-    logging.info(f"[BUILD] file={p} mtime={p.stat().st_mtime:.0f} sha1={sha} Fallback=ON v2025-08-12C")
+    logging.info(f"[BUILD] file={p} mtime={p.stat().st_mtime:.0f} sha1={sha} Fallback=ON v2025-08-12D")
 
     if KILL_SWITCH:
         logging.info("[INFO] KILL_SWITCH=True のため終了"); return
