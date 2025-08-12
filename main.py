@@ -4,6 +4,7 @@ Rakuten競馬 監視・通知バッチ
 - 一覧で発走時刻取得
 - 詳細/オッズ フォールバック（RIDアンカー近傍 & 「発走」文脈優先、ノイズ語除外）
 - 窓内1回通知 / 429クールダウン / Sheet永続TTL
+- 通知先：Googleシート(users)で管理（フォールバックで環境変数LINE_USER_IDS/LINE_USER_ID）
 """
 
 import os, re, json, time, random, logging, pathlib, hashlib
@@ -51,12 +52,14 @@ WINDOW_AFTER_MIN    = int(os.getenv("WINDOW_AFTER_MIN", "-10"))
 CUTOFF_OFFSET_MIN   = int(os.getenv("CUTOFF_OFFSET_MIN", "0"))
 FORCE_RUN           = os.getenv("FORCE_RUN", "0") == "1"
 
-LINE_ACCESS_TOKEN = os.getenv("LINE_ACCESS_TOKEN", "")
-LINE_USER_ID      = os.getenv("LINE_USER_ID", "")
+LINE_ACCESS_TOKEN   = os.getenv("LINE_ACCESS_TOKEN", "")
+LINE_USER_ID        = os.getenv("LINE_USER_ID", "")
+LINE_USER_IDS       = [s.strip() for s in os.getenv("LINE_USER_IDS", "").split(",") if s.strip()]
 
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "")
 GOOGLE_SHEET_ID         = os.getenv("GOOGLE_SHEET_ID", "")
 GOOGLE_SHEET_TAB        = os.getenv("GOOGLE_SHEET_TAB", "notified")
+USERS_SHEET_NAME        = os.getenv("USERS_SHEET_NAME", "users")  # 送信先一覧シート名
 
 RACEID_RE   = re.compile(r"/RACEID/(\d{18})")
 # 半角コロン, 全角コロン, 「時分」表記の3系統に対応
@@ -175,15 +178,38 @@ def sheet_upsert_notified(key: str, ts: float, note: str = "") -> None:
             insertDataOption="INSERT_ROWS", body=body
         ).execute()
 
-def should_skip_by_ttl(notified: Dict[str, float], rid: str) -> bool:
-    now = time.time()
-    cd_ts = notified.get(f"{rid}:cd")
-    if cd_ts and (now - cd_ts) < NOTIFY_COOLDOWN_SEC:
-        return True
-    ts = notified.get(rid)
-    if ts and (now - ts) < NOTIFY_TTL_SEC:
-        return True
-    return False
+def load_users_from_sheet() -> List[Dict[str, str]]:
+    """
+    'users' シート（列: userId, enabled, plan, timing ...）から enabled=TRUE の行を送り先として読み込む。
+    - シート名は USERS_SHEET_NAME 環境変数で変更可（既定 'users'）
+    - ヘッダー行（1行目）を見て柔軟にマッピング
+    """
+    svc = _sheet_service()
+    title = USERS_SHEET_NAME
+    rng = f"'{title}'!A:Z"
+    res = svc.spreadsheets().values().get(spreadsheetId=GOOGLE_SHEET_ID, range=rng).execute()
+    values = res.get("values", [])
+    if not values or len(values) < 2:
+        logging.warning("[WARN] usersシートが空、またはヘッダーのみです: %s", title)
+        return []
+    header = [h.strip() for h in values[0]]
+    users: List[Dict[str, str]] = []
+    for row in values[1:]:
+        rec = {header[i]: row[i].strip() if i < len(row) else "" for i in range(len(header))}
+        uid = rec.get("userId", "").strip()
+        enabled = rec.get("enabled", "").strip().upper()
+        if not uid or not uid.startswith("U"):
+            continue
+        if enabled not in ("TRUE", "1", "YES", "ON"):
+            continue
+        users.append(rec)
+    # 重複除去（userId基準）
+    uniq = {}
+    for u in users:
+        uniq[u["userId"]] = u
+    users = list(uniq.values())
+    logging.info("[INFO] usersシート読込: %d件（enabledのみ）", len(users))
+    return users
 
 # ========= ユーティリティ =========
 def _extract_raceids_from_soup(soup: BeautifulSoup) -> List[str]:
@@ -267,7 +293,7 @@ def _find_time_nearby(el: Tag) -> Tuple[Optional[str], str]:
         return f"{hh:02d}:{mm:02d}", f"row:text/{why}"
     return None, "-"
 
-# ========= 発走時刻（一覧ページ） =========
+# ========= 発走時刻（一覧ページ）解析 =========
 def parse_post_times_from_table_like(root: Tag) -> Dict[str, datetime]:
     post_map: Dict[str, datetime] = {}
 
@@ -667,6 +693,28 @@ def push_line_text(user_id: str, token: str, text: str, timeout=8, retries=1):
                 time.sleep(2); continue
             return False, None, str(e)
 
+def notify_strategy_hit_to_many(message_text: str, targets: List[str]):
+    if not NOTIFY_ENABLED:
+        logging.info("[INFO] NOTIFY_ENABLED=0 のため通知スキップ"); return False, None
+    if DRY_RUN:
+        logging.info("[DRY_RUN] 通知メッセージ:\n%s", message_text); return False, None
+    if not LINE_ACCESS_TOKEN:
+        logging.error("[ERROR] LINE 環境変数不足（LINE_ACCESS_TOKEN）"); return False, None
+    if not targets:
+        logging.error("[ERROR] 送信先ユーザーIDが空（usersシート未設定？）"); return False, None
+
+    all_ok = True
+    last_status = None
+    for uid in targets:
+        ok, status, body = push_line_text(uid, LINE_ACCESS_TOKEN, message_text)
+        last_status = status
+        if not ok:
+            all_ok = False
+            logging.warning("[WARN] LINE送信失敗 user=%s status=%s body=%s", uid, status, (body or "")[:200])
+        time.sleep(0.2)  # 軽い間隔（429対策）
+    return all_ok, last_status
+
+# 旧・単一宛て（互換維持：未使用でも残す）
 def notify_strategy_hit(message_text: str):
     if not NOTIFY_ENABLED:
         logging.info("[INFO] NOTIFY_ENABLED=0 のため通知スキップ"); return False, None
@@ -773,6 +821,20 @@ def main():
                  f"TTL={NOTIFY_TTL_SEC}s CD={NOTIFY_COOLDOWN_SEC}s WIN=-{WINDOW_BEFORE_MIN}m/{WINDOW_AFTER_MIN:+}m "
                  f"CUTOFF={CUTOFF_OFFSET_MIN}m")
 
+    # 送信対象ユーザーの読み込み（usersシート → 環境変数フォールバック）
+    try:
+        users = load_users_from_sheet()
+        targets = [u["userId"] for u in users]
+        if not targets:
+            fb = LINE_USER_IDS if LINE_USER_IDS else ([LINE_USER_ID] if LINE_USER_ID else [])
+            targets = fb
+        logging.info("[INFO] 送信ターゲット数: %d", len(targets))
+    except Exception as e:
+        logging.exception("[ERROR] usersシート読込失敗: %s", e)
+        fb = LINE_USER_IDS if LINE_USER_IDS else ([LINE_USER_ID] if LINE_USER_ID else [])
+        targets = fb
+        logging.info("[INFO] フォールバック送信ターゲット数: %d", len(targets))
+
     # 永続TTLロード
     try:
         notified = sheet_load_notified()
@@ -846,23 +908,18 @@ def main():
             matches += 1
 
             # --- 通知本文の新フォーマット（回収率・的中率なし） ---
-            # 1) パターン番号と条件文
             strategy_text = strategy.get("strategy", "")  # 例: "③ 1→相手（10〜20倍含む）"
             pattern_no = _infer_pattern_no(strategy_text)
             condition_text = _strip_pattern_prefix(strategy_text) or strategy_text
 
-            # 2) 会場名とR数を分離
             venue_disp, race_no = _split_venue_race(meta.get("venue_race", ""))
 
-            # 3) 時刻ラベル（発走 or 締切）と表示時刻
             time_label = "発走" if CUTOFF_OFFSET_MIN == 0 else "締切"
             display_dt = post_time if CUTOFF_OFFSET_MIN == 0 else (post_time - timedelta(minutes=CUTOFF_OFFSET_MIN))
             time_hm = display_dt.strftime("%H:%M")
 
-            # 4) オッズ時点（HH:MM抽出）
             odds_hm = _extract_hhmm_label(meta.get("now", ""))
 
-            # 5) 買い目配列
             tickets = strategy.get("tickets", [])
             if isinstance(tickets, str):
                 tickets = [s.strip() for s in tickets.split(",") if s.strip()]
@@ -879,7 +936,7 @@ def main():
                 odds_url=meta["url"],
             )
 
-            # ログ用の詳細（回収率/的中率はログに残す）
+            # ログ詳細（回収率/的中率はログのみ任意保持）
             ticket_str = ", ".join(tickets)
             detail = f"{strategy_text} / 買い目: {ticket_str}"
             if "roi" in strategy or "hit" in strategy:
@@ -887,7 +944,7 @@ def main():
             logging.info(f"[MATCH] {rid} 条件詳細: {detail}")
             # -----------------------------------------------
 
-            sent_ok, http_status = notify_strategy_hit(message)
+            sent_ok, http_status = notify_strategy_hit_to_many(message, targets)
             now_ts = time.time()
 
             if sent_ok:
