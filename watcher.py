@@ -9,10 +9,9 @@ Rakuten競馬 監視・通知バッチ（騎手ランク200位＋騎手名フォ
 - 騎手ランク(A/B/C)表示（A=1-70位, B=71-200位, C=その他）
 - タイトル「【戦略◯該当レース発見💡】」で統一
 - betsシートへ買い目（馬番）を記録
-- 終業時に当日分の件数/的中率/回収率サマリをLINE通知
+- 終業時に当日分サマリ(件数/的中率/回収率)をLINE通知
 - 券種は STRATEGY_BET_KIND_JSON で設定（既定: ①馬連, ②馬単, ③三連単, ④三連複）
-- ★NEW: 単複オッズ表に騎手列が無い時、出馬表ページから「馬番→騎手名」を補完
-- ★NEW: 騎手ランクはベース内蔵100名＋ENV/Sheetで200位まで拡張可能
+- NEW: 単複オッズ表に騎手列が無い時、出馬表ページから「馬番→騎手名」補完
 """
 
 import os, re, json, time, random, logging, pathlib, hashlib, unicodedata
@@ -148,6 +147,7 @@ def jockey_rank_letter_by_name(name: Optional[str]) -> str:
 
 # ========= 共通 =========
 def now_jst() -> datetime: return datetime.now(JST)
+
 def within_operating_hours() -> bool:
     if FORCE_RUN: return True
     return START_HOUR <= now_jst().hour < END_HOUR
@@ -322,7 +322,7 @@ def parse_post_times_from_table_like(root: Tag) -> Dict[str, datetime]:
                 m = RACEID_RE.search(link["href"])
                 if m: rid=m.group(1)
             if not rid or PLACEHOLDER.search(rid): continue
-            hhmm, reason = _find_time_nearby(tr)
+            hhmm, _ = _find_time_nearby(tr)
             if not hhmm: continue
             hh,mm = map(int, hhmm.split(":"))
             dt = _make_dt_from_hhmm(rid, hh, mm)
@@ -341,13 +341,13 @@ def parse_post_times_from_table_like(root: Tag) -> Dict[str, datetime]:
             if depth >= 6:
                 break
         host = host or a
-        hhmm, reason = _find_time_nearby(host)
+        hhmm, _ = _find_time_nearby(host)
         if not hhmm:
             sib_text=" ".join([x.get_text(" ", strip=True) for x in a.find_all_next(limit=4) if isinstance(x, Tag)])
             got=_norm_hhmm_from_text(sib_text)
             if got:
                 hh,mm,why=got
-                hhmm,reason=f"{hh:02d}:{mm:02d}", f"next:text/{why}"
+                hhmm=f"{hh:02d}:{mm:02d}"
         if not hhmm: continue
         hh,mm=map(int, hhmm.split(":"))
         dt=_make_dt_from_hhmm(rid, hh, mm)
@@ -836,11 +836,12 @@ def summarize_today_and_notify(targets: List[str]):
 
     for r in records:
         date_ymd, race_id, venue, race_no, strategy, bet_kind, t_csv, points, unit, total = r[:10]
+        # 同一レース×同一戦略を初めて見た時だけ races を加算
         if (race_id, strategy) not in seen_race_strategy:
-            seen_in_this = (race_id, strategy)
-            seen_race_strategy.add(seen_in_this)
+            seen_race_strategy.add((race_id, strategy))
+            per_strategy[strategy]["races"] += 1
+
         tickets=[t for t in t_csv.split(",") if t]
-        per_strategy[strategy]["races"] += 1
         per_strategy[strategy]["bets"]  += len(tickets)
         per_strategy[strategy]["stake"] += int(total)
 
@@ -879,7 +880,7 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     p=pathlib.Path(__file__).resolve()
     sha=hashlib.sha1(p.read_bytes()).hexdigest()[:12]
-    logging.info(f"[BUILD] file={p} sha1={sha} v2025-08-13G")
+    logging.info(f"[BUILD] file={p} sha1={sha} v2025-08-14A")
 
     if KILL_SWITCH:
         logging.info("[INFO] KILL_SWITCH=True"); return
@@ -898,9 +899,11 @@ def main():
 
     # 稼働時間内で通常監視
     if within_operating_hours():
-        try: notified=sheet_load_notified()
+        try:
+            notified=sheet_load_notified()
         except Exception as e:
-            logging.exception("[ERROR] TTLロード失敗: %s", e); notified={}
+            logging.exception("[ERROR] TTLロード失敗: %s", e)
+            notified={}
         if DEBUG_RACEIDS:
             target_raceids=[rid for rid in DEBUG_RACEIDS if not PLACEHOLDER.search(rid)]
             post_time_map={}
@@ -973,7 +976,7 @@ def main():
             # 送信
             sent_ok, http_status = notify_strategy_hit_to_many(message, targets)
 
-            # ★通知ログ（append_notify_log）に追記：送信成功時のみ
+            # 通知ログ（送信成功時のみ）
             if sent_ok:
                 try:
                     append_notify_log({
@@ -985,7 +988,7 @@ def main():
                         'notified_at': jst_now(),
                         'jockey_ranks': "/".join([
                             jockey_rank_letter_by_name(h.get("jockey")) if h.get("jockey") else "—"
-                            for h in horses[:3]  # 上位3人気
+                            for h in horses[:3]
                         ]),
                     })
                 except Exception as e:
