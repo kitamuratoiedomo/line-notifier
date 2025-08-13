@@ -1,0 +1,190 @@
+
+# ==============================================
+# utils_summary.py（新規作成：サマリ用ユーティリティ）
+# ==============================================
+"""
+- Google シート 読取/追記の薄いラッパ（既存のシートラッパがあれば差し替え推奨）
+- Rakuten 確定結果取得のリトライ（既存の fetch 関数があれば差し替え）
+- 集計＆メッセージ整形（無料/有料の差し替えポイントをコメント）
+"""
+from __future__ import annotations
+import os
+import time
+from dataclasses import dataclass
+from typing import List, Dict, Any
+from datetime import datetime, timedelta
+import pytz
+
+JST = pytz.timezone('Asia/Tokyo')
+SHEET_NOTIFY_LOG_TAB = os.getenv('SHEET_NOTIFY_LOG_TAB', 'notify_log')
+USERS_TAB = os.getenv('USERS_TAB', '1')
+
+# 既存の Google シート操作関数を使えるならそれに合わせてください。
+# ここでは簡易に gspread 風インタフェースを想定し、関数 stub を用意します。
+
+def _sheet_client():
+    """既存の GSheets クライアントを返す想定の関数（プロジェクト依存）。"""
+    from sheets import get_client  # 既存プロジェクトの関数に置き換え
+    return get_client()
+
+
+def jst_now():
+    return datetime.now(JST).strftime('%Y-%m-%d %H:%M:%S')
+
+
+def jst_today_str():
+    return datetime.now(JST).strftime('%Y-%m-%d')
+
+
+def jst_yesterday_str():
+    return (datetime.now(JST) - timedelta(days=1)).strftime('%Y-%m-%d')
+
+
+# ---- データモデル
+@dataclass
+class NotifyRow:
+    date_jst: str
+    race_id: str
+    strategy: str  # ①/②/③/④ など
+    stake: int     # その通知における推奨投資額合計（円）
+    bets_json: str # 買い目 JSON（配列）
+    notified_at: str
+    jockey_ranks: str  # 任意: "A/B/C" など
+
+
+# ---- 読み出し
+
+def read_notify_logs_for_day(day_str: str) -> List[Dict[str, Any]]:
+    sc = _sheet_client()
+    ws = sc.open_by_env().worksheet(SHEET_NOTIFY_LOG_TAB)
+    values = ws.get_all_values()
+    if not values:
+        return []
+    header = [h.strip() for h in values[0]]
+    idx = {h: i for i, h in enumerate(header)}
+
+    rows = []
+    for r in values[1:]:
+        if len(r) < len(header):
+            continue
+        if r[idx.get('date_jst', 0)] != day_str:
+            continue
+        rows.append({h: r[idx[h]] for h in header})
+    return rows
+
+
+# ---- ユーザID
+
+def load_user_ids() -> List[str]:
+    sc = _sheet_client()
+    ws = sc.open_by_env().worksheet(USERS_TAB)
+    values = ws.get_all_values()
+    if not values:
+        return []
+    header = [h.strip() for h in values[0]]
+    idx = {h: i for i, h in enumerate(header)}
+    # 既存仕様：H 列に userId（ヘッダ名は 'userId' を想定）
+    key = 'userId' if 'userId' in idx else 'H'
+    uids = []
+    for r in values[1:]:
+        try:
+            u = r[idx[key]] if key in idx else r[7]
+            if u:
+                uids.append(u)
+        except Exception:
+            continue
+    return list(dict.fromkeys(uids))  # 重複除去
+
+
+# ---- 日付ロック
+
+def try_acquire_daily_lock(day_str: str) -> bool:
+    path = f"/tmp/daily_lock_{day_str}"
+    if os.path.exists(path):
+        return False
+    try:
+        with open(path, 'w') as f:
+            f.write('1')
+        return True
+    except Exception:
+        return False
+
+
+# ---- 確定結果取得（既存関数がある場合は差し替え）
+
+def _fetch_result_or_none(race_id: str) -> Dict[str, Any] | None:
+    # 既存の関数 fetch_result_by_raceid があれば利用
+    try:
+        from rakuten import fetch_result_by_raceid  # プロジェクトの関数名に合わせて
+        return fetch_result_by_raceid(race_id)
+    except Exception:
+        return None
+
+
+def fetch_results_with_retry(rows: List[Dict[str, Any]], max_wait_sec: int = 180) -> List[Dict[str, Any]]:
+    start = time.time()
+    enriched = []
+    pending = list(rows)
+    backoff = 2
+    while pending and time.time() - start < max_wait_sec:
+        next_pending = []
+        for r in pending:
+            rid = r.get('race_id') or r.get('RACEID') or r.get('rid')
+            res = _fetch_result_or_none(rid)
+            if res and res.get('settled'):  # settled=True を既存側で立てる想定
+                enriched.append({**r, **res})
+            else:
+                next_pending.append(r)
+        if not next_pending:
+            break
+        time.sleep(backoff)
+        backoff = min(backoff * 2, 15)
+        pending = next_pending
+    # 取り切れなかった分もそのまま返す（settled=False として扱う）
+    for r in pending:
+        r2 = dict(r)
+        r2['settled'] = False
+        enriched.append(r2)
+    return enriched
+
+
+# ---- 集計と LINE メッセージ整形
+
+def build_summary_report_messages(rows: List[Dict[str, Any]], day_str: str, compact: bool = False) -> List[str]:
+    # 戦略別に集計
+    by_strategy: Dict[str, Dict[str, Any]] = {}
+    for r in rows:
+        strat = r.get('strategy') or r.get('戦略') or '-'
+        d = by_strategy.setdefault(strat, dict(total_bets=0, invest=0, hit=0, return_amt=0))
+        stake = int(str(r.get('stake') or 0))
+        d['invest'] += stake
+        d['total_bets'] += 1
+        if r.get('settled') and r.get('payout_total'):  # 例：確定配当合計（円）
+            d['hit'] += 1
+            d['return_amt'] += int(r['payout_total'])
+
+    lines = []
+    header = f"【日次サマリ】{day_str}"
+
+    # 有料/無料の差し替えポイント（必要ならここで分岐）
+    body = []
+    for strat, s in sorted(by_strategy.items()):
+        roi = (s['return_amt'] / s['invest'] * 100) if s['invest'] else 0.0
+        hit_rate = (s['hit'] / s['total_bets'] * 100) if s['total_bets'] else 0.0
+        body.append(
+            f"戦略{strat}: 投資{format(s['invest'], ',')}円 / 回収{format(s['return_amt'], ',')}円\n"
+            f"  回収率 {roi:.1f}% / 的中率 {hit_rate:.1f}%（{s['hit']}/{s['total_bets']}）"
+        )
+
+    note = (
+        "\n※オッズは締切直前まで変化しますので、ご注意ください。\n"
+        "※馬券の的中を保証するものではありません。余裕資金の範囲内で馬券購入をお願いします。"
+    )
+
+    if not body:
+        return [] if compact else [header + "\n本日の該当レースはありませんでした。" + note]
+
+    text = header + "\n\n" + "\n".join(body) + note
+    return [text]
+"""
+
