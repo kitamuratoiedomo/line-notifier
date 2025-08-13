@@ -23,6 +23,10 @@ import requests
 from bs4 import BeautifulSoup, Tag
 from strategy_rules import eval_strategy
 
+# 追記：通知ログと日付関数
+from utils_notify_log import append_notify_log
+from utils_summary import jst_today_str, jst_now
+
 # ===== Google Sheets =====
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
@@ -98,16 +102,11 @@ IGNORE_NEAR_PAT = re.compile(r"(現在|更新|発売|締切|投票|オッズ|確
 LABEL_NEAR_PAT  = re.compile(r"(発走|発走予定|発走時刻|発送|出走)")
 
 # ========= 騎手ランク（1〜200位を内蔵） =========
-import unicodedata
-from typing import Optional, Dict
-
 def _normalize_name(s: str) -> str:
     if not s: return ""
     s = unicodedata.normalize("NFKC", s)
     return s.replace(" ", "").replace("\u3000", "")
 
-# ここを“固定200名”にしました（1〜100は従前どおり、101〜200も追加）
-# ★注意：ランキングは時期で変動します。必要に応じてこの表だけ差し替えてください。
 JOCKEY_RANK_TABLE_RAW: Dict[int, str] = {
     1:"笹川翼",2:"矢野貴之",3:"塚本征吾",4:"小牧太",5:"山本聡哉",6:"野畑凌",7:"石川倭",8:"永森大智",9:"中島龍也",10:"吉原寛人",
     11:"広瀬航",12:"加藤聡一",13:"望月洵輝",14:"鈴木恵介",15:"渡辺竜也",16:"落合玄太",17:"山口勲",18:"本田正重",19:"吉村智洋",20:"赤岡修次",
@@ -119,7 +118,6 @@ JOCKEY_RANK_TABLE_RAW: Dict[int, str] = {
     71:"高橋悠里",72:"土方颯太",73:"長谷部駿弥",74:"高橋愛叶",75:"及川裕一",76:"加茂飛翔",77:"川原正一",78:"村上忍",79:"岡村健司",80:"田野豊三",
     81:"村上弘樹",82:"山崎誠士",83:"竹吉徹",84:"宮内勇樹",85:"船山蔵人",86:"中村太陽",87:"本橋孝太",88:"出水拓人",89:"新庄海誠",90:"山崎雅由",
     91:"阿部武臣",92:"安藤洋一",93:"小林凌",94:"友森翔太郎",95:"福原杏",96:"岩橋勇二",97:"佐々木志音",98:"木之前葵",99:"藤田凌",100:"佐野遥久",
-    # ↓ここから101〜200を“内蔵”。手元の最新版に合わせてあります。必要ならここだけ更新してください。
     101:"井上幹太",102:"佐藤友則",103:"吉村誠之助",104:"吉本隆記",105:"渡辺竜也",106:"吉井友彦",107:"岡田祥嗣",108:"松木大地",109:"加藤和義",110:"田中学",
     111:"川島拓",112:"森泰斗",113:"服部茂史",114:"加藤誓二",115:"濱尚美",116:"永井孝典",117:"高野誠毅",118:"大畑雅章",119:"大山真吾",120:"長谷部駿弥",
     121:"丹羽克輝",122:"山口勲二",123:"田中学良",124:"落合玄太朗",125:"細川智史朗",126:"松本剛史",127:"藤原良一",128:"山本政聡良",129:"佐原秀泰",130:"藤田弘治",
@@ -131,14 +129,12 @@ JOCKEY_RANK_TABLE_RAW: Dict[int, str] = {
     181:"竹村達也良",182:"鴨宮祥行良",183:"松本剛史良",184:"小牧太良",185:"吉村智洋良",186:"下原理隆",187:"廣瀬航良",188:"長谷部駿弥良",189:"中越琉世良",190:"田中学真",
     191:"長田進仁良",192:"佐原秀泰良",193:"大柿一真隆",194:"高野誠毅良",195:"山田雄大良",196:"池谷匠翔良",197:"小牧太隆",198:"石川慎将良",199:"吉村誠之助良",200:"山本聡哉良",
 }
-
-# 名前→順位の辞書
 _JOCKEY_NAME_TO_RANK: Dict[str, int] = { _normalize_name(v): k for k, v in JOCKEY_RANK_TABLE_RAW.items() }
 
 def jockey_rank_letter_by_name(name: Optional[str]) -> str:
     if not name: return "—"
     rank = _JOCKEY_NAME_TO_RANK.get(_normalize_name(name))
-    if rank is None: return "C"         # 200名に入っていなければC
+    if rank is None: return "C"
     if 1 <= rank <= 70: return "A"
     if 71 <= rank <= 200: return "B"
     return "C"
@@ -173,7 +169,6 @@ def _sheet_service():
     return build("sheets", "v4", credentials=creds, cache_discovery=False)
 
 def _resolve_sheet_title(svc, tab_or_gid: str) -> str:
-    """名前 or gid をタイトルに正規化。なければ作成"""
     tab = tab_or_gid
     meta = svc.spreadsheets().get(spreadsheetId=GOOGLE_SHEET_ID).execute()
     sheets = meta.get("sheets", [])
@@ -507,7 +502,6 @@ def check_tanfuku_page(race_id: str) -> Optional[Dict]:
     horses, venue_race, now_label = parse_odds_table(soup)
     if not horses: return None
     if not venue_race: venue_race="地方競馬"
-    # ★ 騎手列が無い/欠けている時は出馬表から補完
     _enrich_horses_with_jockeys(horses, race_id)
     return {"race_id": race_id, "url": url, "horses": horses, "venue_race": venue_race, "now": now_label or ""}
 
@@ -966,24 +960,26 @@ def main():
                 tickets_umaban=_tickets_pop_to_umaban(raw_tickets, horses)
                 bet_kind = STRATEGY_BET_KIND.get(str(pattern_no), "三連単")
 
+            # 送信
             sent_ok, http_status = notify_strategy_hit_to_many(message, targets)
-            
-            from utils_notify_log import append_notify_log
-from utils_summary import jst_today_str, jst_now
 
-if sent_ok:
-    append_notify_log({
-        'date_jst': jst_today_str(),
-        'race_id': rid,
-        'strategy': str(pattern_no),
-        'stake': len(tickets_umaban) * UNIT_STAKE_YEN,
-        'bets_json': json.dumps(tickets_umaban, ensure_ascii=False),
-        'notified_at': jst_now(),
-        'jockey_ranks': "/".join([
-            jockey_rank_letter_by_name(h.get("jockey")) if h.get("jockey") else "—"
-            for h in horses[:3]  # 上位3人気
-        ]),
-    })
+            # ★ 通知ログを追記（送信できた時のみ）
+            if sent_ok:
+                try:
+                    append_notify_log({
+                        'date_jst': jst_today_str(),
+                        'race_id': rid,
+                        'strategy': str(pattern_no if pattern_no else (3 if str(strategy_text).startswith("③") else "")),
+                        'stake': len(tickets_umaban) * UNIT_STAKE_YEN,
+                        'bets_json': json.dumps(tickets_umaban, ensure_ascii=False),
+                        'notified_at': jst_now(),
+                        'jockey_ranks': "/".join([
+                            jockey_rank_letter_by_name(h.get("jockey")) if h.get("jockey") else "—"
+                            for h in horses[:3]
+                        ]),
+                    })
+                except Exception as e:
+                    logging.exception("[ERROR] notify_log 追記失敗: %s", e)
 
             now_epoch=time.time()
             if sent_ok:
@@ -1048,5 +1044,4 @@ if __name__ == '__main__':
 
     run_watcher_forever()
 """
-
-# 既存の if __name__ == '__ma
+# 既存の if __name__ == '__ma の続きがある場合はプロジェクト構成に合わせて調整してください。
