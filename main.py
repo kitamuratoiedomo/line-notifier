@@ -1,16 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-Rakuten競馬 監視・通知バッチ（騎手ランク＋日次検証サマリ対応）
+Rakuten競馬 監視・通知バッチ（騎手ランク200位＋騎手名フォールバック＋日次サマリ）
 - 一覧で発走時刻取得
 - 詳細/オッズ フォールバック（RIDアンカー近傍 & 「発走」文脈優先、ノイズ語除外）
 - 窓内1回通知 / 429クールダウン / Sheet永続TTL
 - 通知先：Googleシート(タブA=名称「1」)のH列から userId を収集
 - 戦略③は専用フォーマット（1軸・相手10〜20倍・馬番買い目・候補最大4頭・点数表示）
-- 騎手列パース / 騎手ランク(A/B/C)表示（A=1-70位, B=71-200位, C=その他）
+- 騎手ランク(A/B/C)表示（A=1-70位, B=71-200位, C=その他）
 - タイトル「【戦略◯該当レース発見💡】」で統一
-- ★NEW: 通知時に bets シートへ買い目（馬番）を記録
-- ★NEW: 1日の終わりに当日分を集計して「戦略①〜④の件数/的中率、全体回収率」をLINE通知
-- ★NEW: 券種は環境変数 STRATEGY_BET_KIND_JSON で設定可能（既定: ①馬連, ②馬単, ③三連単, ④三連複）
+- betsシートへ買い目（馬番）を記録
+- 終業時に当日分の件数/的中率/回収率サマリをLINE通知
+- 券種は STRATEGY_BET_KIND_JSON で設定（既定: ①馬連, ②馬単, ③三連単, ④三連複）
+- ★NEW: 単複オッズ表に騎手列が無い時、出馬表ページから「馬番→騎手名」を補完
+- ★NEW: 騎手ランクはベース内蔵100名＋ENV/Sheetで200位まで拡張可能
 """
 
 import os, re, json, time, random, logging, pathlib, hashlib, unicodedata
@@ -72,11 +74,10 @@ GOOGLE_SHEET_TAB        = os.getenv("GOOGLE_SHEET_TAB", "notified")
 USERS_SHEET_NAME        = os.getenv("USERS_SHEET_NAME", "1")
 USERS_USERID_COL        = os.getenv("USERS_USERID_COL", "H")
 
-# ★NEW: ベット記録タブ名
+# ベット記録タブ
 BETS_SHEET_TAB          = os.getenv("BETS_SHEET_TAB", "bets")
 
-# ★NEW: 券種マッピング（戦略番号→券種）。文字列は払戻ページの見出しと一致させる。
-# 既定: ①馬連, ②馬単, ③三連単, ④三連複
+# 券種（戦略→券種）
 _DEFAULT_BET_KIND = {"1":"馬連", "2":"馬単", "3":"三連単", "4":"三連複"}
 try:
     STRATEGY_BET_KIND = json.loads(os.getenv("STRATEGY_BET_KIND_JSON","")) or _DEFAULT_BET_KIND
@@ -86,7 +87,6 @@ except Exception:
 UNIT_STAKE_YEN = int(os.getenv("UNIT_STAKE_YEN", "100"))  # 1点100円
 
 RACEID_RE   = re.compile(r"/RACEID/(\d{18})")
-# 半角コロン, 全角コロン, 「時分」表記の3系統
 TIME_PATS = [
     re.compile(r"\b(\d{1,2}):(\d{2})\b"),
     re.compile(r"\b(\d{1,2})：(\d{2})\b"),
@@ -97,12 +97,13 @@ PLACEHOLDER = re.compile(r"\d{8}0000000000$")
 IGNORE_NEAR_PAT = re.compile(r"(現在|更新|発売|締切|投票|オッズ|確定|払戻|実況)")
 LABEL_NEAR_PAT  = re.compile(r"(発走|発走予定|発走時刻|発送|出走)")
 
-# ========= 騎手ランク（上位100名を内蔵） =========
-JOCKEY_RANK_TABLE_RAW: Dict[int, str] = {
+# ========= 騎手ランク（ベース100名内蔵＋拡張で200位まで） =========
+# 1〜100位（ベース、例）
+JOCKEY_RANK_TABLE_RAW_BASE: Dict[int, str] = {
     1:"笹川翼",2:"矢野貴之",3:"塚本征吾",4:"小牧太",5:"山本聡哉",6:"野畑凌",7:"石川倭",8:"永森大智",9:"中島龍也",10:"吉原寛人",
     11:"広瀬航",12:"加藤聡一",13:"望月洵輝",14:"鈴木恵介",15:"渡辺竜也",16:"落合玄太",17:"山口勲",18:"本田正重",19:"吉村智洋",20:"赤岡修次",
     21:"岡部誠",22:"高松亮",23:"飛田愛斗",24:"西将太",25:"御神本訓史",26:"下原理",27:"山本政聡",28:"今井貴大",29:"筒井勇介",30:"山田義貴",
-    31:"丸野勝虎",32:"青柳正義",33:"渡来心路",34:"今井千尋",35:"和田譲治",36:"井上瑛太",37:"多田羅誠也",38:"金田利貴",39:"宮下瞳",40:"塚本涼人",
+    31:"丸野勝虎",32:"青柳正義",33:"渡来心路",34:"今井千尋",35:"和田譲治",36:"井上瑛太",37:"多田羅誠也",38:"金田利貴",39:"塚本涼人",40:"宮下瞳",
     41:"栗原大河",42:"西謙一",43:"西啓太",44:"長澤幸太",45:"山中悠希",46:"菊池一樹",47:"町田直希",48:"石川慎将",49:"菅原辰徳",50:"島津新",
     51:"阿部龍",52:"小野楓馬",53:"赤塚健仁",54:"加藤翔馬",55:"杉浦健太",56:"張田昂",57:"桑村真明",58:"山本聡紀",59:"吉井章",60:"大畑慧悟",
     61:"柴田勇真",62:"大畑雅章",63:"笹田知宏",64:"細川智史",65:"金山昇馬",66:"岩本怜",67:"岡遼太郎",68:"岡村卓弥",69:"中原蓮",70:"藤本匠",
@@ -110,14 +111,69 @@ JOCKEY_RANK_TABLE_RAW: Dict[int, str] = {
     81:"村上弘樹",82:"山崎誠士",83:"竹吉徹",84:"宮内勇樹",85:"船山蔵人",86:"中村太陽",87:"本橋孝太",88:"出水拓人",89:"新庄海誠",90:"山崎雅由",
     91:"阿部武臣",92:"安藤洋一",93:"小林凌",94:"友森翔太郎",95:"福原杏",96:"岩橋勇二",97:"佐々木志音",98:"木之前葵",99:"藤田凌",100:"佐野遥久",
 }
+# 101〜200位は、ENVまたはシートから拡張（ベースに上書きマージ）
+# 1) 環境変数 JOCKEY_RANK_EXT_JSON 形式: {"101":"騎手名", "102":"騎手名", ... "200":"騎手名"}
+try:
+    _EXT_FROM_ENV: Dict[str,str] = json.loads(os.getenv("JOCKEY_RANK_EXT_JSON","") or "{}")
+except Exception:
+    _EXT_FROM_ENV = {}
 
 def _normalize_name(s: str) -> str:
     if not s: return ""
     s = unicodedata.normalize("NFKC", s)
-    s = s.replace(" ", "").replace("\u3000", "")
-    return s
+    return s.replace(" ", "").replace("\u3000", "")
 
-_JOCKEY_NAME_TO_RANK: Dict[str, int] = { _normalize_name(v): k for k, v in JOCKEY_RANK_TABLE_RAW.items() }
+def _sheet_service_lazy():
+    if not GOOGLE_CREDENTIALS_JSON or not GOOGLE_SHEET_ID:
+        return None
+    info = json.loads(GOOGLE_CREDENTIALS_JSON)
+    creds = Credentials.from_service_account_info(info, scopes=["https://www.googleapis.com/auth/spreadsheets"])
+    return build("sheets", "v4", credentials=creds, cache_discovery=False)
+
+def _load_rank_ext_from_sheet() -> Dict[int,str]:
+    """
+    2) シート 'JOCKEY_RANKS'（A列:順位 1-200 / B列:騎手名）から拡張（存在すれば）
+    """
+    svc = _sheet_service_lazy()
+    if not svc: return {}
+    tab = os.getenv("JOCKEY_RANKS_SHEET", "JOCKEY_RANKS")
+    try:
+        meta = svc.spreadsheets().get(spreadsheetId=GOOGLE_SHEET_ID).execute()
+        titles = [s["properties"]["title"] for s in meta.get("sheets",[])]
+        if tab not in titles: return {}
+        res = svc.spreadsheets().values().get(spreadsheetId=GOOGLE_SHEET_ID, range=f"'{tab}'!A:B").execute()
+        values = res.get("values", [])
+        out: Dict[int,str] = {}
+        for row in values:
+            if len(row) < 2: continue
+            try:
+                r = int(str(row[0]).strip())
+                if not (1 <= r <= 200): continue
+                name = _normalize_name(row[1])
+                if name: out[r] = name
+            except: pass
+        return out
+    except Exception:
+        return {}
+
+def _build_rank_table_1_200() -> Dict[int,str]:
+    table = dict(JOCKEY_RANK_TABLE_RAW_BASE)
+    # 環境変数（文字キーをint化）
+    for k,v in _EXT_FROM_ENV.items():
+        try:
+            r = int(k)
+            if 1 <= r <= 200 and v.strip():
+                table[r] = v.strip()
+        except: pass
+    # シートがあれば更に上書き
+    from_sheet = _load_rank_ext_from_sheet()
+    for r, name in from_sheet.items():
+        table[r] = name
+    return table
+
+# 正規化済テーブル（名前→順位）
+_JOCKEY_RANK_FULL: Dict[int,str] = _build_rank_table_1_200()
+_JOCKEY_NAME_TO_RANK: Dict[str,int] = { _normalize_name(n): r for r,n in _JOCKEY_RANK_FULL.items() }
 
 def jockey_rank_letter_by_name(name: Optional[str]) -> str:
     if not name: return "—"
@@ -129,7 +185,6 @@ def jockey_rank_letter_by_name(name: Optional[str]) -> str:
 
 # ========= 共通 =========
 def now_jst() -> datetime: return datetime.now(JST)
-
 def within_operating_hours() -> bool:
     if FORCE_RUN: return True
     return START_HOUR <= now_jst().hour < END_HOUR
@@ -154,9 +209,7 @@ def _sheet_service():
     if not GOOGLE_CREDENTIALS_JSON or not GOOGLE_SHEET_ID:
         raise RuntimeError("Google Sheets の環境変数不足")
     info = json.loads(GOOGLE_CREDENTIALS_JSON)
-    creds = Credentials.from_service_account_info(
-        info, scopes=["https://www.googleapis.com/auth/spreadsheets"]
-    )
+    creds = Credentials.from_service_account_info(info, scopes=["https://www.googleapis.com/auth/spreadsheets"])
     return build("sheets", "v4", credentials=creds, cache_discovery=False)
 
 def _resolve_sheet_title(svc, tab_or_gid: str) -> str:
@@ -384,7 +437,7 @@ def _find_popular_odds_table(soup: BeautifulSoup) -> Tuple[Optional[BeautifulSou
             for i,h in enumerate(headers):
                 if ("馬" in h) and ("馬名" not in h) and (i!=pop_idx): num_idx=i; break
         for i,h in enumerate(headers):
-            if "騎手" in h: jockey_idx=i; break
+            if any(k in h for k in ("騎手","騎手名")): jockey_idx=i; break
         if pop_idx is None or win_idx is None: continue
         body=table.find("tbody") or table
         rows=body.find_all("tr")
@@ -423,7 +476,8 @@ def parse_odds_table(soup: BeautifulSoup) -> Tuple[List[Dict[str,float]], Option
         jockey=None
         if 0<=jockey_idx<len(tds):
             jt=tds[jockey_idx].get_text(" ", strip=True)
-            jockey=re.split(r"[（( ]", jt)[0].strip() if jt else None
+            jraw = re.split(r"[（( ]", jt)[0].strip() if jt else None
+            jockey = jraw if jraw else None
         rec={"pop":pop, "odds":float(odds)}
         if num is not None: rec["num"]=num
         if jockey: rec["jockey"]=jockey
@@ -433,6 +487,59 @@ def parse_odds_table(soup: BeautifulSoup) -> Tuple[List[Dict[str,float]], Option
     horses=[uniq[k] for k in sorted(uniq.keys())]
     return horses, venue_race, now_label
 
+# === 騎手名クリーニング & 出馬表から補完 ===
+def _clean_jockey_name(s: str) -> str:
+    if not s: return ""
+    s = re.sub(r"\(.*?\)", "", s)
+    s = re.sub(r"[▲△☆★◇◆⊙◎○◯◉⚪︎＋+＊*]", "", s)
+    s = re.sub(r"\d+(?:\.\d+)?\s*(?:kg|斤)?", "", s)
+    s = s.replace("斤量","")
+    return s.strip()
+
+def fetch_jockey_map_from_card(race_id: str) -> Dict[int, str]:
+    urls = [
+        f"https://keiba.rakuten.co.jp/race_card/RACEID/{race_id}",
+        f"https://keiba.rakuten.co.jp/race_card/list/RACEID/{race_id}",
+    ]
+    result: Dict[int,str] = {}
+    for url in urls:
+        try:
+            soup = BeautifulSoup(fetch(url), "lxml")
+        except Exception:
+            continue
+        for table in soup.find_all("table"):
+            thead = table.find("thead")
+            if not thead: continue
+            headers = [_clean(th.get_text()) for th in thead.find_all(["th","td"])]
+            if not headers: continue
+            num_idx = next((i for i,h in enumerate(headers) if "馬番" in h), -1)
+            jockey_idx = next((i for i,h in enumerate(headers) if any(k in h for k in ("騎手","騎手名"))), -1)
+            if num_idx < 0 or jockey_idx < 0: continue
+            body = table.find("tbody") or table
+            for tr in body.find_all("tr"):
+                tds = tr.find_all(["td","th"])
+                if len(tds) <= max(num_idx, jockey_idx): continue
+                num = _as_int(tds[num_idx].get_text(" ", strip=True))
+                jtx = tds[jockey_idx].get_text(" ", strip=True)
+                if num is None or not jtx: continue
+                name = _clean_jockey_name(re.split(r"[（(]", jtx)[0])
+                if name:
+                    result[num] = name
+            if result:
+                return result
+    return result
+
+def _enrich_horses_with_jockeys(horses: List[Dict[str,float]], race_id: str) -> None:
+    need = any((h.get("jockey") is None) and isinstance(h.get("num"), int) for h in horses)
+    if not need: return
+    num2jockey = fetch_jockey_map_from_card(race_id)
+    if not num2jockey: return
+    for h in horses:
+        if not h.get("jockey") and isinstance(h.get("num"), int):
+            name = num2jockey.get(h["num"])
+            if name:
+                h["jockey"] = name
+
 def check_tanfuku_page(race_id: str) -> Optional[Dict]:
     url = f"https://keiba.rakuten.co.jp/odds/tanfuku/RACEID/{race_id}"
     html = fetch(url)
@@ -440,6 +547,8 @@ def check_tanfuku_page(race_id: str) -> Optional[Dict]:
     horses, venue_race, now_label = parse_odds_table(soup)
     if not horses: return None
     if not venue_race: venue_race="地方競馬"
+    # ★ 騎手列が無い/欠けている時は出馬表から補完
+    _enrich_horses_with_jockeys(horses, race_id)
     return {"race_id": race_id, "url": url, "horses": horses, "venue_race": venue_race, "now": now_label or ""}
 
 # ========= 発走時刻フォールバック =========
@@ -614,14 +723,12 @@ def _map_pop_to_info(horses: List[Dict[str,float]]) -> Dict[int, Dict[str, Optio
     return m
 
 def _tickets_pop_to_umaban(bets: List[str], horses: List[Dict[str,float]]) -> List[str]:
-    """'1-3' 等の人気表記 → '2-7' 等の馬番表記へ"""
     pop2=_map_pop_to_info(horses)
     out=[]
     for b in bets:
         pops=_parse_ticket_as_pops(b)
         if not pops: out.append(b); continue
-        nums=[]
-        ok=True
+        nums=[]; ok=True
         for p in pops:
             n=pop2.get(p,{}).get("umaban")
             if n is None: ok=False; break
@@ -630,7 +737,6 @@ def _tickets_pop_to_umaban(bets: List[str], horses: List[Dict[str,float]]) -> Li
     return out
 
 def _format_bets_with_rank(bets: List[str], horses: List[Dict[str,float]]) -> List[str]:
-    """表示用：X番人気（馬番Y／騎手ランクZ）"""
     pop2=_map_pop_to_info(horses)
     out=[]
     for bet in bets:
@@ -703,7 +809,7 @@ def build_line_notification_strategy3(strategy:Dict, venue:str, race_no:str, tim
     lines += ["🔗 オッズ詳細:", odds_url, "", "※オッズは締切直前まで変化します", "※馬券的中を保証するものではありません。余裕資金でご購入ください"]
     return "\n".join(lines)
 
-# ========= ★NEW: ベット記録（bets シート） =========
+# ========= ベット記録 =========
 def _bets_sheet_header() -> List[str]:
     return ["date","race_id","venue","race_no","strategy","bet_kind","tickets_umaban_csv","points","unit_stake","total_stake"]
 
@@ -720,14 +826,10 @@ def sheet_append_bet_record(date_ymd:str, race_id:str, venue:str, race_no:str,
     values.append([date_ymd, race_id, venue, race_no, str(strategy_no), bet_kind, ",".join(tickets_umaban), str(points), str(unit), str(total)])
     _sheet_update_range_values(svc, title, "A:J", values)
 
-# ========= ★NEW: 払戻取得＆日次サマリ =========
+# ========= 払戻取得＆日次サマリ =========
 _PAYOUT_KIND_KEYS = ["単勝","複勝","枠連","馬連","ワイド","馬単","三連複","三連単"]
 
 def fetch_payoff_map(race_id:str) -> Dict[str, List[Tuple[str,int]]]:
-    """
-    払戻ページを取得して {券種: [(組番(馬番ハイフン), 払戻円)]} を返す。
-    注: 実装はサイト構造に依存します。必要に応じてセレクタ調整してください。
-    """
     url=f"https://keiba.rakuten.co.jp/race/payoff/RACEID/{race_id}"
     html=fetch(url)
     soup=BeautifulSoup(html, "lxml")
@@ -747,14 +849,12 @@ def fetch_payoff_map(race_id:str) -> Dict[str, List[Tuple[str,int]]]:
     return result
 
 def _normalize_ticket_for_kind(ticket:str, kind:str) -> str:
-    """券種に合わせて並び順を正規化（馬連・三連複は昇順、馬単・三連単はそのまま）"""
     parts=[int(x) for x in ticket.split("-") if x.strip().isdigit()]
     if kind in ("馬連","三連複"):
         parts=sorted(parts)
     return "-".join(str(x) for x in parts)
 
 def summarize_today_and_notify(targets: List[str]):
-    """bets シートの当日分を集計し、LINEで通知"""
     svc=_sheet_service()
     title=_resolve_sheet_title(svc, BETS_SHEET_TAB)
     values=_sheet_get_range_values(svc, title, "A:J")
@@ -766,7 +866,6 @@ def summarize_today_and_notify(targets: List[str]):
     if not records:
         logging.info("[INFO] 当日分なし"); return
 
-    # 集計
     per_strategy = { "1":{"races":0,"hits":0,"bets":0,"stake":0,"return":0},
                      "2":{"races":0,"hits":0,"bets":0,"stake":0,"return":0},
                      "3":{"races":0,"hits":0,"bets":0,"stake":0,"return":0},
@@ -782,24 +881,21 @@ def summarize_today_and_notify(targets: List[str]):
         per_strategy[strategy]["bets"]  += len(tickets)
         per_strategy[strategy]["stake"] += int(total)
 
-        # 払戻判定
-        paymap = fetch_payoff_map(race_id)  # {券種:[(組番, 払戻円)]}
+        paymap = fetch_payoff_map(race_id)
         winners = { _normalize_ticket_for_kind(comb, bet_kind) : pay for (comb, pay) in paymap.get(bet_kind, []) }
         for t in tickets:
             norm=_normalize_ticket_for_kind(t, bet_kind)
             if norm in winners:
                 per_strategy[strategy]["hits"]   += 1
-                per_strategy[strategy]["return"] += winners[norm]  # 100円基準を想定
+                per_strategy[strategy]["return"] += winners[norm]
 
         time.sleep(0.2)
 
-    # 総計
     total_stake=sum(v["stake"] for v in per_strategy.values())
     total_return=sum(v["return"] for v in per_strategy.values())
 
     def pct(n,d): return f"{(100.0*n/d):.1f}%" if d>0 else "0.0%"
 
-    # 通知本文
     lines=[]
     lines.append("📊【本日の検証結果】")
     lines.append(f"日付：{today[:4]}/{today[4:6]}/{today[6:]}")
@@ -820,7 +916,7 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     p=pathlib.Path(__file__).resolve()
     sha=hashlib.sha1(p.read_bytes()).hexdigest()[:12]
-    logging.info(f"[BUILD] file={p} sha1={sha} v2025-08-13F")
+    logging.info(f"[BUILD] file={p} sha1={sha} v2025-08-13G")
 
     if KILL_SWITCH: logging.info("[INFO] KILL_SWITCH=True"); return
 
@@ -838,11 +934,9 @@ def main():
 
     # 稼働時間内で通常監視
     if within_operating_hours():
-        # 永続TTL
         try: notified=sheet_load_notified()
         except Exception as e:
             logging.exception("[ERROR] TTLロード失敗: %s", e); notified={}
-        # RACEID 列挙
         if DEBUG_RACEIDS:
             target_raceids=[rid for rid in DEBUG_RACEIDS if not PLACEHOLDER.search(rid)]
             post_time_map={}
@@ -860,7 +954,6 @@ def main():
 
         for rid in target_raceids:
             if rid in seen_in_this_run: continue
-            # 抑制
             now_ts=time.time()
             cd_ts=notified.get(f"{rid}:cd")
             if cd_ts and (now_ts-cd_ts)<NOTIFY_COOLDOWN_SEC: continue
@@ -868,10 +961,9 @@ def main():
             if ts and (now_ts-ts)<NOTIFY_TTL_SEC: continue
 
             post_time=post_time_map.get(rid)
-            via="list"
             if not post_time:
                 got=fallback_post_time_for_rid(rid)
-                if got: post_time, via, url = got
+                if got: post_time, _, _ = got
                 else: continue
 
             now=now_jst()
@@ -904,7 +996,6 @@ def main():
             if isinstance(raw_tickets, str):
                 raw_tickets=[s.strip() for s in raw_tickets.split(",") if s.strip()]
 
-            # 送信用メッセージ & 記録用馬番
             if str(strategy_text).startswith("③"):
                 message=build_line_notification_strategy3(strategy, venue_disp, race_no, time_label, time_hm, odds_hm, meta["url"], horses)
                 tickets_umaban = strategy.get("tickets", [])
@@ -915,10 +1006,8 @@ def main():
                 tickets_umaban=_tickets_pop_to_umaban(raw_tickets, horses)
                 bet_kind = STRATEGY_BET_KIND.get(str(pattern_no), "三連単")
 
-            # LINE送信
             sent_ok, http_status = notify_strategy_hit_to_many(message, targets)
 
-            # TTL/記録
             now_epoch=time.time()
             if sent_ok:
                 try:
@@ -926,14 +1015,11 @@ def main():
                 except Exception as e:
                     logging.exception("[ERROR] TTL更新失敗: %s", e)
                 seen_in_this_run.add(rid)
-
-                # ★NEW: betsに記録
                 try:
                     ymd=now_jst().strftime("%Y%m%d")
                     sheet_append_bet_record(ymd, rid, venue_disp, race_no, pattern_no, bet_kind, tickets_umaban or [])
                 except Exception as e:
                     logging.exception("[ERROR] bets記録失敗: %s", e)
-
             elif http_status==429:
                 try:
                     key_cd=f"{rid}:cd"; sheet_upsert_notified(key_cd, now_epoch, note=f"429 cooldown {meta['venue_race']} {post_time:%H:%M}")
@@ -944,10 +1030,9 @@ def main():
 
         logging.info(f"[INFO] HITS={hits} / MATCHES={matches}")
 
-    # ★NEW: 終業タイミングなら日次サマリ送信
+    # 終業後にサマリ
     try:
-        nowH=now_jst().hour
-        if nowH >= END_HOUR:
+        if now_jst().hour >= END_HOUR:
             summarize_today_and_notify(targets)
     except Exception as e:
         logging.exception("[ERROR] 日次サマリ送信失敗: %s", e)
