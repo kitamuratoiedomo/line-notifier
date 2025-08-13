@@ -1,15 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-Rakuten競馬 監視・通知バッチ
+Rakuten競馬 監視・通知バッチ（騎手ランク対応版）
 - 一覧で発走時刻取得
 - 詳細/オッズ フォールバック（RIDアンカー近傍 & 「発走」文脈優先、ノイズ語除外）
 - 窓内1回通知 / 429クールダウン / Sheet永続TTL
 - 通知先：Googleシート(タブA=名称「1」)のH列から userId を収集
 - 通知の「買い目」を 人気順＋馬番 の両表示に対応
 - 戦略③は専用フォーマット（1軸・相手10〜20倍・馬番買い目・候補最大4頭・点数表示）
+- NEW: 騎手列パース / 騎手ランク(A/B/C)表示（A=1-70位, B=71-200位, C=その他）
 """
 
-import os, re, json, time, random, logging, pathlib, hashlib
+import os, re, json, time, random, logging, pathlib, hashlib, unicodedata
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional, Tuple, Set
 
@@ -80,6 +81,44 @@ PLACEHOLDER = re.compile(r"\d{8}0000000000$")
 # ノイズ／優先ラベル
 IGNORE_NEAR_PAT = re.compile(r"(現在|更新|発売|締切|投票|オッズ|確定|払戻|実況)")
 LABEL_NEAR_PAT  = re.compile(r"(発走|発走予定|発走時刻|発送|出走)")
+
+# ========= 騎手ランク（1〜100位を内蔵。以降は必要に応じて追記） =========
+# 例：A=1-70位、B=71-200位、C=その他
+JOCKEY_RANK_TABLE_RAW: Dict[int, str] = {
+    1:"笹川翼",2:"矢野貴之",3:"塚本征吾",4:"小牧太",5:"山本聡哉",6:"野畑凌",7:"石川倭",8:"永森大智",9:"中島龍也",10:"吉原寛人",
+    11:"広瀬航",12:"加藤聡一",13:"望月洵輝",14:"鈴木恵介",15:"渡辺竜也",16:"落合玄太",17:"山口勲",18:"本田正重",19:"吉村智洋",20:"赤岡修次",
+    21:"岡部誠",22:"高松亮",23:"飛田愛斗",24:"西将太",25:"御神本訓史",26:"下原理",27:"山本政聡",28:"今井貴大",29:"筒井勇介",30:"山田義貴",
+    31:"丸野勝虎",32:"青柳正義",33:"渡来心路",34:"今井千尋",35:"和田譲治",36:"井上瑛太",37:"多田羅誠也",38:"金田利貴",39:"塚本涼人",40:"宮下瞳",
+    41:"栗原大河",42:"西謙一",43:"西啓太",44:"長澤幸太",45:"山中悠希",46:"菊池一樹",47:"町田直希",48:"石川慎将",49:"菅原辰徳",50:"島津新",
+    51:"阿部龍",52:"小野楓馬",53:"赤塚健仁",54:"加藤翔馬",55:"杉浦健太",56:"張田昂",57:"桑村真明",58:"山本聡紀",59:"吉井章",60:"大畑慧悟",
+    61:"柴田勇真",62:"大畑雅章",63:"笹田知宏",64:"細川智史",65:"金山昇馬",66:"岩本怜",67:"岡遼太郎",68:"岡村卓弥",69:"中原蓮",70:"藤本匠",
+    71:"高橋悠里",72:"土方颯太",73:"長谷部駿弥",74:"高橋愛叶",75:"及川裕一",76:"加茂飛翔",77:"川原正一",78:"村上忍",79:"岡村健司",80:"田野豊三",
+    81:"村上弘樹",82:"山崎誠士",83:"竹吉徹",84:"宮内勇樹",85:"船山蔵人",86:"中村太陽",87:"本橋孝太",88:"出水拓人",89:"新庄海誠",90:"山崎雅由",
+    91:"阿部武臣",92:"安藤洋一",93:"小林凌",94:"友森翔太郎",95:"福原杏",96:"岩橋勇二",97:"佐々木志音",98:"木之前葵",99:"藤田凌",100:"佐野遥久",
+}
+def _normalize_name(s: str) -> str:
+    if not s: return ""
+    s = unicodedata.normalize("NFKC", s)
+    s = s.replace(" ", "").replace("\u3000", "")
+    return s
+
+# 正規化済テーブル（名前→順位）
+_JOCKEY_NAME_TO_RANK: Dict[str, int] = { _normalize_name(v): k for k, v in JOCKEY_RANK_TABLE_RAW.items() }
+
+def jockey_rank_letter_by_name(name: Optional[str]) -> str:
+    """
+    騎手名から A/B/C を返す（A=1-70, B=71-200, C=その他 or 不明）
+    """
+    if not name:
+        return "—"
+    rank = _JOCKEY_NAME_TO_RANK.get(_normalize_name(name))
+    if rank is None:
+        return "C"  # 未登録はC扱い（必要に応じてテーブル拡張）
+    if 1 <= rank <= 70:
+        return "A"
+    if 71 <= rank <= 200:
+        return "B"
+    return "C"
 
 # ========= 共通 =========
 def now_jst() -> datetime:
@@ -413,7 +452,7 @@ def _as_int(text: str) -> Optional[int]:
 
 def _find_popular_odds_table(soup: BeautifulSoup) -> Tuple[Optional[BeautifulSoup], Dict[str, int]]:
     """
-    人気列(pop)、単勝オッズ列(win)に加え、馬番列(num)も特定する
+    人気列(pop)、単勝オッズ列(win)、馬番列(num)、騎手列(jockey) を特定
     """
     for table in soup.find_all("table"):
         thead = table.find("thead")
@@ -450,6 +489,12 @@ def _find_popular_odds_table(soup: BeautifulSoup) -> Tuple[Optional[BeautifulSou
                 if ("馬" in h) and ("馬名" not in h) and (i != pop_idx):
                     num_idx = i; break
 
+        # 騎手列
+        jockey_idx = None
+        for i, h in enumerate(headers):
+            if "騎手" in h:
+                jockey_idx = i; break
+
         if pop_idx is None or win_idx is None:
             continue
 
@@ -471,8 +516,8 @@ def _find_popular_odds_table(soup: BeautifulSoup) -> Tuple[Optional[BeautifulSou
                 tds = tr.find_all(["td", "th"])
                 if len(tds) > win_idx:
                     sample.append(tds[win_idx].get_text(" ", strip=True))
-            logging.info(f"[DEBUG] headers={headers} / pop_idx={pop_idx} / win_idx={win_idx} / num_idx={num_idx} / win_samples={sample}")
-            return table, {"pop": pop_idx, "win": win_idx, "num": num_idx if num_idx is not None else -1}
+            logging.info(f"[DEBUG] headers={headers} / pop_idx={pop_idx} / win_idx={win_idx} / num_idx={num_idx} / jockey_idx={jockey_idx} / win_samples={sample}")
+            return table, {"pop": pop_idx, "win": win_idx, "num": num_idx if num_idx is not None else -1, "jockey": jockey_idx if jockey_idx is not None else -1}
     return None, {}
 
 def parse_odds_table(soup: BeautifulSoup) -> Tuple[List[Dict[str, float]], Optional[str], Optional[str]]:
@@ -484,7 +529,7 @@ def parse_odds_table(soup: BeautifulSoup) -> Tuple[List[Dict[str, float]], Optio
     if not table:
         return [], venue_race, now_label
 
-    pop_idx = idx["pop"]; win_idx = idx["win"]; num_idx = idx.get("num", -1)
+    pop_idx = idx["pop"]; win_idx = idx["win"]; num_idx = idx.get("num", -1); jockey_idx = idx.get("jockey", -1)
     horses: List[Dict[str, float]] = []
     body = table.find("tbody") or table
     for tr in body.find_all("tr"):
@@ -506,9 +551,16 @@ def parse_odds_table(soup: BeautifulSoup) -> Tuple[List[Dict[str, float]], Optio
         if 0 <= num_idx < len(tds):
             num = _as_int(tds[num_idx].get_text(" ", strip=True))
 
+        # 騎手名（あれば）
+        jockey = None
+        if 0 <= jockey_idx < len(tds):
+            jt = tds[jockey_idx].get_text(" ", strip=True)
+            # 体重などが付く場合は手前を採用
+            jockey = re.split(r"[（( ]", jt)[0].strip() if jt else None
+
         rec = {"pop": pop, "odds": float(odds)}
-        if num is not None:
-            rec["num"] = num
+        if num is not None: rec["num"] = num
+        if jockey: rec["jockey"] = jockey
         horses.append(rec)
 
     # 人気でユニーク化
@@ -841,15 +893,16 @@ def _format_bets_pop_and_umanum(bets: List[str], horses: List[Dict[str, float]])
         out.append(" - ".join(segs))
     return out
 
-def _map_pop_to_num_and_odds(horses: List[Dict[str, float]]) -> Dict[int, Tuple[Optional[int], Optional[float]]]:
-    """人気→(馬番, 単勝オッズ)"""
-    m: Dict[int, Tuple[Optional[int], Optional[float]]] = {}
+def _map_pop_to_info(horses: List[Dict[str, float]]) -> Dict[int, Dict[str, Optional[float]]]:
+    """人気→ {umaban, odds, jockey}"""
+    m: Dict[int, Dict[str, Optional[float]]] = {}
     for h in horses:
         try:
             p = int(h.get("pop"))
             num = h.get("num") if isinstance(h.get("num"), int) else None
             o = float(h.get("odds")) if h.get("odds") is not None else None
-            m[p] = (num, o)
+            j = h.get("jockey") or None
+            m[p] = {"umaban": num, "odds": o, "jockey": j}
         except Exception:
             continue
     return m
@@ -891,14 +944,16 @@ def build_line_notification_strategy3(
     horses: List[Dict[str, float]],
 ) -> str:
     """
-    戦略③専用：馬番入りの買い目と候補リストを表示
+    戦略③専用：馬番入りの買い目と候補リストを表示（騎手ランク付き）
     - eval_strategy が axis/candidates/tickets を返していない場合でも、horses から復元
     """
-    pop2 = _map_pop_to_num_and_odds(horses)
+    pop2 = _map_pop_to_info(horses)
     # 軸（1番人気）
     axis = strategy.get("axis") or {}
-    axis_num = axis.get("umaban") or (pop2.get(1, (None, None))[0])
-    axis_odds = axis.get("odds") if axis.get("odds") is not None else pop2.get(1, (None, None))[1]
+    axis_num = axis.get("umaban") or (pop2.get(1, {}).get("umaban"))
+    axis_odds = axis.get("odds") if axis.get("odds") is not None else pop2.get(1, {}).get("odds")
+    axis_jockey = axis.get("jockey") or pop2.get(1, {}).get("jockey")
+    axis_rank = f"騎手ランク{jockey_rank_letter_by_name(axis_jockey)}" if axis_jockey else "騎手ランク—"
 
     # 候補
     cands = strategy.get("candidates")
@@ -910,7 +965,7 @@ def build_line_notification_strategy3(
                 p = int(h.get("pop")); o = float(h.get("odds"))
                 if p == 1: continue
                 if 10.0 <= o <= 20.0:
-                    cands_list.append({"pop": p, "odds": o, "umaban": h.get("num")})
+                    cands_list.append({"pop": p, "odds": o, "umaban": h.get("num"), "jockey": h.get("jockey")})
                     if len(cands_list) >= 4: break
             except Exception:
                 continue
@@ -939,13 +994,20 @@ def build_line_notification_strategy3(
     )
     n = len(cands_sorted)
     pts = n * (n - 1) if n >= 2 else 0
-    cand_lines = "\n".join([
-        f"    ・{c['pop']}番人気（馬番 {c.get('umaban','—')}／{c.get('odds',0):.1f}倍）"
-        for c in cands_sorted
-    ]) if cands_sorted else "    ・—"
+
+    def _cand_line(c: Dict) -> str:
+        jrank = f"／騎手ランク{jockey_rank_letter_by_name(c.get('jockey'))}" if c.get("jockey") else ""
+        um = c.get('umaban', '—')
+        od = f"{c.get('odds',0):.1f}倍" if c.get('odds') is not None else "—"
+        return f"    ・{c['pop']}番人気（馬番 {um}／{od}{jrank}）"
+
+    cand_lines = "\n".join([_cand_line(c) for c in cands_sorted]) if cands_sorted else "    ・—"
 
     tickets_str = ", ".join(tickets) if tickets else "—"
-    axis_str = f"1番人気（馬番 {axis_num if axis_num is not None else '—'}／{axis_odds:.1f}倍）" if axis_odds is not None else f"1番人気（馬番 {axis_num if axis_num is not None else '—'}）"
+    if axis_odds is not None:
+        axis_str = f"1番人気（馬番 {axis_num if axis_num is not None else '—'}／{axis_odds:.1f}倍／{axis_rank}）"
+    else:
+        axis_str = f"1番人気（馬番 {axis_num if axis_num is not None else '—'}／{axis_rank}）"
 
     lines = [
         f"【{title}】",
@@ -975,7 +1037,7 @@ def main():
     # ビルド識別
     p = pathlib.Path(__file__).resolve()
     sha = hashlib.sha1(p.read_bytes()).hexdigest()[:12]
-    logging.info(f"[BUILD] file={p} mtime={p.stat().st_mtime:.0f} sha1={sha} Fallback=ON v2025-08-13B")
+    logging.info(f"[BUILD] file={p} mtime={p.stat().st_mtime:.0f} sha1={sha} Fallback=ON v2025-08-13C")
 
     if KILL_SWITCH:
         logging.info("[INFO] KILL_SWITCH=True のため終了"); return
@@ -1069,7 +1131,9 @@ def main():
 
         try:
             odds_log = ", ".join([
-                f"{h.get('pop')}番人気:単{h.get('odds')}" + (f"/馬番{h.get('num')}" if 'num' in h else "")
+                f"{h.get('pop')}番人気:単{h.get('odds')}" +
+                (f"/馬番{h.get('num')}" if 'num' in h else "") +
+                (f"/騎手{h.get('jockey')}" if 'jockey' in h else "")
                 for h in sorted(horses, key=lambda x: x['pop'])
             ])
         except Exception:
@@ -1097,7 +1161,7 @@ def main():
             if isinstance(raw_tickets, str):
                 raw_tickets = [s.strip() for s in raw_tickets.split(",") if s.strip()]
 
-            # ③は専用フォーマット（馬番入り買い目 & 候補）
+            # ③は専用フォーマット（馬番入り買い目 & 候補 & 騎手ランク）
             if str(strategy_text).startswith("③"):
                 message = build_line_notification_strategy3(
                     strategy=strategy,
