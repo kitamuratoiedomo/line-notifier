@@ -5,6 +5,7 @@ Rakuten競馬 監視・通知バッチ
 - 詳細/オッズ フォールバック（RIDアンカー近傍 & 「発走」文脈優先、ノイズ語除外）
 - 窓内1回通知 / 429クールダウン / Sheet永続TTL
 - 通知先：Googleシート(タブA=名称「1」)のH列から userId を収集
+- 通知の「買い目」を 人気順＋馬番 の両表示に対応
 """
 
 import os, re, json, time, random, logging, pathlib, hashlib
@@ -59,7 +60,7 @@ LINE_USER_IDS       = [s.strip() for s in os.getenv("LINE_USER_IDS", "").split("
 
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "")
 GOOGLE_SHEET_ID         = os.getenv("GOOGLE_SHEET_ID", "")
-# TTL管理タブ（名前 or gid）。あなたの運用では「2」(名前) か 1830595589(gid)
+# TTL管理タブ（名前 or gid）
 GOOGLE_SHEET_TAB        = os.getenv("GOOGLE_SHEET_TAB", "notified")
 
 # 送信先ユーザーを読むタブA（=「1」）と列（=H）
@@ -403,7 +404,16 @@ def _as_float(text: str) -> Optional[float]:
     m = re.search(r"\d+(?:\.\d+)?", t)
     return float(m.group(0)) if m else None
 
+def _as_int(text: str) -> Optional[int]:
+    if not text:
+        return None
+    m = re.search(r"\d+", text)
+    return int(m.group(0)) if m else None
+
 def _find_popular_odds_table(soup: BeautifulSoup) -> Tuple[Optional[BeautifulSoup], Dict[str, int]]:
+    """
+    人気列(pop)、単勝オッズ列(win)に加え、馬番列(num)も特定する
+    """
     for table in soup.find_all("table"):
         thead = table.find("thead")
         if not thead:
@@ -412,10 +422,14 @@ def _find_popular_odds_table(soup: BeautifulSoup) -> Tuple[Optional[BeautifulSou
         headers = [_clean(th.get_text()) for th in ths]
         if not headers:
             continue
+
+        # 人気列
         pop_idx = None
         for i, h in enumerate(headers):
             if h in ("人気", "順位") or ("人気" in h and "順" not in h):
                 pop_idx = i; break
+
+        # 単勝オッズ列（優先度: 完全一致「単勝」> 部分一致 > 「オッズ」）
         win_candidates = []
         for i, h in enumerate(headers):
             if ("複" in h) or ("率" in h) or ("%" in h): continue
@@ -423,8 +437,22 @@ def _find_popular_odds_table(soup: BeautifulSoup) -> Tuple[Optional[BeautifulSou
             elif "単勝" in h: win_candidates.append((1, i))
             elif "オッズ" in h: win_candidates.append((2, i))
         win_idx = sorted(win_candidates, key=lambda x: x[0])[0][1] if win_candidates else None
+
+        # 馬番列
+        num_idx = None
+        for i, h in enumerate(headers):
+            if h == "馬番" or "馬番" in h:
+                num_idx = i; break
+        if num_idx is None:
+            # 予備: 「馬」含むが「馬名」ではない列を候補に
+            for i, h in enumerate(headers):
+                if ("馬" in h) and ("馬名" not in h) and (i != pop_idx):
+                    num_idx = i; break
+
         if pop_idx is None or win_idx is None:
             continue
+
+        # テーブルっぽさの軽い検証（人気1→2の昇順が2行以上）
         body = table.find("tbody") or table
         rows = body.find_all("tr")
         seq_ok, last = 0, 0
@@ -442,8 +470,8 @@ def _find_popular_odds_table(soup: BeautifulSoup) -> Tuple[Optional[BeautifulSou
                 tds = tr.find_all(["td", "th"])
                 if len(tds) > win_idx:
                     sample.append(tds[win_idx].get_text(" ", strip=True))
-            logging.info(f"[DEBUG] headers={headers} / pop_idx={pop_idx} / win_idx={win_idx} / win_samples={sample}")
-            return table, {"pop": pop_idx, "win": win_idx}
+            logging.info(f"[DEBUG] headers={headers} / pop_idx={pop_idx} / win_idx={win_idx} / num_idx={num_idx} / win_samples={sample}")
+            return table, {"pop": pop_idx, "win": win_idx, "num": num_idx if num_idx is not None else -1}
     return None, {}
 
 def parse_odds_table(soup: BeautifulSoup) -> Tuple[List[Dict[str, float]], Optional[str], Optional[str]]:
@@ -455,20 +483,34 @@ def parse_odds_table(soup: BeautifulSoup) -> Tuple[List[Dict[str, float]], Optio
     if not table:
         return [], venue_race, now_label
 
-    pop_idx = idx["pop"]; win_idx = idx["win"]
+    pop_idx = idx["pop"]; win_idx = idx["win"]; num_idx = idx.get("num", -1)
     horses: List[Dict[str, float]] = []
     body = table.find("tbody") or table
     for tr in body.find_all("tr"):
         tds = tr.find_all(["td", "th"])
         if len(tds) <= max(pop_idx, win_idx): continue
+
+        # 人気
         pop_txt = tds[pop_idx].get_text(strip=True)
         if not pop_txt.isdigit(): continue
         pop = int(pop_txt)
         if not (1 <= pop <= 30): continue
+
+        # 単勝オッズ
         odds = _as_float(tds[win_idx].get_text(" ", strip=True))
         if odds is None: continue
-        horses.append({"pop": pop, "odds": float(odds)})
 
+        # 馬番（あれば）
+        num = None
+        if 0 <= num_idx < len(tds):
+            num = _as_int(tds[num_idx].get_text(" ", strip=True))
+
+        rec = {"pop": pop, "odds": float(odds)}
+        if num is not None:
+            rec["num"] = num
+        horses.append(rec)
+
+    # 人気でユニーク化
     uniq = {}
     for h in sorted(horses, key=lambda x: x["pop"]):
         uniq[h["pop"]] = h
@@ -714,7 +756,7 @@ def notify_strategy_hit_to_many(message_text: str, targets: List[str]):
         time.sleep(0.2)  # 軽い間隔（429対策）
     return all_ok, last_status
 
-# ========= 通知メッセージ生成（回収率・的中率なし） =========
+# ========= 通知メッセージ整形 =========
 _CIRCLED = "①②③④⑤⑥⑦⑧⑨"
 def _circled(n: int) -> str:
     return _CIRCLED[n-1] if 1 <= n <= 9 else f"{n}."
@@ -757,6 +799,47 @@ def _split_venue_race(venue_race: str) -> Tuple[str, str]:
         return venue_disp, race
     return venue_race, ""
 
+def _parse_ticket_as_pops(ticket: str) -> List[int]:
+    """'1-2-3' → [1,2,3]（人気順位として解釈）"""
+    parts = [p.strip() for p in re.split(r"[-→>〜~]", str(ticket)) if p.strip()]
+    pops: List[int] = []
+    for p in parts:
+        m = re.search(r"\d+", p)
+        if not m: continue
+        try:
+            pops.append(int(m.group(0)))
+        except:
+            pass
+    return pops
+
+def _format_bets_pop_and_umanum(bets: List[str], horses: List[Dict[str, float]]) -> List[str]:
+    """
+    eval_strategy の買い目（人気順位ベースと想定）を、
+    「X番人気（馬番 Y）」の連結表示へ変換
+    """
+    # 人気→馬番のマップ
+    pop2num: Dict[int, Optional[int]] = {}
+    for h in horses:
+        pop = int(h.get("pop"))
+        num = h.get("num")  # ない場合もある
+        pop2num[pop] = int(num) if isinstance(num, int) else None
+
+    out: List[str] = []
+    for bet in bets:
+        pops = _parse_ticket_as_pops(bet)
+        if not pops:
+            out.append(bet)  # 形式が違う場合はそのまま
+            continue
+        segs: List[str] = []
+        for p in pops:
+            n = pop2num.get(p)
+            if n is None:
+                segs.append(f"{p}番人気")
+            else:
+                segs.append(f"{p}番人気（馬番 {n}）")
+        out.append(" - ".join(segs))
+    return out
+
 def build_line_notification(
     pattern_no: int,
     venue: str,
@@ -790,7 +873,7 @@ def main():
     # ビルド識別
     p = pathlib.Path(__file__).resolve()
     sha = hashlib.sha1(p.read_bytes()).hexdigest()[:12]
-    logging.info(f"[BUILD] file={p} mtime={p.stat().st_mtime:.0f} sha1={sha} Fallback=ON v2025-08-12E")
+    logging.info(f"[BUILD] file={p} mtime={p.stat().st_mtime:.0f} sha1={sha} Fallback=ON v2025-08-13A")
 
     if KILL_SWITCH:
         logging.info("[INFO] KILL_SWITCH=True のため終了"); return
@@ -815,7 +898,7 @@ def main():
         targets = fb
         logging.info("[INFO] フォールバック送信ターゲット数: %d", len(targets))
 
-    # 永続TTLロード（タブB=「2」相当）
+    # 永続TTLロード
     try:
         notified = sheet_load_notified()
     except Exception as e:
@@ -883,7 +966,10 @@ def main():
             time.sleep(random.uniform(*SLEEP_BETWEEN)); continue
 
         try:
-            odds_log = ", ".join([f"{h['pop']}番人気:{h['odds']}" for h in sorted(horses, key=lambda x: x['pop'])])
+            odds_log = ", ".join([
+                f"{h.get('pop')}番人気:単{h.get('odds')}" + (f"/馬番{h.get('num')}" if 'num' in h else "")
+                for h in sorted(horses, key=lambda x: x['pop'])
+            ])
         except Exception:
             odds_log = str(horses)
         logging.info(f"[DEBUG] {rid} 取得オッズ: {odds_log}")
@@ -905,9 +991,12 @@ def main():
 
             odds_hm = _extract_hhmm_label(meta.get("now", ""))
 
-            tickets = strategy.get("tickets", [])
-            if isinstance(tickets, str):
-                tickets = [s.strip() for s in tickets.split(",") if s.strip()]
+            raw_tickets = strategy.get("tickets", [])
+            if isinstance(raw_tickets, str):
+                raw_tickets = [s.strip() for s in raw_tickets.split(",") if s.strip()]
+
+            # ここで「人気＋馬番」表記へ
+            pretty_tickets = _format_bets_pop_and_umanum(raw_tickets, horses)
 
             message = build_line_notification(
                 pattern_no=pattern_no,
@@ -916,13 +1005,13 @@ def main():
                 time_label=time_label,
                 time_hm=time_hm,
                 condition_text=condition_text,
-                bets=tickets,
+                bets=pretty_tickets,
                 odds_timestamp_hm=odds_hm,
                 odds_url=meta["url"],
             )
 
             # ログ詳細
-            ticket_str = ", ".join(tickets)
+            ticket_str = ", ".join(pretty_tickets)
             detail = f"{strategy_text} / 買い目: {ticket_str}"
             if "roi" in strategy or "hit" in strategy:
                 detail += f" / {strategy.get('roi','-')} / {strategy.get('hit','-')}"
