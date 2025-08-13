@@ -357,7 +357,7 @@ def collect_post_time_map(ymd: str, ymd_next: str) -> Dict[str, datetime]:
             logging.warning(f"[WARN] 発走一覧読み込み失敗: {e} ({url})")
     _merge_from(f"https://keiba.rakuten.co.jp/race_card/list/RACEID/{ymd}0000000000")
     _merge_from(f"https://keiba.rakuten.co.jp/race_card/list/RACEID/{ymd_next}0000000000")
-    logging.info(f"[INFO] 発走時刻取得: {len(post_map)件}")
+    logging.info(f"[INFO] 発走時刻取得: {len(post_map)}件")
     return post_map
 
 # ========= オッズ解析（単複ページ） =========
