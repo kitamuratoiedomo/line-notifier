@@ -23,8 +23,15 @@ import requests
 from bs4 import BeautifulSoup, Tag
 from strategy_rules import eval_strategy
 
-# 追加：通知ログ用
-from utils_notify_log import append_notify_log
+# --- 通知ログ append のフォールバック付き import ---
+try:
+    from utils_notify_log import append_notify_log
+except ModuleNotFoundError:
+    import logging as _logging
+    def append_notify_log(*args, **kwargs):
+        _logging.warning("[WARN] utils_notify_log が見つからないため、通知ログの追記をスキップします。")
+
+# 日付ユーティリティ
 from utils_summary import jst_today_str, jst_now
 
 # ===== Google Sheets =====
@@ -631,7 +638,7 @@ def notify_strategy_hit_to_many(message_text: str, targets: List[str]):
 _CIRCLED="①②③④⑤⑥⑦⑧⑨"
 def _circled(n:int)->str: return _CIRCLED[n-1] if 1<=n<=9 else f"{n}."
 def _extract_hhmm_label(s:str)->Optional[str]:
-    got=_norm_hhmm_from_text(s); 
+    got=_norm_hhmm_from_text(s)
     if not got: return None
     hh,mm,_=got; return f"{hh:02d}:{mm:02d}"
 def _infer_pattern_no(strategy_text: str) -> int:
@@ -830,9 +837,10 @@ def summarize_today_and_notify(targets: List[str]):
     for r in records:
         date_ymd, race_id, venue, race_no, strategy, bet_kind, t_csv, points, unit, total = r[:10]
         if (race_id, strategy) not in seen_race_strategy:
-            seen_race_strategy.add((race_id, strategy))
-            per_strategy[strategy]["races"] += 1
+            seen_in_this = (race_id, strategy)
+            seen_race_strategy.add(seen_in_this)
         tickets=[t for t in t_csv.split(",") if t]
+        per_strategy[strategy]["races"] += 1
         per_strategy[strategy]["bets"]  += len(tickets)
         per_strategy[strategy]["stake"] += int(total)
 
@@ -1005,15 +1013,14 @@ def main():
 
         logging.info(f"[INFO] HITS={hits} / MATCHES={matches}")
 
-    
-    
-    # 追加：通知ログ用
-　　　try:
-         from utils_notify_log import append_notify_log
-　　　except ModuleNotFoundError:
-    import logging
-    def append_notify_log(*args, **kwargs):
-        logging.warning("[WARN] append_notify_log が見つからないため、通知ログの追記をスキップします。")
+    # 終業後にサマリ
+    try:
+        if now_jst().hour >= END_HOUR:
+            summarize_today_and_notify(targets)
+    except Exception as e:
+        logging.exception("[ERROR] 日次サマリ送信失敗: %s", e)
+
+    logging.info("[INFO] ジョブ終了")
 
 # ========= 常駐ループ =========
 def run_watcher_forever(interval_sec: int = int(os.getenv("WATCHER_INTERVAL_SEC", "60"))):
