@@ -1,7 +1,25 @@
+# -*- coding: utf-8 -*-
+"""
+戦略①〜④の判定ロジック（デバッグログ付き）
+- 入力: horses = [{"pop":1, "odds":2.4, "num": 4}, ...]
+  * pop: 人気（1始まり）
+  * odds: 単勝オッズ（float）
+  * num: 馬番（int）  ※ページから取れない場合は欠損あり
+- 出力: 合致した戦略のディクショナリ
+    {
+      "strategy": str,
+      "tickets": List[str],          # 戦略③は馬番ベース "4-6-8" など（umaban）
+      "axis": {"pop":1,"umaban":4,"odds":1.4},               # ③のみ
+      "candidates": [{"pop":3,"umaban":6,"odds":12.3}, ...], # ③のみ（最大4頭）
+      "roi": "想定回収率: —",
+      "hit": "的中率: —",
+    }
+"""
+
 from typing import Dict, List, Optional
 
 def _odds_map(horses: List[Dict]) -> Dict[int, float]:
-    """人気→単勝オッズの辞書（1始まり）。不足は None。"""
+    """人気→単勝オッズの辞書（1始まり）。"""
     m: Dict[int, float] = {}
     for h in horses:
         try:
@@ -16,13 +34,13 @@ def _odds_map(horses: List[Dict]) -> Dict[int, float]:
 def _fmt(o: Optional[float]) -> str:
     return "—" if o is None else f"{o:.1f}"
 
-def _pick_candidates_10_20(horses: List[Dict]) -> List[int]:
+def _pick_candidates_10_20(horses: List[Dict]) -> List[Dict]:
     """
-    相手候補：単勝オッズが10.0〜20.0（両端含む）の馬を人気順で抽出（1番人気は除外）。
-    返り値は「人気(pop)のリスト」。最大4頭に制限。
+    相手候補：単勝オッズが10.0〜20.0（両端含む）の馬を人気昇順で抽出（1番人気は除外）。
+    戻り値は辞書の配列: [{"pop":pop, "odds":odds, "umaban":num}, ...]
+    最大4頭に制限。
     """
-    # popularity (pop) 昇順でソートされたエントリを走査
-    filtered = []
+    out = []
     for h in sorted(horses, key=lambda x: int(x.get("pop", 999))):
         try:
             pop = int(h.get("pop"))
@@ -30,49 +48,59 @@ def _pick_candidates_10_20(horses: List[Dict]) -> List[int]:
         except Exception:
             continue
         if pop == 1:
-            continue  # 1番人気は軸なので除外
+            continue
         if 10.0 <= odds <= 20.0:
-            filtered.append(pop)
-        if len(filtered) >= 4:
-            break
-    return filtered
+            umaban = h.get("num") if isinstance(h.get("num"), int) else None
+            out.append({"pop": pop, "odds": odds, "umaban": umaban})
+            if len(out) >= 4:
+                break
+    return out
 
-def _tickets_perm_with_axis(axis_pop: int, candidates: List[int]) -> List[str]:
+def _tickets_perm_with_axis_num(axis_umaban: Optional[int], cand_umanums: List[int]) -> List[str]:
     """
-    1着を axis_pop に固定し、candidates から 2着・3着の順列を列挙（同一馬重複なし）。
-    表記は「pop番号」で統一（例: "1-2-5"）。
+    1着を axis_umaban に固定し、cand_umanums から 2着・3着の順列を列挙（同一馬重複なし）。
+    馬番ベースで "4-6-8" の形式を返す。axisが不明 or 相手<2頭なら空配列。
     """
-    tickets = []
-    for a in candidates:
-        for b in candidates:
-            if a == b:
+    if axis_umaban is None or len(cand_umanums) < 2:
+        return []
+    tickets: List[str] = []
+    for i in range(len(cand_umanums)):
+        for j in range(len(cand_umanums)):
+            if i == j:
                 continue
-            tickets.append(f"{axis_pop}-{a}-{b}")
+            a = cand_umanums[i]
+            b = cand_umanums[j]
+            tickets.append(f"{axis_umaban}-{a}-{b}")
     return tickets
 
 def _tickets_for(label: str) -> List[str]:
-    # 既存（固定テンプレ）が必要なら残す。③は動的生成に切替えるので未使用でもOK。
+    """固定テンプレ（①②④用）。③は動的生成のため未使用。"""
     if label == "②":
         return ["1-2-3", "1-3-2"]
     if label == "①":
+        # 例：BOX6点など、仕様に合わせて
         return ["1-2-3", "1-3-2", "2-1-3", "2-3-1", "3-1-2", "3-2-1"]
     if label == "④":
+        # 例：@ (1,2)→(1,2)→3 固定（ここは仮）
         return ["1-2-3", "2-1-3"]
     return []
 
 def eval_strategy(horses: List[Dict], logger=None) -> Optional[Dict]:
     """
     horses から上位人気の単勝オッズを取り、戦略①〜④のいずれかに合致すれば
-    {strategy, tickets, roi, hit} を返す。合致しなければ None。
+    {strategy, tickets, roi, hit, axis?, candidates?} を返す。合致しなければ None。
     """
     o = _odds_map(horses)
     o1, o2, o3, o4 = o.get(1), o.get(2), o.get(3), o.get(4)
 
     # デバッグ：人気上位のオッズ出力
     if logger:
-        logger.info(
-            f"[DEBUG] odds top4 → 1位={_fmt(o1)}, 2位={_fmt(o2)}, 3位={_fmt(o3)}, 4位={_fmt(o4)}"
-        )
+        try:
+            logger.info(
+                f"[DEBUG] odds top4 → 1位={_fmt(o1)}, 2位={_fmt(o2)}, 3位={_fmt(o3)}, 4位={_fmt(o4)}"
+            )
+        except Exception:
+            pass
 
     # ① 既存（例）：1〜3番人気 <10.0、1番人気は[2.0,10.0)、4番人気>=15.0
     cond1 = (
@@ -90,23 +118,53 @@ def eval_strategy(horses: List[Dict], logger=None) -> Optional[Dict]:
         (o4 is not None and o4 >= 12.0)
     )
 
-    # ③（更新版）：
+    # ③（更新版：方式A）
     #   条件：
     #     - 1番人気 <= 2.0
     #     - 2番人気 >= 10.0
-    #     - 相手候補：単勝オッズが[10.0, 20.0]の馬（1番人気除く）を人気順に最大4頭
-    #     - 相手候補が2頭以上（= 3連単の2,3着を埋められる）
-    #   買い目：
-    #     - 三連単 1番人気（1着固定）→ 相手候補 → 相手候補（重複なし）の順列
-    cond3 = False
-    tickets3: List[str] = []
+    #     - 相手候補：単勝[10.0, 20.0]（1番人気除外）を人気昇順で最大4頭
+    #     - 相手候補が2頭以上
+    #   返却：
+    #     - tickets: 馬番ベース（例 "4-6-8"）。馬番欠損時は人気ベースにフォールバック。
+    cond3, tickets3 = False, []
+    candidates3: List[Dict] = []
+    axis_info3: Optional[Dict] = None
+
     if (o1 is not None and o1 <= 2.0) and (o2 is not None and o2 >= 10.0):
-        cands = _pick_candidates_10_20(horses)  # popのリスト、最大4
+        candidates3 = _pick_candidates_10_20(horses)  # [{"pop","odds","umaban"}] 最大4
         if logger:
-            logger.info(f"[DEBUG] strategy③ candidates (pop): {cands}")
-        if len(cands) >= 2:
+            try:
+                logger.info(f"[DEBUG] strategy③ candidates (pop): {[c['pop'] for c in candidates3]}")
+            except Exception:
+                pass
+        if len(candidates3) >= 2:
             cond3 = True
-            tickets3 = _tickets_perm_with_axis(1, cands)
+
+            # 軸（1番人気）umaban 取得
+            axis_umaban = None
+            for h in horses:
+                try:
+                    if int(h.get("pop")) == 1:
+                        axis_umaban = h.get("num") if isinstance(h.get("num"), int) else None
+                        break
+                except Exception:
+                    continue
+
+            # 馬番で買い目生成（馬番が全部揃っていない場合は人気ベースにフォールバック）
+            cand_umanums = [c.get("umaban") for c in candidates3 if c.get("umaban") is not None]
+            tickets3 = _tickets_perm_with_axis_num(axis_umaban, cand_umanums)
+
+            if not tickets3:
+                # フォールバック（人気ベース: "1-2-5" 形式）
+                cand_pops = [c["pop"] for c in candidates3]
+                tickets3 = []
+                for a in cand_pops:
+                    for b in cand_pops:
+                        if a == b:
+                            continue
+                        tickets3.append(f"1-{a}-{b}")
+
+            axis_info3 = {"pop": 1, "umaban": axis_umaban, "odds": o1}
 
     # ④ 既存：1位<=3.0, 2位<=3.0, 3位が[6.0,10.0], 4位>=15.0
     cond4 = (
@@ -118,9 +176,12 @@ def eval_strategy(horses: List[Dict], logger=None) -> Optional[Dict]:
 
     # デバッグ：各条件の評価結果
     if logger:
-        logger.info("[DEBUG] checks → ①=%s, ②=%s, ③=%s, ④=%s", cond1, cond2, cond3, cond4)
+        try:
+            logger.info("[DEBUG] checks → ①=%s, ②=%s, ③=%s, ④=%s", cond1, cond2, cond3, cond4)
+        except Exception:
+            pass
 
-    # 優先順位：②→①→③→④（現状維持）
+    # 優先順位：②→①→③→④（現状のまま）
     if cond2:
         return {
             "strategy": "② 1番人気1着固定 × 2・3番人気（2点）",
@@ -138,7 +199,9 @@ def eval_strategy(horses: List[Dict], logger=None) -> Optional[Dict]:
     if cond3:
         return {
             "strategy": "③ 1軸 — 相手10〜20倍（最大4頭）",
-            "tickets": tickets3,
+            "tickets": tickets3,           # 馬番が取れれば馬番ベース／欠損時は人気ベース
+            "axis": axis_info3,            # 例: {"pop":1,"umaban":4,"odds":1.4}
+            "candidates": candidates3,     # 例: [{"pop":3,"umaban":6,"odds":12.3}, ...]（最大4）
             "roi": "想定回収率: —",
             "hit": "的中率: —",
         }
