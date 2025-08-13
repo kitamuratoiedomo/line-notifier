@@ -8,6 +8,8 @@ Rakuten競馬 監視・通知バッチ（騎手ランク対応版）
 - 通知の「買い目」を 人気順＋馬番 の両表示に対応
 - 戦略③は専用フォーマット（1軸・相手10〜20倍・馬番買い目・候補最大4頭・点数表示）
 - NEW: 騎手列パース / 騎手ランク(A/B/C)表示（A=1-70位, B=71-200位, C=その他）
+- NEW: 通知タイトルを「【戦略◯該当レース発見💡】」に統一
+- NEW: ①②④ でも各買い目に騎手ランクを付加
 """
 
 import os, re, json, time, random, logging, pathlib, hashlib, unicodedata
@@ -865,34 +867,6 @@ def _parse_ticket_as_pops(ticket: str) -> List[int]:
             pass
     return pops
 
-def _format_bets_pop_and_umanum(bets: List[str], horses: List[Dict[str, float]]) -> List[str]:
-    """
-    eval_strategy の買い目（人気順位ベースと想定）を、
-    「X番人気（馬番 Y）」の連結表示へ変換
-    """
-    # 人気→馬番のマップ
-    pop2num: Dict[int, Optional[int]] = {}
-    for h in horses:
-        pop = int(h.get("pop"))
-        num = h.get("num")  # ない場合もある
-        pop2num[pop] = int(num) if isinstance(num, int) else None
-
-    out: List[str] = []
-    for bet in bets:
-        pops = _parse_ticket_as_pops(bet)
-        if not pops:
-            out.append(bet)  # 形式が違う場合はそのまま
-            continue
-        segs: List[str] = []
-        for p in pops:
-            n = pop2num.get(p)
-            if n is None:
-                segs.append(f"{p}番人気")
-            else:
-                segs.append(f"{p}番人気（馬番 {n}）")
-        out.append(" - ".join(segs))
-    return out
-
 def _map_pop_to_info(horses: List[Dict[str, float]]) -> Dict[int, Dict[str, Optional[float]]]:
     """人気→ {umaban, odds, jockey}"""
     m: Dict[int, Dict[str, Optional[float]]] = {}
@@ -907,6 +881,30 @@ def _map_pop_to_info(horses: List[Dict[str, float]]) -> Dict[int, Dict[str, Opti
             continue
     return m
 
+def _format_bets_with_rank(bets: List[str], horses: List[Dict[str, float]]) -> List[str]:
+    """
+    eval_strategy の買い目（人気ベース）を
+    「X番人気（馬番 Y／騎手ランクZ）」に整形
+    """
+    pop2 = _map_pop_to_info(horses)
+    out: List[str] = []
+    for bet in bets:
+        pops = _parse_ticket_as_pops(bet)
+        if not pops:
+            out.append(bet); continue
+        segs: List[str] = []
+        for p in pops:
+            info = pop2.get(p, {})
+            n = info.get("umaban")
+            jk = info.get("jockey")
+            r = jockey_rank_letter_by_name(jk) if jk else "—"
+            if n is None:
+                segs.append(f"{p}番人気（騎手ランク{r}）")
+            else:
+                segs.append(f"{p}番人気（馬番 {n}／騎手ランク{r}）")
+        out.append(" - ".join(segs))
+    return out
+
 def build_line_notification(
     pattern_no: int,
     venue: str,
@@ -917,14 +915,15 @@ def build_line_notification(
     bets: List[str],
     odds_timestamp_hm: Optional[str],
     odds_url: str,
-    header_emoji: str = "🚨",
+    header_emoji: str = "💡",
 ) -> str:
+    title = f"【戦略{pattern_no if pattern_no>0 else ''}該当レース発見💡】".replace("戦略該当","戦略該当")
     lines = [
-        f"{header_emoji}【戦略{pattern_no if pattern_no>0 else ''} ヒット】".replace("戦略 ヒット","戦略ヒット"),
-        f"{venue} {race_no}（{time_label} {time_hm}）".strip(),
-        f"条件: {condition_text}",
+        title,
+        f"■レース：{venue} {race_no}（{time_label} {time_hm}）".strip(),
+        f"■条件：{condition_text}",
         "",
-        "買い目:",
+        "■買い目：",
     ]
     for i, bet in enumerate(bets, 1):
         lines.append(f"{_circled(i)} {bet}")
@@ -984,14 +983,11 @@ def build_line_notification_strategy3(
         tickets = tks
 
     # 表示用
-    title = strategy.get("strategy", "③ 1軸 — 相手10〜20倍（最大4頭）")
+    title = "【戦略③該当レース発見💡】"
     cond_line = "1番人気 ≤2.0、2番人気 ≥10.0、相手＝単勝10〜20倍（最大4頭）"
 
     # 候補整形
-    cands_sorted = sorted(
-        [c for c in cands if c.get("pop")],
-        key=lambda x: x["pop"]
-    )
+    cands_sorted = sorted([c for c in cands if c.get("pop")], key=lambda x: x["pop"])
     n = len(cands_sorted)
     pts = n * (n - 1) if n >= 2 else 0
 
@@ -1010,7 +1006,7 @@ def build_line_notification_strategy3(
         axis_str = f"1番人気（馬番 {axis_num if axis_num is not None else '—'}／{axis_rank}）"
 
     lines = [
-        f"【{title}】",
+        title,
         f"■レース：{venue} {race_no}（{time_label} {time_hm}）",
         f"■条件：{cond_line}",
         f"■買い目（3連単・1着固定）：{tickets_str}",
@@ -1037,7 +1033,7 @@ def main():
     # ビルド識別
     p = pathlib.Path(__file__).resolve()
     sha = hashlib.sha1(p.read_bytes()).hexdigest()[:12]
-    logging.info(f"[BUILD] file={p} mtime={p.stat().st_mtime:.0f} sha1={sha} Fallback=ON v2025-08-13C")
+    logging.info(f"[BUILD] file={p} mtime={p.stat().st_mtime:.0f} sha1={sha} Fallback=ON v2025-08-13D")
 
     if KILL_SWITCH:
         logging.info("[INFO] KILL_SWITCH=True のため終了"); return
@@ -1174,8 +1170,8 @@ def main():
                     horses=horses,
                 )
             else:
-                # それ以外（①②④）は従来体裁：人気＋馬番フォーマットへ変換
-                pretty_tickets = _format_bets_pop_and_umanum(raw_tickets, horses)
+                # それ以外（①②④）は人気＋馬番＋騎手ランクに整形
+                pretty_tickets = _format_bets_with_rank(raw_tickets, horses)
                 message = build_line_notification(
                     pattern_no=pattern_no,
                     venue=venue_disp,
