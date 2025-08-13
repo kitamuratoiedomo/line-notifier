@@ -999,5 +999,37 @@ def main():
 
     logging.info("[INFO] ジョブ終了")
 
-if __name__ == "__main__":
-    main()
+# ==============================================
+# main.py（変更点のみ：内部スケジューラの起動）
+# ==============================================
+"""
+from apscheduler.schedulers.background import BackgroundScheduler
+import pytz
+from daily import run_daily_summary_once, run_yesterday_catchup
+from watcher import run_watcher_forever  # 既存の常駐監視
+
+JST = pytz.timezone("Asia/Tokyo")
+
+
+def start_scheduler():
+    sch = BackgroundScheduler(timezone=JST)
+    # 確定配当の反映遅延を吸収するため 21:02 に発火
+    sch.add_job(run_daily_summary_once, 'cron', hour=21, minute=2, id='daily_summary')
+    # 前日補完（未確定があった場合の再集計）
+    sch.add_job(run_yesterday_catchup, 'cron', hour=9, minute=0, id='daily_catchup')
+    sch.start()
+
+
+if __name__ == '__main__':
+    print('[BOOT] start internal scheduler (JST)')
+    start_scheduler()
+
+    # 任意：即時実行のフラグ（デプロイ後の動作確認用）
+    import os
+    if os.getenv('RUN_DAILY_ON_BOOT') == '1':
+        run_daily_summary_once()
+
+    run_watcher_forever()
+"""
+
+# 既存の if __name__ == '__ma
