@@ -1005,14 +1005,15 @@ def main():
 
         logging.info(f"[INFO] HITS={hits} / MATCHES={matches}")
 
-    # 終業後にサマリ
-    try:
-        if now_jst().hour >= END_HOUR:
-            summarize_today_and_notify(targets)
-    except Exception as e:
-        logging.exception("[ERROR] 日次サマリ送信失敗: %s", e)
-
-    logging.info("[INFO] ジョブ終了")
+    
+    
+    # 追加：通知ログ用
+　　　try:
+         from utils_notify_log import append_notify_log
+　　　except ModuleNotFoundError:
+    import logging
+    def append_notify_log(*args, **kwargs):
+        logging.warning("[WARN] append_notify_log が見つからないため、通知ログの追記をスキップします。")
 
 # ========= 常駐ループ =========
 def run_watcher_forever(interval_sec: int = int(os.getenv("WATCHER_INTERVAL_SEC", "60"))):
