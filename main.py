@@ -967,6 +967,23 @@ def main():
                 bet_kind = STRATEGY_BET_KIND.get(str(pattern_no), "三連単")
 
             sent_ok, http_status = notify_strategy_hit_to_many(message, targets)
+            
+            from utils_notify_log import append_notify_log
+from utils_summary import jst_today_str, jst_now
+
+if sent_ok:
+    append_notify_log({
+        'date_jst': jst_today_str(),
+        'race_id': rid,
+        'strategy': str(pattern_no),
+        'stake': len(tickets_umaban) * UNIT_STAKE_YEN,
+        'bets_json': json.dumps(tickets_umaban, ensure_ascii=False),
+        'notified_at': jst_now(),
+        'jockey_ranks': "/".join([
+            jockey_rank_letter_by_name(h.get("jockey")) if h.get("jockey") else "—"
+            for h in horses[:3]  # 上位3人気
+        ]),
+    })
 
             now_epoch=time.time()
             if sent_ok:
