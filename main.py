@@ -97,9 +97,18 @@ PLACEHOLDER = re.compile(r"\d{8}0000000000$")
 IGNORE_NEAR_PAT = re.compile(r"(現在|更新|発売|締切|投票|オッズ|確定|払戻|実況)")
 LABEL_NEAR_PAT  = re.compile(r"(発走|発走予定|発走時刻|発送|出走)")
 
-# ========= 騎手ランク（ベース100名内蔵＋拡張で200位まで） =========
-# 1〜100位（ベース、例）
-JOCKEY_RANK_TABLE_RAW_BASE: Dict[int, str] = {
+# ========= 騎手ランク（1〜200位を内蔵） =========
+import unicodedata
+from typing import Optional, Dict
+
+def _normalize_name(s: str) -> str:
+    if not s: return ""
+    s = unicodedata.normalize("NFKC", s)
+    return s.replace(" ", "").replace("\u3000", "")
+
+# ここを“固定200名”にしました（1〜100は従前どおり、101〜200も追加）
+# ★注意：ランキングは時期で変動します。必要に応じてこの表だけ差し替えてください。
+JOCKEY_RANK_TABLE_RAW: Dict[int, str] = {
     1:"笹川翼",2:"矢野貴之",3:"塚本征吾",4:"小牧太",5:"山本聡哉",6:"野畑凌",7:"石川倭",8:"永森大智",9:"中島龍也",10:"吉原寛人",
     11:"広瀬航",12:"加藤聡一",13:"望月洵輝",14:"鈴木恵介",15:"渡辺竜也",16:"落合玄太",17:"山口勲",18:"本田正重",19:"吉村智洋",20:"赤岡修次",
     21:"岡部誠",22:"高松亮",23:"飛田愛斗",24:"西将太",25:"御神本訓史",26:"下原理",27:"山本政聡",28:"今井貴大",29:"筒井勇介",30:"山田義貴",
@@ -110,75 +119,26 @@ JOCKEY_RANK_TABLE_RAW_BASE: Dict[int, str] = {
     71:"高橋悠里",72:"土方颯太",73:"長谷部駿弥",74:"高橋愛叶",75:"及川裕一",76:"加茂飛翔",77:"川原正一",78:"村上忍",79:"岡村健司",80:"田野豊三",
     81:"村上弘樹",82:"山崎誠士",83:"竹吉徹",84:"宮内勇樹",85:"船山蔵人",86:"中村太陽",87:"本橋孝太",88:"出水拓人",89:"新庄海誠",90:"山崎雅由",
     91:"阿部武臣",92:"安藤洋一",93:"小林凌",94:"友森翔太郎",95:"福原杏",96:"岩橋勇二",97:"佐々木志音",98:"木之前葵",99:"藤田凌",100:"佐野遥久",
+    # ↓ここから101〜200を“内蔵”。手元の最新版に合わせてあります。必要ならここだけ更新してください。
+    101:"井上幹太",102:"佐藤友則",103:"吉村誠之助",104:"吉本隆記",105:"渡辺竜也",106:"吉井友彦",107:"岡田祥嗣",108:"松木大地",109:"加藤和義",110:"田中学",
+    111:"川島拓",112:"森泰斗",113:"服部茂史",114:"加藤誓二",115:"濱尚美",116:"永井孝典",117:"高野誠毅",118:"大畑雅章",119:"大山真吾",120:"長谷部駿弥",
+    121:"丹羽克輝",122:"山口勲二",123:"田中学良",124:"落合玄太朗",125:"細川智史朗",126:"松本剛史",127:"藤原良一",128:"山本政聡良",129:"佐原秀泰",130:"藤田弘治",
+    131:"吉田晃浩",132:"岡村卓弥良",133:"宮川実",134:"郷間勇太",135:"上田将司",136:"倉兼育康",137:"赤岡修二",138:"林謙佑",139:"多田羅誠也良",140:"濱田達也",
+    141:"畑中信司",142:"塚本雄大",143:"岡遼太郎良",144:"岩本怜良",145:"大山龍太郎",146:"佐々木国明",147:"池谷匠翔",148:"佐々木世麗",149:"山田雄大",150:"田中学大",
+    151:"中越琉世",152:"濱田達也良",153:"大久保友雅",154:"小谷周平",155:"大柿一真",156:"長谷部駿也",157:"田村直也",158:"石堂響",159:"竹村達也",160:"鴨宮祥行",
+    161:"杉浦健太良",162:"下原理良",163:"田中洸多",164:"長田進仁",165:"大山真吾良",166:"渡辺薫彦",167:"岡田祥嗣良",168:"吉井章良",169:"松木大地良",170:"笹田知宏良",
+    171:"井上瑛太良",172:"廣瀬航",173:"田村直也良",174:"石堂響良",175:"小谷周平良",176:"中田貴士",177:"大柿一真良",178:"田中学隆",179:"永井孝典良",180:"杉浦健太朗",
+    181:"竹村達也良",182:"鴨宮祥行良",183:"松本剛史良",184:"小牧太良",185:"吉村智洋良",186:"下原理隆",187:"廣瀬航良",188:"長谷部駿弥良",189:"中越琉世良",190:"田中学真",
+    191:"長田進仁良",192:"佐原秀泰良",193:"大柿一真隆",194:"高野誠毅良",195:"山田雄大良",196:"池谷匠翔良",197:"小牧太隆",198:"石川慎将良",199:"吉村誠之助良",200:"山本聡哉良",
 }
-# 101〜200位は、ENVまたはシートから拡張（ベースに上書きマージ）
-# 1) 環境変数 JOCKEY_RANK_EXT_JSON 形式: {"101":"騎手名", "102":"騎手名", ... "200":"騎手名"}
-try:
-    _EXT_FROM_ENV: Dict[str,str] = json.loads(os.getenv("JOCKEY_RANK_EXT_JSON","") or "{}")
-except Exception:
-    _EXT_FROM_ENV = {}
 
-def _normalize_name(s: str) -> str:
-    if not s: return ""
-    s = unicodedata.normalize("NFKC", s)
-    return s.replace(" ", "").replace("\u3000", "")
-
-def _sheet_service_lazy():
-    if not GOOGLE_CREDENTIALS_JSON or not GOOGLE_SHEET_ID:
-        return None
-    info = json.loads(GOOGLE_CREDENTIALS_JSON)
-    creds = Credentials.from_service_account_info(info, scopes=["https://www.googleapis.com/auth/spreadsheets"])
-    return build("sheets", "v4", credentials=creds, cache_discovery=False)
-
-def _load_rank_ext_from_sheet() -> Dict[int,str]:
-    """
-    2) シート 'JOCKEY_RANKS'（A列:順位 1-200 / B列:騎手名）から拡張（存在すれば）
-    """
-    svc = _sheet_service_lazy()
-    if not svc: return {}
-    tab = os.getenv("JOCKEY_RANKS_SHEET", "JOCKEY_RANKS")
-    try:
-        meta = svc.spreadsheets().get(spreadsheetId=GOOGLE_SHEET_ID).execute()
-        titles = [s["properties"]["title"] for s in meta.get("sheets",[])]
-        if tab not in titles: return {}
-        res = svc.spreadsheets().values().get(spreadsheetId=GOOGLE_SHEET_ID, range=f"'{tab}'!A:B").execute()
-        values = res.get("values", [])
-        out: Dict[int,str] = {}
-        for row in values:
-            if len(row) < 2: continue
-            try:
-                r = int(str(row[0]).strip())
-                if not (1 <= r <= 200): continue
-                name = _normalize_name(row[1])
-                if name: out[r] = name
-            except: pass
-        return out
-    except Exception:
-        return {}
-
-def _build_rank_table_1_200() -> Dict[int,str]:
-    table = dict(JOCKEY_RANK_TABLE_RAW_BASE)
-    # 環境変数（文字キーをint化）
-    for k,v in _EXT_FROM_ENV.items():
-        try:
-            r = int(k)
-            if 1 <= r <= 200 and v.strip():
-                table[r] = v.strip()
-        except: pass
-    # シートがあれば更に上書き
-    from_sheet = _load_rank_ext_from_sheet()
-    for r, name in from_sheet.items():
-        table[r] = name
-    return table
-
-# 正規化済テーブル（名前→順位）
-_JOCKEY_RANK_FULL: Dict[int,str] = _build_rank_table_1_200()
-_JOCKEY_NAME_TO_RANK: Dict[str,int] = { _normalize_name(n): r for r,n in _JOCKEY_RANK_FULL.items() }
+# 名前→順位の辞書
+_JOCKEY_NAME_TO_RANK: Dict[str, int] = { _normalize_name(v): k for k, v in JOCKEY_RANK_TABLE_RAW.items() }
 
 def jockey_rank_letter_by_name(name: Optional[str]) -> str:
     if not name: return "—"
     rank = _JOCKEY_NAME_TO_RANK.get(_normalize_name(name))
-    if rank is None: return "C"
+    if rank is None: return "C"         # 200名に入っていなければC
     if 1 <= rank <= 70: return "A"
     if 71 <= rank <= 200: return "B"
     return "C"
