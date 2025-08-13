@@ -1,94 +1,69 @@
-# jockey_rank.py
-import re
-import logging
-from typing import Dict, Tuple
-from datetime import timezone, timedelta
+# -*- coding: utf-8 -*-
+"""
+騎手ランク判定
+- A: 1〜70位
+- B: 71〜200位
+- C: その他（未掲載）
+"""
 
-import requests
-from bs4 import BeautifulSoup
+# 文字のゆらぎを少し吸収（全角ドット等）
+def _norm(name: str) -> str:
+    if not name:
+        return ""
+    s = name.strip()
+    s = s.replace("．", ".").replace("・", "・")  # ドットは半角へ
+    s = s.replace("　", " ")  # 全角スペース→半角
+    return s
 
-JST = timezone(timedelta(hours=9))
-HEADERS = {"user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-
-# ---- 任意：簡易ランク表（必要に応じて更新） ----------------------------
-# 実運用ではここをスプレッドシート等に差し替えてもOK
-_RANK_TABLE = {
-    # 例
-    "矢野貴之": "B",
-    "本田正重": "C",
-    "笹川翼": "C",
-    # 未登録はデフォルト C とする
+# ===== Aランク（1〜70位）=====
+A_SET = {
+    "笹川翼","矢野貴之","塚本征吾","小牧太","山本聡哉","野畑凌","石川倭","永森大智","中島龍也","吉原寛人",
+    "広瀬航","加藤聡一","望月洵輝","鈴木恵介","渡辺竜也","落合玄太","山口勲","本田正重","吉村智洋","赤岡修次",
+    "岡部誠","高松亮","飛田愛斗","西将太","御神本訓史","下原理","山本政聡","今井貴大","筒井勇介","山田義貴",
+    "丸野勝虎","青柳正義","渡来心路","今井千尋","和田譲治","井上瑛太","多田羅誠也","金田利貴","塚本涼人","宮下瞳",
+    "栗原大河","西謙一","西啓太","長澤幸太","山中悠希","菊池一樹","町田直希","石川慎将","菅原辰徳","島津新",
+    "阿部龍","小野楓馬","赤塚健仁","加藤翔馬","杉浦健太","張田昂","桑村真明","山本聡紀","吉井章","大畑慧悟",
+    "柴田勇真","大畑雅章","笹田知宏","細川智史","金山昇馬","岩本怜","岡遼太郎","岡村卓弥","中原蓮","藤本匠",
 }
 
-def _get(url: str, timeout: int = 12) -> str:
-    r = requests.get(url, headers=HEADERS, timeout=timeout)
-    r.raise_for_status()
-    r.encoding = r.apparent_encoding or "utf-8"
-    return r.text
+# ===== Bランク（71〜200位）=====
+B_SET = {
+    # 71〜100
+    "高橋悠里","土方颯太","長谷部駿弥","高橋愛叶","及川裕一","加茂飛翔","川原正一","村上忍","岡村健司","田野豊三",
+    "村上弘樹","山崎誠士","竹吉徹","宮内勇樹","船山蔵人","中村太陽","本橋孝太","出水拓人","新庄海誠","山崎雅由",
+    "阿部武臣","安藤洋一","小林凌","友森翔太郎","福原杏","岩橋勇二","佐々木志音","木之前葵","藤田凌","佐野遥久",
+    # 101〜126
+    "明星晴大","城野慈尚","畑中信司","長谷川蓮","服部茂史","鴨宮祥行","井上幹太","鈴木祐","大山龍太郎","竹村達也",
+    "高木健","大山真吾","山本咲希到","永井孝典","藤野俊一","大柿一真","田中直人","阿部英俊","菅原涼太","大友一馬",
+    "大坪慎","関本玲花","妹尾浩一朗","達城龍次","吉田晃浩",
+    # 127〜150
+    "澤田龍哉","笹野雄大","藤原幹生","鈴木太一","山田祥雄","R.クアトロ","松戸政也","大原浩司","東川慎","松本一心",
+    "藤本現暉","田中純","松木大地","阪野学","佐々木世麗","山下裕貴","川島正太郎","米玉利燕三","及川烈","見越彬央",
+    "近藤翔月","林悠翔","石堂響","小松丈二",
+    # 151〜170
+    "新原周馬","山本屋太三","佐原秀泰","向山牧","米倉知","小谷哲平","坂井瑛音","七夕裕次郎","村上章","宮川実",
+    "松本秀克","川島拓","松井伸也","丹羽克輝","篠谷葵","鷹見陸","阿岸潤一朗","青海大樹","亀井洋司","中山蓮王",
+    "中田貴士","桜井光輔","加藤雄真","保園翔也","木間塚龍馬","阿部基嗣","林謙佑","小谷周平","池谷匠翔",
+    # 180〜200
+    "千田洋","南郷家全","山口達弥","秋元耕成","黒沢愛斗","小笠原玲","木村直輝","平瀬城久","中山遥人","今野忠成",
+    "藤江渉","馬渕繁治","甲賀弘隆","仲野光馬","深沢杏花","山林堂信彦","増田充宏","室陽一朗","村松翔太","沖静男","小杉亮",
+}
 
-def _norm_jname(name: str) -> str:
-    name = (name or "").strip()
-    name = re.sub(r"\s+", "", name)
-    # 括弧の所属など除去
-    name = re.sub(r"（.*?）|\(.*?\)", "", name)
-    return name
+# 名前の別表記を吸収したい場合のエイリアス（必要に応じて拡張）
+ALIASES = {
+    "R．クアトロ": "R.クアトロ",
+    "Ｒ．クアトロ": "R.クアトロ",
+}
 
-def get_jockey_rank(name: str) -> str:
-    name = _norm_jname(name)
+def jockey_rank(name: str) -> str:
+    """
+    騎手名から A/B/C を返す
+    """
     if not name:
-        return "-"
-    return _RANK_TABLE.get(name, "C")
-
-def get_jockey_map(race_id: str) -> Dict[int, Tuple[str, str]]:
-    """
-    楽天のレースカードから「馬番 -> (騎手名, ランク)」を返す。
-    失敗時は空 dict。
-    """
-    urls = [
-        f"https://keiba.rakuten.co.jp/race_card/list/RACEID/{race_id}",
-        f"https://keiba.rakuten.co.jp/race/top/RACEID/{race_id}",
-    ]
-    for url in urls:
-        try:
-            html = _get(url, timeout=10)
-            soup = BeautifulSoup(html, "html.parser")
-
-            # 馬番・騎手名が同じ行に並ぶ table/section を広めに探索
-            cand = soup.find_all(["table", "section", "div"])
-            pairs = {}
-            for blk in cand:
-                rows = blk.find_all("tr")
-                for tr in rows:
-                    texts = [td.get_text(" ", strip=True) for td in tr.find_all(["th", "td"])]
-                    if len(texts) < 3:
-                        continue
-                    # 馬番
-                    umaban = None
-                    for t in texts[:2]:
-                        if re.fullmatch(r"\d{1,2}", t):
-                            umaban = int(t)
-                            break
-                    if umaban is None:
-                        continue
-                    # 騎手名候補
-                    jname = None
-                    for t in texts:
-                        # 「騎手」「斤量」等の文字列が近傍にあることもあるが、
-                        # とにかく漢字/カナ2〜4字程度を優先的に拾う
-                        if re.search(r"[一-龥ァ-ヶー]{2,}", t):
-                            # 明らかに馬名や厩舎・調教師と紛れることがあるため
-                            # “斤量”“厩舎”“父”“母”“馬体重”などを含むセルは避ける
-                            if any(x in t for x in ["斤量", "厩舎", "父", "母", "馬体重", "タイム"]):
-                                continue
-                            jname = _norm_jname(t)
-                            # 騎手名はだいたい 2〜4 文字程度
-                            if 1 <= len(jname) <= 6:
-                                break
-                    if umaban is not None and jname:
-                        pairs[umaban] = (jname, get_jockey_rank(jname))
-            if pairs:
-                return pairs
-        except Exception as e:
-            logging.warning("get_jockey_map failed url=%s err=%s", url, e)
-
-    return {}
+        return "C"
+    n = _norm(ALIASES.get(name, name))
+    if n in A_SET:
+        return "A"
+    if n in B_SET:
+        return "B"
+    return "C"
