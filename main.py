@@ -6,6 +6,7 @@ Rakuten競馬 監視・通知バッチ
 - 窓内1回通知 / 429クールダウン / Sheet永続TTL
 - 通知先：Googleシート(タブA=名称「1」)のH列から userId を収集
 - 通知の「買い目」を 人気順＋馬番 の両表示に対応
+- 戦略③は専用フォーマット（1軸・相手10〜20倍・馬番買い目・候補最大4頭・点数表示）
 """
 
 import os, re, json, time, random, logging, pathlib, hashlib
@@ -840,6 +841,19 @@ def _format_bets_pop_and_umanum(bets: List[str], horses: List[Dict[str, float]])
         out.append(" - ".join(segs))
     return out
 
+def _map_pop_to_num_and_odds(horses: List[Dict[str, float]]) -> Dict[int, Tuple[Optional[int], Optional[float]]]:
+    """人気→(馬番, 単勝オッズ)"""
+    m: Dict[int, Tuple[Optional[int], Optional[float]]] = {}
+    for h in horses:
+        try:
+            p = int(h.get("pop"))
+            num = h.get("num") if isinstance(h.get("num"), int) else None
+            o = float(h.get("odds")) if h.get("odds") is not None else None
+            m[p] = (num, o)
+        except Exception:
+            continue
+    return m
+
 def build_line_notification(
     pattern_no: int,
     venue: str,
@@ -866,6 +880,94 @@ def build_line_notification(
     lines += ["🔗 オッズ詳細:", odds_url]
     return "\n".join(lines)
 
+def build_line_notification_strategy3(
+    strategy: Dict,
+    venue: str,
+    race_no: str,
+    time_label: str,
+    time_hm: str,
+    odds_timestamp_hm: Optional[str],
+    odds_url: str,
+    horses: List[Dict[str, float]],
+) -> str:
+    """
+    戦略③専用：馬番入りの買い目と候補リストを表示
+    - eval_strategy が axis/candidates/tickets を返していない場合でも、horses から復元
+    """
+    pop2 = _map_pop_to_num_and_odds(horses)
+    # 軸（1番人気）
+    axis = strategy.get("axis") or {}
+    axis_num = axis.get("umaban") or (pop2.get(1, (None, None))[0])
+    axis_odds = axis.get("odds") if axis.get("odds") is not None else pop2.get(1, (None, None))[1]
+
+    # 候補
+    cands = strategy.get("candidates")
+    if not cands:
+        # horses から復元（10〜20倍／1番人気除外／最大4頭／人気昇順）
+        cands_list = []
+        for h in sorted(horses, key=lambda x: int(x.get("pop", 999))):
+            try:
+                p = int(h.get("pop")); o = float(h.get("odds"))
+                if p == 1: continue
+                if 10.0 <= o <= 20.0:
+                    cands_list.append({"pop": p, "odds": o, "umaban": h.get("num")})
+                    if len(cands_list) >= 4: break
+            except Exception:
+                continue
+        cands = cands_list
+
+    # 買い目（eval_strategy から来ていればそれを採用。なければ馬番で生成）
+    tickets = strategy.get("tickets") or []
+    if not tickets and axis_num:
+        nums = [c.get("umaban") for c in cands if c.get("umaban") is not None]
+        # 2頭以上のときのみ順列生成
+        tks = []
+        for i in range(len(nums)):
+            for j in range(len(nums)):
+                if i == j: continue
+                tks.append(f"{axis_num}-{nums[i]}-{nums[j]}")
+        tickets = tks
+
+    # 表示用
+    title = strategy.get("strategy", "③ 1軸 — 相手10〜20倍（最大4頭）")
+    cond_line = "1番人気 ≤2.0、2番人気 ≥10.0、相手＝単勝10〜20倍（最大4頭）"
+
+    # 候補整形
+    cands_sorted = sorted(
+        [c for c in cands if c.get("pop")],
+        key=lambda x: x["pop"]
+    )
+    n = len(cands_sorted)
+    pts = n * (n - 1) if n >= 2 else 0
+    cand_lines = "\n".join([
+        f"    ・{c['pop']}番人気（馬番 {c.get('umaban','—')}／{c.get('odds',0):.1f}倍）"
+        for c in cands_sorted
+    ]) if cands_sorted else "    ・—"
+
+    tickets_str = ", ".join(tickets) if tickets else "—"
+    axis_str = f"1番人気（馬番 {axis_num if axis_num is not None else '—'}／{axis_odds:.1f}倍）" if axis_odds is not None else f"1番人気（馬番 {axis_num if axis_num is not None else '—'}）"
+
+    lines = [
+        f"【{title}】",
+        f"■レース：{venue} {race_no}（{time_label} {time_hm}）",
+        f"■条件：{cond_line}",
+        f"■買い目（3連単・1着固定）：{tickets_str}",
+        f"  軸：{axis_str}",
+        "  相手候補（10〜20倍）：",
+        f"{cand_lines}",
+        f"  → 候補 {n}頭／合計 {pts}点",
+    ]
+    if odds_timestamp_hm:
+        lines += [f"\n📅 オッズ時点: {odds_timestamp_hm}"]
+    lines += [
+        "🔗 オッズ詳細:",
+        odds_url,
+        "",
+        "※オッズは締切直前まで変化します",
+        "※馬券的中を保証するものではありません。余裕資金でご購入ください",
+    ]
+    return "\n".join(lines)
+
 # ========= メイン =========
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -873,7 +975,7 @@ def main():
     # ビルド識別
     p = pathlib.Path(__file__).resolve()
     sha = hashlib.sha1(p.read_bytes()).hexdigest()[:12]
-    logging.info(f"[BUILD] file={p} mtime={p.stat().st_mtime:.0f} sha1={sha} Fallback=ON v2025-08-13A")
+    logging.info(f"[BUILD] file={p} mtime={p.stat().st_mtime:.0f} sha1={sha} Fallback=ON v2025-08-13B")
 
     if KILL_SWITCH:
         logging.info("[INFO] KILL_SWITCH=True のため終了"); return
@@ -995,26 +1097,36 @@ def main():
             if isinstance(raw_tickets, str):
                 raw_tickets = [s.strip() for s in raw_tickets.split(",") if s.strip()]
 
-            # ここで「人気＋馬番」表記へ
-            pretty_tickets = _format_bets_pop_and_umanum(raw_tickets, horses)
-
-            message = build_line_notification(
-                pattern_no=pattern_no,
-                venue=venue_disp,
-                race_no=race_no,
-                time_label=time_label,
-                time_hm=time_hm,
-                condition_text=condition_text,
-                bets=pretty_tickets,
-                odds_timestamp_hm=odds_hm,
-                odds_url=meta["url"],
-            )
+            # ③は専用フォーマット（馬番入り買い目 & 候補）
+            if str(strategy_text).startswith("③"):
+                message = build_line_notification_strategy3(
+                    strategy=strategy,
+                    venue=venue_disp,
+                    race_no=race_no,
+                    time_label=time_label,
+                    time_hm=time_hm,
+                    odds_timestamp_hm=odds_hm,
+                    odds_url=meta["url"],
+                    horses=horses,
+                )
+            else:
+                # それ以外（①②④）は従来体裁：人気＋馬番フォーマットへ変換
+                pretty_tickets = _format_bets_pop_and_umanum(raw_tickets, horses)
+                message = build_line_notification(
+                    pattern_no=pattern_no,
+                    venue=venue_disp,
+                    race_no=race_no,
+                    time_label=time_label,
+                    time_hm=time_hm,
+                    condition_text=condition_text,
+                    bets=pretty_tickets,
+                    odds_timestamp_hm=odds_hm,
+                    odds_url=meta["url"],
+                )
 
             # ログ詳細
-            ticket_str = ", ".join(pretty_tickets)
-            detail = f"{strategy_text} / 買い目: {ticket_str}"
-            if "roi" in strategy or "hit" in strategy:
-                detail += f" / {strategy.get('roi','-')} / {strategy.get('hit','-')}"
+            ticket_str = ", ".join(raw_tickets) if raw_tickets else "-"
+            detail = f"{strategy_text} / 買い目(raw): {ticket_str}"
             logging.info(f"[MATCH] {rid} 条件詳細: {detail}")
 
             sent_ok, http_status = notify_strategy_hit_to_many(message, targets)
