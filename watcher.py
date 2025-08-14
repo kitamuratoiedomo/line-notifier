@@ -138,12 +138,41 @@ JOCKEY_RANK_TABLE_RAW: Dict[int, str] = {
 }
 _JOCKEY_NAME_TO_RANK: Dict[str, int] = { _normalize_name(v): k for k, v in JOCKEY_RANK_TABLE_RAW.items() }
 
+# === 騎手名クレンジング（強化版） ===
+def _clean_jockey_name(s: str) -> str:
+    if not s:
+        return ""
+    # 全角/半角の括弧内（所属など）を除去
+    s = re.sub(r"[（(].*?[）)]", "", s)
+    # 印・記号を除去
+    s = re.sub(r"[▲△☆★◇◆⊙◎○◯◉⚪︎＋+＊*]", "", s)
+    # 斤量などの数値＋単位を除去
+    s = re.sub(r"\d+(?:\.\d+)?\s*(?:kg|斤)?", "", s)
+    s = s.replace("斤量", "")
+    # 全角・半角スペースを除去
+    s = re.sub(r"\s+", "", s)
+    # 代表的な別表記を吸収（必要に応じて追加）
+    aliases = {
+        "小牧太": "小牧太",
+        "小牧太J": "小牧太",
+        "小牧太騎手": "小牧太",
+        "小牧太兵庫": "小牧太",
+    }
+    return aliases.get(s, s)
+
 def jockey_rank_letter_by_name(name: Optional[str]) -> str:
-    if not name: return "—"
-    rank = _JOCKEY_NAME_TO_RANK.get(_normalize_name(name))
-    if rank is None: return "C"
-    if 1 <= rank <= 70: return "A"
-    if 71 <= rank <= 200: return "B"
+    if not name:
+        return "—"
+    # ★必ずクレンジング → 正規化してから照合
+    name_clean = _clean_jockey_name(name)
+    name_norm  = _normalize_name(name_clean)
+    rank = _JOCKEY_NAME_TO_RANK.get(name_norm)
+    if rank is None:
+        return "C"
+    if 1 <= rank <= 70:
+        return "A"
+    if 71 <= rank <= 200:
+        return "B"
     return "C"
 
 # ========= 共通 =========
@@ -441,7 +470,8 @@ def parse_odds_table(soup: BeautifulSoup) -> Tuple[List[Dict[str,float]], Option
         if 0<=jockey_idx<len(tds):
             jt=tds[jockey_idx].get_text(" ", strip=True)
             jraw = re.split(r"[（( ]", jt)[0].strip() if jt else None
-            jockey = jraw if jraw else None
+            jclean = _clean_jockey_name(jraw) if jraw else None   # ★取得時点でクレンジング
+            jockey = jclean if jclean else None
         rec={"pop":pop, "odds":float(odds)}
         if num is not None: rec["num"]=num
         if jockey: rec["jockey"]=jockey
@@ -451,15 +481,7 @@ def parse_odds_table(soup: BeautifulSoup) -> Tuple[List[Dict[str,float]], Option
     horses=[uniq[k] for k in sorted(uniq.keys())]
     return horses, venue_race, now_label
 
-# === 騎手名クリーニング & 出馬表から補完 ===
-def _clean_jockey_name(s: str) -> str:
-    if not s: return ""
-    s = re.sub(r"\(.*?\)", "", s)
-    s = re.sub(r"[▲△☆★◇◆⊙◎○◯◉⚪︎＋+＊*]", "", s)
-    s = re.sub(r"\d+(?:\.\d+)?\s*(?:kg|斤)?", "", s)
-    s = s.replace("斤量","")
-    return s.strip()
-
+# === 出馬表からの騎手補完 ===
 def fetch_jockey_map_from_card(race_id: str) -> Dict[int, str]:
     urls = [
         f"https://keiba.rakuten.co.jp/race_card/RACEID/{race_id}",
@@ -890,7 +912,7 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     p=pathlib.Path(__file__).resolve()
     sha=hashlib.sha1(p.read_bytes()).hexdigest()[:12]
-    logging.info(f"[BUILD] file={p} sha1={sha} v2025-08-14C")
+    logging.info(f"[BUILD] file={p} sha1={sha} v2025-08-14D")
 
     if KILL_SWITCH:
         logging.info("[INFO] KILL_SWITCH=True"); return
