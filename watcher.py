@@ -438,7 +438,7 @@ def _find_popular_odds_table(soup: BeautifulSoup) -> Tuple[Optional[BeautifulSou
             if h in ("人気","順位") or ("人気" in h and "順" not in h): pop_idx=i; break
         win_c=[]
         for i,h in enumerate(headers):
-            if ("複" in h) or ("率"に in h) or ("%" in h): continue
+            if ("複" in h) or ("率" in h) or ("%" in h): continue
             if h=="単勝": win_c.append((0,i))
             elif "単勝" in h: win_c.append((1,i))
             elif "オッズ" in h: win_c.append((2,i))
