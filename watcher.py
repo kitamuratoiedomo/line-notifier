@@ -104,6 +104,7 @@ TIME_PATS = [
 ]
 PLACEHOLDER = re.compile(r"\d{8}0000000000$")
 
+# ノイズ語と発走ラベル
 IGNORE_NEAR_PAT = re.compile(r"(現在|更新|発売|締切|投票|オッズ|確定|払戻|実況)")
 LABEL_NEAR_PAT  = re.compile(r"(発走|発走予定|発走時刻|発送|出走)")
 
@@ -346,7 +347,7 @@ def parse_post_times_from_table_like(root: Tag) -> Dict[str, datetime]:
             sib_text=" ".join([x.get_text(" ", strip=True) for x in a.find_all_next(limit=4) if isinstance(x, Tag)])
             got=_norm_hhmm_from_text(sib_text)
             if got:
-                hh,mm,why=got
+                hh,mm,_=got
                 hhmm=f"{hh:02d}:{mm:02d}"
         if not hhmm: continue
         hh,mm=map(int, hhmm.split(":"))
@@ -529,11 +530,19 @@ def fallback_post_time_for_rid(rid: str) -> Optional[Tuple[datetime, str, str]]:
         if not hhmm:
             sibs=[n for n in host.find_all_next(limit=6) if isinstance(n, Tag)]
             text=" ".join([n.get_text(" ", strip=True) for n in sibs])
-            if not IGNORE_NEAR_PAT.search(text):
+            # ★発走ラベルが近傍にあれば最優先（締切などノイズ語が混在しても許容）
+            if LABEL_NEAR_PAT.search(text):
                 got=_norm_hhmm_from_text(text)
                 if got:
                     hh,mm,why=got
-                    hhmm,reason=f"{hh:02d}:{mm:02d}", f"sibling:text/{why}"
+                    hhmm,reason=f"{hh:02d}:{mm:02d}", f"sibling:label-first/{why}"
+            else:
+                # 発走ラベルが無い場合のみノイズ語チェックを適用
+                if not IGNORE_NEAR_PAT.search(text):
+                    got=_norm_hhmm_from_text(text)
+                    if got:
+                        hh,mm,why=got
+                        hhmm,reason=f"{hh:02d}:{mm:02d}", f"sibling:text/{why}"
         if not hhmm: return None
         hh,mm=map(int, hhmm.split(":")); dt=_make_dt_from_hhmm(rid, hh, mm)
         return (dt, f"list-anchor/{reason}", url) if dt else None
@@ -555,7 +564,9 @@ def fallback_post_time_for_rid(rid: str) -> Optional[Tuple[datetime, str, str]]:
                     try: chunks.append(sub.get_text(" ", strip=True))
                     except: pass
                 near=" ".join(chunks)
-                if IGNORE_NEAR_PAT.search(near): continue
+                # ★発走ラベルがあるならノイズ語が混ざっていても許容
+                if IGNORE_NEAR_PAT.search(near) and not LABEL_NEAR_PAT.search(near):
+                    continue
                 got=_norm_hhmm_from_text(near)
                 if got:
                     hh,mm,why=got; dt=_make_dt_from_hhmm(rid, hh, mm)
@@ -832,11 +843,10 @@ def summarize_today_and_notify(targets: List[str]):
                      "2":{"races":0,"hits":0,"bets":0,"stake":0,"return":0},
                      "3":{"races":0,"hits":0,"bets":0,"stake":0,"return":0},
                      "4":{"races":0,"hits":0,"bets":0,"stake":0,"return":0} }
-    seen_race_strategy=set()
+    seen_race_strategy:set[Tuple[str,str]] = set()
 
     for r in records:
         date_ymd, race_id, venue, race_no, strategy, bet_kind, t_csv, points, unit, total = r[:10]
-        # 同一レース×同一戦略を初めて見た時だけ races を加算
         if (race_id, strategy) not in seen_race_strategy:
             seen_race_strategy.add((race_id, strategy))
             per_strategy[strategy]["races"] += 1
@@ -880,7 +890,7 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     p=pathlib.Path(__file__).resolve()
     sha=hashlib.sha1(p.read_bytes()).hexdigest()[:12]
-    logging.info(f"[BUILD] file={p} sha1={sha} v2025-08-14A")
+    logging.info(f"[BUILD] file={p} sha1={sha} v2025-08-14C")
 
     if KILL_SWITCH:
         logging.info("[INFO] KILL_SWITCH=True"); return
