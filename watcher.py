@@ -9,7 +9,7 @@ Rakuten競馬 監視・通知バッチ（完全差し替え版）
 - 通知本文の買い目表記：『単勝人気－騎手ランク』（例：1－A-3－B-5－C）
 - 注意事項にランク根拠を明記（2024年の地方競馬リーディングジョッキーランキング）
 - betsシートに馬番ベースで記録
-- 終業後に当日サマリ（件数/的中率/回収率）をLINE通知
+- 日次サマリ：指定時刻に1日1回送信（0件でも可）
 - 券種は STRATEGY_BET_KIND_JSON で設定（既定: ①馬連, ②馬単, ③三連単, ④三連複）
 
 ★「発走5分前以降は通知しない」設定：
@@ -97,6 +97,10 @@ except Exception:
 
 UNIT_STAKE_YEN = int(os.getenv("UNIT_STAKE_YEN", "100"))  # 1点100円
 
+# === 日次サマリの新規設定 ===
+DAILY_SUMMARY_HHMM = os.getenv("DAILY_SUMMARY_HHMM", "21:02")  # 決まった時刻に1回送る
+ALWAYS_NOTIFY_DAILY_SUMMARY = os.getenv("ALWAYS_NOTIFY_DAILY_SUMMARY", "1") == "1"  # 0件でも送る
+
 RACEID_RE   = re.compile(r"/RACEID/(\d{18})")
 TIME_PATS = [
     re.compile(r"\b(\d{1,2}):(\d{2})\b"),
@@ -164,7 +168,7 @@ _JOCKEY_NAME_TO_RANK: Dict[str, int] = { _normalize_name(v): k for k, v in JOCKE
 def _best_match_rank(name_norm: str) -> Optional[int]:
     """
     直接一致がない場合のフォールバック：
-      1) 前方一致（例: '矢野貴' → '矢野貴之'）
+      1) 前方一致
       2) 逆前方一致（テーブル側が短い場合）
       候補が複数なら “文字列差が小” → “ランク上位（数値が小さい）” を優先
     """
@@ -179,10 +183,7 @@ def _best_match_rank(name_norm: str) -> Optional[int]:
     return candidates[0][1]
 
 def jockey_rank_letter_by_name(name: Optional[str]) -> str:
-    """
-    表示ランク:
-      A : 1〜70位 / B : 71〜200位 / C : その他 / — : 名前なし
-    """
+    """表示ランク: A=1〜70 / B=71〜200 / C=その他 / —=名前なし"""
     if not name:
         return "—"
     base = _normalize_name(_clean_jockey_name(name))
@@ -437,7 +438,7 @@ def _find_popular_odds_table(soup: BeautifulSoup) -> Tuple[Optional[BeautifulSou
             if h in ("人気","順位") or ("人気" in h and "順" not in h): pop_idx=i; break
         win_c=[]
         for i,h in enumerate(headers):
-            if ("複" in h) or ("率" in h) or ("%" in h): continue
+            if ("複" in h) or ("率"に in h) or ("%" in h): continue
             if h=="単勝": win_c.append((0,i))
             elif "単勝" in h: win_c.append((1,i))
             elif "オッズ" in h: win_c.append((2,i))
@@ -849,7 +850,7 @@ def build_line_notification_strategy3(strategy:Dict, venue:str, race_no:str, tim
         "※馬券購入は余裕資金で。的中は保証されません。"
     ]
     return "\n".join(lines)
-    
+
 # ========= ベット記録 =========
 def _bets_sheet_header() -> List[str]:
     return ["date","race_id","venue","race_no","strategy","bet_kind","tickets_umaban_csv","points","unit_stake","total_stake"]
@@ -895,17 +896,34 @@ def _normalize_ticket_for_kind(ticket:str, kind:str) -> str:
         parts=sorted(parts)
     return "-".join(str(x) for x in parts)
 
+def _summary_key_for_today() -> str:
+    return f"summary:{now_jst():%Y%m%d}"
+
+def _is_time_reached(now: datetime, hhmm: str) -> bool:
+    try:
+        hh, mm = map(int, hhmm.split(":"))
+    except Exception:
+        return False
+    target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    return now >= target
+
 def summarize_today_and_notify(targets: List[str]):
     svc=_sheet_service()
     title=_resolve_sheet_title(svc, BETS_SHEET_TAB)
     values=_sheet_get_range_values(svc, title, "A:J")
+
+    # 0件でも通知するモードならダミーで進行
     if not values or values==[_bets_sheet_header()]:
-        logging.info("[INFO] betsシートに当日データなし"); return
+        if not ALWAYS_NOTIFY_DAILY_SUMMARY:
+            logging.info("[INFO] betsシートに当日データなし（無通知モード）"); return
+        values=[_bets_sheet_header()]
+
     hdr=values[0]; rows=values[1:]
     today=now_jst().strftime("%Y%m%d")
     records=[r for r in rows if len(r)>=10 and r[0]==today]
-    if not records:
-        logging.info("[INFO] 当日分なし"); return
+
+    if not records and not ALWAYS_NOTIFY_DAILY_SUMMARY:
+        logging.info("[INFO] 当日分なし（無通知モード）"); return
 
     per_strategy = { "1":{"races":0,"hits":0,"bets":0,"stake":0,"return":0},
                      "2":{"races":0,"hits":0,"bets":0,"stake":0,"return":0},
@@ -973,7 +991,7 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     p=pathlib.Path(__file__).resolve()
     sha=hashlib.sha1(p.read_bytes()).hexdigest()[:12]
-    logging.info(f"[BUILD] file={p} sha1={sha} v2025-08-14F")
+    logging.info(f"[BUILD] file={p} sha1={sha} v2025-08-14G")
 
     if KILL_SWITCH:
         logging.info("[INFO] KILL_SWITCH=True"); return
@@ -1109,12 +1127,24 @@ def main():
 
         logging.info(f"[INFO] HITS={hits} / MATCHES={matches}")
 
-    # 終業後にサマリ
+    # === 日次サマリ：指定時刻に1日1回 ===
     try:
-        if now_jst().hour >= END_HOUR:
-            summarize_today_and_notify(targets)
+        now = now_jst()
+        if _is_time_reached(now, DAILY_SUMMARY_HHMM):
+            notified = {}
+            try:
+                notified = sheet_load_notified()
+            except Exception:
+                pass
+            skey = _summary_key_for_today()
+            if skey not in notified:
+                summarize_today_and_notify(targets)
+                try:
+                    sheet_upsert_notified(skey, time.time(), note=f"daily summary {now:%H:%M}")
+                except Exception as e:
+                    logging.exception("[ERROR] サマリ送信フラグの保存に失敗: %s", e)
     except Exception as e:
-        logging.exception("[ERROR] 日次サマリ送信失敗: %s", e)
+        logging.exception("[ERROR] 日次サマリ送信判定に失敗: %s", e)
 
     logging.info("[INFO] ジョブ終了")
 
