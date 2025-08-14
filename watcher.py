@@ -109,11 +109,37 @@ IGNORE_NEAR_PAT = re.compile(r"(現在|更新|発売|締切|投票|オッズ|確
 LABEL_NEAR_PAT  = re.compile(r"(発走|発走予定|発走時刻|発送|出走)")
 
 # ========= 騎手ランク（1〜200位を内蔵） =========
-def _normalize_name(s: str) -> str:
-    if not s: return ""
-    s = unicodedata.normalize("NFKC", s)
-    return s.replace(" ", "").replace("\u3000", "")
+import unicodedata, re
+from typing import Optional, Dict
 
+def _normalize_name(s: str) -> str:
+    """全角→半角統一・空白除去・代表的な旧字体/異体字を新字体に寄せる"""
+    if not s:
+        return ""
+    s = unicodedata.normalize("NFKC", s)
+    s = s.replace(" ", "").replace("\u3000", "")
+    # 代表的な旧字体→新字体マップ（必要に応じて追加）
+    replace_map = {
+        "廣":"広", "齋":"斎", "齊":"斉", "髙":"高", "濱":"浜", "﨑":"崎", "峯":"峰",
+        "內":"内", "冨":"富", "國":"国", "體":"体", "眞":"真"
+    }
+    for k, v in replace_map.items():
+        s = s.replace(k, v)
+    return s
+
+def _clean_jockey_name(s: str) -> str:
+    """括弧・斤量・印などを除去して素の氏名だけにする（表記ゆれ耐性）"""
+    if not s:
+        return ""
+    s = re.sub(r"[（(].*?[）)]", "", s)                           # 括弧内
+    s = re.sub(r"[▲△☆★◇◆⊙◎○◯◉⚪︎＋+＊*]", "", s)                # 印
+    s = re.sub(r"\d+(?:\.\d+)?\s*(?:kg|斤)?", "", s)               # 斤量
+    s = s.replace("斤量", "")
+    s = s.replace("騎手", "").replace("J", "").replace("Ｊ", "")   # 接尾辞
+    s = re.sub(r"\s+", "", s)
+    return s
+
+# ランク表（1〜200位）。元のテーブルはそのまま流用してください。
 JOCKEY_RANK_TABLE_RAW: Dict[int, str] = {
     1:"笹川翼",2:"矢野貴之",3:"塚本征吾",4:"小牧太",5:"山本聡哉",6:"野畑凌",7:"石川倭",8:"永森大智",9:"中島龍也",10:"吉原寛人",
     11:"広瀬航",12:"加藤聡一",13:"望月洵輝",14:"鈴木恵介",15:"渡辺竜也",16:"落合玄太",17:"山口勲",18:"本田正重",19:"吉村智洋",20:"赤岡修次",
@@ -136,44 +162,49 @@ JOCKEY_RANK_TABLE_RAW: Dict[int, str] = {
     181:"竹村達也良",182:"鴨宮祥行良",183:"松本剛史良",184:"小牧太良",185:"吉村智洋良",186:"下原理隆",187:"廣瀬航良",188:"長谷部駿弥良",189:"中越琉世良",190:"田中学真",
     191:"長田進仁良",192:"佐原秀泰良",193:"大柿一真隆",194:"高野誠毅良",195:"山田雄大良",196:"池谷匠翔良",197:"小牧太隆",198:"石川慎将良",199:"吉村誠之助良",200:"山本聡哉良",
 }
+
+# 正規化済みランク表
 _JOCKEY_NAME_TO_RANK: Dict[str, int] = { _normalize_name(v): k for k, v in JOCKEY_RANK_TABLE_RAW.items() }
 
-# === 騎手名クレンジング（強化版） ===
-def _clean_jockey_name(s: str) -> str:
-    if not s:
-        return ""
-    # 全角/半角の括弧内（所属など）を除去
-    s = re.sub(r"[（(].*?[）)]", "", s)
-    # 印・記号を除去
-    s = re.sub(r"[▲△☆★◇◆⊙◎○◯◉⚪︎＋+＊*]", "", s)
-    # 斤量などの数値＋単位を除去
-    s = re.sub(r"\d+(?:\.\d+)?\s*(?:kg|斤)?", "", s)
-    s = s.replace("斤量", "")
-    # 全角・半角スペースを除去
-    s = re.sub(r"\s+", "", s)
-    # 代表的な別表記を吸収（必要に応じて追加）
-    aliases = {
-        "小牧太": "小牧太",
-        "小牧太J": "小牧太",
-        "小牧太騎手": "小牧太",
-        "小牧太兵庫": "小牧太",
-    }
-    return aliases.get(s, s)
+def _best_match_rank(name_norm: str) -> Optional[int]:
+    """
+    直接一致がない場合のフォールバック：
+      1) 前方一致（例: '矢野貴' → '矢野貴之'）
+      2) 逆前方一致（例: 名寄せでテーブル側が短い場合を想定）
+      ※ 複数候補がある場合は “文字列差が最小” → “ランク上位（数値が小さい）” を優先
+    """
+    candidates = []
+    for n2, rank in _JOCKEY_NAME_TO_RANK.items():
+        if n2.startswith(name_norm) or name_norm.startswith(n2):
+            diff = abs(len(n2) - len(name_norm))
+            candidates.append((diff, rank, n2))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: (x[0], x[1]))  # 差が小さい→ランク上位
+    return candidates[0][1]
 
 def jockey_rank_letter_by_name(name: Optional[str]) -> str:
+    """
+    表示用ランク記号を返す:
+      - 'A' : 1〜70位
+      - 'B' : 71〜200位
+      - 'C' : それ以外 / 未判定
+      - '—' : 名前なし
+    """
     if not name:
         return "—"
-    # ★必ずクレンジング → 正規化してから照合
-    name_clean = _clean_jockey_name(name)
-    name_norm  = _normalize_name(name_clean)
-    rank = _JOCKEY_NAME_TO_RANK.get(name_norm)
+    base = _normalize_name(_clean_jockey_name(name))
+
+    # 1) まずは完全一致
+    rank = _JOCKEY_NAME_TO_RANK.get(base)
+
+    # 2) 合致なし → 前方一致ベースのフォールバック（略記・旧字体差分の吸収）
+    if rank is None and base:
+        rank = _best_match_rank(base)
+
     if rank is None:
         return "C"
-    if 1 <= rank <= 70:
-        return "A"
-    if 71 <= rank <= 200:
-        return "B"
-    return "C"
+    return "A" if 1 <= rank <= 70 else ("B" if 71 <= rank <= 200 else "C")
 
 # ========= 共通 =========
 def now_jst() -> datetime: return datetime.now(JST)
