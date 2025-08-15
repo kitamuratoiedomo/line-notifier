@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Rakuten競馬 監視・通知バッチ（完全差し替え版 v2025-08-15D）
+Rakuten競馬 監視・通知バッチ（完全差し替え版 v2025-08-15E）
 - 締切時刻：単複オッズ/一覧ページから“締切”を直接抽出（最優先）
 - 発走時刻：一覧ページ優先＋オッズ詳細のフォールバック
 - 窓判定：ターゲット時刻（締切 or 発走）基準、±GRACE_SECONDS の許容
@@ -13,12 +13,17 @@ Rakuten競馬 監視・通知バッチ（完全差し替え版 v2025-08-15D）
   ※戦略1/2/4の表示は『人気優先→馬番へ変換』に統一（11人気混入対策）
 - 未一致の騎手名は [RANKMISS] ログに記録（重複抑止）＋ [RANKDBG] で突合過程を出力
 - betsシート：馬番ベースで記録（仕様は従来通り）
-- 日次サマリ：指定時刻に1日1回送信（0件でも可）
+- 日次サマリ：JST 21:02 に当日1回だけ送信（0件でも送信） ← FIX
 - 券種は STRATEGY_BET_KIND_JSON で設定（既定: ①馬連, ②馬単, ③三連単, ④三連複）
 
 ★締切基準で運用する場合：
   - 環境変数 CUTOFF_OFFSET_MIN を 5（推奨）に設定
   - 本版は “締切そのもの” を抽出できたらそれを採用。取れない場合のみ「発走-5分」を代用。
+
+★本版の変更点（E）：
+  - 日次サマリ実行を 21:02 で確実にトリガ（>= 判定・重複抑止はシートの summary フラグ）
+  - サマリ作成中の払戻ページ404等はレース単位で捕捉してスキップ（処理全体を落とさない）
+  - サマリ開始・結果・スキップ理由などログを強化
 """
 
 import os, re, json, time, random, logging, pathlib, hashlib, unicodedata
@@ -104,7 +109,7 @@ except Exception:
 UNIT_STAKE_YEN = int(os.getenv("UNIT_STAKE_YEN", "100"))  # 1点100円
 
 # === 日次サマリ ===
-DAILY_SUMMARY_HHMM = os.getenv("DAILY_SUMMARY_HHMM", "21:02")  # 決まった時刻に1回送る
+DAILY_SUMMARY_HHMM = os.getenv("DAILY_SUMMARY_HHMM", "21:02")  # 決まった時刻に1回送る（JST）
 ALWAYS_NOTIFY_DAILY_SUMMARY = os.getenv("ALWAYS_NOTIFY_DAILY_SUMMARY", "1") == "1"  # 0件でも送る
 
 RACEID_RE   = re.compile(r"/RACEID/(\d{18})")
@@ -773,7 +778,6 @@ def _format_bet_display_line(ticket: str, horses: List[Dict[str,float]], prefer:
     for n in nums:
         label = (_format_single_leg_prefer_pop(n, pop2, uma2)
                  if prefer=="pop" else
-                 # 予備：馬番優先（使わないが残す）
                  (lambda x: None)(n))
         parts.append(label if label else str(n))
     return " - ".join(parts)
@@ -924,23 +928,31 @@ def _summary_key_for_today() -> str:
     return f"summary:{now_jst():%Y%m%d}"
 
 def _is_time_reached(now: datetime, hhmm: str) -> bool:
+    """指定hh:mm（JST）に到達済みか。>= で判定（ジョブが遅れても1回は動く）"""
     try: hh,mm=map(int, hhmm.split(":"))
     except Exception: return False
     target=now.replace(hour=hh, minute=mm, second=0, microsecond=0)
     return now >= target
 
 def summarize_today_and_notify(targets: List[str]):
+    """当日betsからサマリを作成し通知。払戻ページ取得失敗は個別に握りつぶして継続。"""
+    logging.info("[SUMMARY] 本日サマリ作成を開始します")
+
     svc=_sheet_service(); title=_resolve_sheet_title(svc, BETS_SHEET_TAB)
     values=_sheet_get_range_values(svc, title, "A:J")
     if not values or values==[_bets_sheet_header()]:
         if not ALWAYS_NOTIFY_DAILY_SUMMARY:
-            logging.info("[INFO] betsシートに当日データなし（無通知モード）"); return
+            logging.info("[SUMMARY] betsシートに当日データなし（無通知モード）")
+            return
         values=[_bets_sheet_header()]
+
     hdr=values[0]; rows=values[1:]
     today=now_jst().strftime("%Y%m%d")
     records=[r for r in rows if len(r)>=10 and r[0]==today]
+
     if not records and not ALWAYS_NOTIFY_DAILY_SUMMARY:
-        logging.info("[INFO] 当日分なし（無通知モード）"); return
+        logging.info("[SUMMARY] 当日分なし（無通知モード）")
+        return
 
     per_strategy = { k:{"races":0,"hits":0,"bets":0,"stake":0,"return":0} for k in ("1","2","3","4") }
     seen_race_strategy:set[Tuple[str,str]] = set()
@@ -954,7 +966,13 @@ def summarize_today_and_notify(targets: List[str]):
         per_strategy[strategy]["bets"]  += len(tickets)
         per_strategy[strategy]["stake"] += int(total)
 
-        paymap=fetch_payoff_map(race_id)
+        # 払戻ページ取得はレースごとに保護
+        try:
+            paymap=fetch_payoff_map(race_id)
+        except Exception as e:
+            logging.warning("[SUMMARY] 払戻取得失敗 rid=%s: %s（このレースはスキップ）", race_id, e)
+            continue
+
         winners={ _normalize_ticket_for_kind(comb, bet_kind): pay for (comb, pay) in paymap.get(bet_kind, []) }
         for t in tickets:
             norm=_normalize_ticket_for_kind(t, bet_kind)
@@ -976,7 +994,13 @@ def summarize_today_and_notify(targets: List[str]):
         lines.append(f"　　　的中率 {hit_rate} / 回収率 {roi}")
     lines.append("")
     lines.append(f"合計：投資 {total_stake:,}円 / 払戻 {total_return:,}円 / 回収率 {pct(total_return, max(total_stake,1))}")
-    notify_strategy_hit_to_many("\n".join(lines), targets)
+
+    msg="\n".join(lines)
+    ok, status = notify_strategy_hit_to_many(msg, targets)
+    if ok:
+        logging.info("[SUMMARY] サマリ通知を送信しました（HTTP %s）", status)
+    else:
+        logging.error("[SUMMARY] サマリ通知の送信に失敗しました（HTTP %s）", status)
 
 # ========= 監視本体（一回実行） =========
 def _tickets_pop_to_umaban(bets: List[str], horses: List[Dict[str,float]]) -> List[str]:
@@ -1001,7 +1025,7 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     p=pathlib.Path(__file__).resolve()
     sha=hashlib.sha1(p.read_bytes()).hexdigest()[:12]
-    logging.info(f"[BUILD] file={p} sha1={sha} v2025-08-15D")
+    logging.info(f"[BUILD] file={p} sha1={sha} v2025-08-15E")
 
     if KILL_SWITCH:
         logging.info("[INFO] KILL_SWITCH=True"); return
@@ -1172,15 +1196,25 @@ def main():
             notified = {}
             try:
                 notified = sheet_load_notified()
-            except Exception:
-                pass
+            except Exception as e:
+                logging.warning("[SUMMARY] 通知フラグの読込に失敗: %s（続行）", e)
             skey = _summary_key_for_today()
             if skey not in notified:
-                summarize_today_and_notify(targets)
+                logging.info("[SUMMARY] トリガ時刻到達（%s）。本日のサマリを送信します。", DAILY_SUMMARY_HHMM)
                 try:
-                    sheet_upsert_notified(skey, time.time(), note=f"daily summary {now:%H:%M}")
+                    summarize_today_and_notify(targets)
                 except Exception as e:
-                    logging.exception("[ERROR] サマリ送信フラグの保存に失敗: %s", e)
+                    # ここで握りつぶさないと「判定に失敗」で全体が終了して再送機会を失う
+                    logging.exception("[SUMMARY] サマリ作成/送信中に未捕捉例外: %s", e)
+                    # 失敗時はフラグを書かずに次回以降の再試行に委ねる
+                else:
+                    try:
+                        sheet_upsert_notified(skey, time.time(), note=f"daily summary {now:%H:%M}")
+                        logging.info("[SUMMARY] サマリ送信フラグを保存しました（%s）。", skey)
+                    except Exception as e:
+                        logging.exception("[SUMMARY] サマリ送信フラグの保存に失敗: %s", e)
+            else:
+                logging.info("[SUMMARY] 本日は既にサマリ送信済み（key=%s）。スキップします。", skey)
     except Exception as e:
         logging.exception("[ERROR] 日次サマリ送信判定に失敗: %s", e)
 
