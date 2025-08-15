@@ -1018,7 +1018,7 @@ def main():
 
             # オッズスナップ
             top3=sorted(horses, key=lambda x:int(x.get("pop",999)))[:3]
-            logging.info("[TRACE] odds_top3 rid=%s %s", rid, [(h.get("pop"), h.get("odds")) for h in top3]])
+            logging.info("[TRACE] odds_top3 rid=%s %s", rid, [(h.get("pop"), h.get("odds")) for h in top3])
 
             hits+=1
             strategy=eval_strategy(horses, logger=logging)
