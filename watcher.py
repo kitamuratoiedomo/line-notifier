@@ -1,14 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-Rakuten競馬 監視・通知バッチ（完全差し替え版 v2025-08-15A）
+Rakuten競馬 監視・通知バッチ（完全差し替え版 v2025-08-15B）
 - 締切時刻：単複オッズ/一覧ページから“締切”を直接抽出（最優先）
 - 発走時刻：一覧ページ優先＋オッズ詳細のフォールバック
 - 窓判定：ターゲット時刻（締切 or 発走）基準、±GRACE_SECONDS の許容
 - 通知：窓内1回 / 429時はクールダウン / Google SheetでTTL永続
 - 送信先：Googleシート(タブA=名称「1」)のH列から userId を収集
 - 戦略③：専用フォーマット（1軸・相手10〜20倍・候補最大4頭・点数表示）
-- 騎手ランク：内蔵200位＋表記ゆれ耐性（クレンジング＋前方一致）
+- 騎手ランク：内蔵200位＋表記ゆれ耐性（強化版クレンジング＋前方一致）
 - 通知本文：『単勝人気－騎手ランク』（例：1－A-3－B-5－C）
+- 未一致の騎手名は [RANKMISS] ログに記録（重複抑止）
 - betsシート：馬番ベースで記録
 - 日次サマリ：指定時刻に1日1回送信（0件でも可）
 - 券種は STRATEGY_BET_KIND_JSON で設定（既定: ①馬連, ②馬単, ③三連単, ④三連複）
@@ -118,22 +119,51 @@ POST_LABEL_PAT    = re.compile(r"(発走|発走予定|発走時刻|発送|出走
 CUTOFF_LABEL_PAT  = re.compile(r"(投票締切|発売締切|締切)")
 
 # ========= 騎手ランク（1〜200位を内蔵） =========
+# RANKMISS 重複抑止用
+_RANKMISS_SEEN: Set[str] = set()
+
+def _log_rank_miss(orig: str, norm: str):
+    key = f"{orig}|{norm}"
+    if key not in _RANKMISS_SEEN:
+        _RANKMISS_SEEN.add(key)
+        logging.info("[RANKMISS] name_raw=%s name_norm=%s", orig, norm)
+
 def _normalize_name(s: str) -> str:
-    if not s: return ""
-    s = unicodedata.normalize("NFKC", s).replace(" ", "").replace("\u3000", "")
-    replace_map = {"廣":"広","齋":"斎","齊":"斉","髙":"高","濱":"浜","﨑":"崎","峯":"峰","內":"内","冨":"富","國":"国","體":"体","眞":"真"}
-    for k,v in replace_map.items(): s = s.replace(k,v)
+    """強化版：全半角正規化・空白除去・旧字体/異体字/一般的誤記の代表表記化"""
+    if not s:
+        return ""
+    s = unicodedata.normalize("NFKC", s)
+    s = s.replace(" ", "").replace("\u3000", "")
+
+    # 代表表記置換（拡充）
+    replace_map = {
+        # 旧字体・異体字
+        "𠮷": "吉", "栁": "柳", "髙": "高", "濵": "浜", "﨑": "崎", "嶋": "島", "峯": "峰",
+        "齋": "斎", "齊": "斉", "內": "内", "冨": "富", "國": "国", "體": "体", "眞": "真",
+        "廣": "広",
+        # 邊の異体字
+        "邊": "辺", "邉": "辺",
+        # 渡邊/渡邉 → 渡辺
+        "渡邊": "渡辺", "渡邉": "渡辺",
+        # 促音・長音の揺れはそのまま（氏名で少ないため）
+    }
+    for k, v in replace_map.items():
+        s = s.replace(k, v)
     return s
 
 def _clean_jockey_name(s: str) -> str:
-    if not s: return ""
-    s = re.sub(r"[（(].*?[）)]", "", s)
-    s = re.sub(r"[▲△☆★◇◆⊙◎○◯◉⚪︎＋+＊*]", "", s)
-    s = re.sub(r"\d+(?:\.\d+)?\s*(?:kg|斤)?", "", s)
-    s = s.replace("斤量","").replace("騎手","").replace("J","").replace("Ｊ","")
+    """括弧・斤量・印などを除去して素の氏名だけにする"""
+    if not s:
+        return ""
+    s = re.sub(r"[（(].*?[）)]", "", s)                           # 括弧内
+    s = re.sub(r"[▲△☆★◇◆⊙◎○◯◉⚪︎＋+＊*]", "", s)                # 印
+    s = re.sub(r"\d+(?:\.\d+)?\s*(?:kg|斤)?", "", s)               # 斤量
+    s = s.replace("斤量", "")
+    s = s.replace("騎手", "").replace("J", "").replace("Ｊ", "")   # 接尾辞
     s = re.sub(r"\s+", "", s)
     return s
 
+# 1〜200位ランク表（ご提供のテーブルを踏襲）
 JOCKEY_RANK_TABLE_RAW: Dict[int, str] = {
     1:"笹川翼",2:"矢野貴之",3:"塚本征吾",4:"小牧太",5:"山本聡哉",6:"野畑凌",7:"石川倭",8:"永森大智",9:"中島龍也",10:"吉原寛人",
     11:"広瀬航",12:"加藤聡一",13:"望月洵輝",14:"鈴木恵介",15:"渡辺竜也",16:"落合玄太",17:"山口勲",18:"本田正重",19:"吉村智洋",20:"赤岡修次",
@@ -145,27 +175,49 @@ JOCKEY_RANK_TABLE_RAW: Dict[int, str] = {
     71:"高橋悠里",72:"土方颯太",73:"長谷部駿弥",74:"高橋愛叶",75:"及川裕一",76:"加茂飛翔",77:"川原正一",78:"村上忍",79:"岡村健司",80:"田野豊三",
     81:"村上弘樹",82:"山崎誠士",83:"竹吉徹",84:"宮内勇樹",85:"船山蔵人",86:"中村太陽",87:"本橋孝太",88:"出水拓人",89:"新庄海誠",90:"山崎雅由",
     91:"阿部武臣",92:"安藤洋一",93:"小林凌",94:"友森翔太郎",95:"福原杏",96:"岩橋勇二",97:"佐々木志音",98:"木之前葵",99:"藤田凌",100:"佐野遥久",
-    # ...（以下略。元コードに同じ）
-    199:"吉村誠之助良",200:"山本聡哉良",
+    101:"井上幹太",102:"佐藤友則",103:"吉村誠之助",104:"吉本隆記",105:"渡辺竜也",106:"吉井友彦",107:"岡田祥嗣",108:"松木大地",109:"加藤和義",110:"田中学",
+    111:"川島拓",112:"森泰斗",113:"服部茂史",114:"加藤誓二",115:"濱尚美",116:"永井孝典",117:"高野誠毅",118:"大畑雅章",119:"大山真吾",120:"長谷部駿弥",
+    121:"丹羽克輝",122:"山口勲二",123:"田中学良",124:"落合玄太朗",125:"細川智史朗",126:"松本剛史",127:"藤原良一",128:"山本政聡良",129:"佐原秀泰",130:"藤田弘治",
+    131:"吉田晃浩",132:"岡村卓弥良",133:"宮川実",134:"郷間勇太",135:"上田将司",136:"倉兼育康",137:"赤岡修二",138:"林謙佑",139:"多田羅誠也良",140:"濱田達也",
+    141:"畑中信司",142:"塚本雄大",143:"岡遼太郎良",144:"岩本怜良",145:"大山龍太郎",146:"佐々木国明",147:"池谷匠翔",148:"佐々木世麗",149:"山田雄大",150:"田中学大",
+    151:"中越琉世",152:"濱田達也良",153:"大久保友雅",154:"小谷周平",155:"大柿一真",156:"長谷部駿也",157:"田村直也",158:"石堂響",159:"竹村達也",160:"鴨宮祥行",
+    161:"杉浦健太良",162:"下原理良",163:"田中洸多",164:"長田進仁",165:"大山真吾良",166:"渡辺薫彦",167:"岡田祥嗣良",168:"吉井章良",169:"松木大地良",170:"笹田知宏良",
+    171:"井上瑛太良",172:"廣瀬航",173:"田村直也良",174:"石堂響良",175:"小谷周平良",176:"中田貴士",177:"大柿一真良",178:"田中学隆",179:"永井孝典良",180:"杉浦健太朗",
+    181:"竹村達也良",182:"鴨宮祥行良",183:"松本剛史良",184:"小牧太良",185:"吉村智洋良",186:"下原理隆",187:"廣瀬航良",188:"長谷部駿弥良",189:"中越琉世良",190:"田中学真",
+    191:"長田進仁良",192:"佐原秀泰良",193:"大柿一真隆",194:"高野誠毅良",195:"山田雄大良",196:"池谷匠翔良",197:"小牧太隆",198:"石川慎将良",199:"吉村誠之助良",200:"山本聡哉良",
 }
 _JOCKEY_NAME_TO_RANK: Dict[str, int] = { _normalize_name(v): k for k, v in JOCKEY_RANK_TABLE_RAW.items() }
 
 def _best_match_rank(name_norm: str) -> Optional[int]:
-    candidates=[]
+    """
+    直接一致がない場合のフォールバック：
+      1) 前方一致
+      2) 逆前方一致（テーブル側が短い場合）
+      候補が複数なら “文字列差が小” → “ランク上位（数値が小さい）” を優先
+    """
+    candidates = []
     for n2, rank in _JOCKEY_NAME_TO_RANK.items():
         if n2.startswith(name_norm) or name_norm.startswith(n2):
-            diff=abs(len(n2)-len(name_norm))
+            diff = abs(len(n2) - len(name_norm))
             candidates.append((diff, rank))
-    if not candidates: return None
-    candidates.sort(key=lambda x:(x[0], x[1]))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: (x[0], x[1]))
     return candidates[0][1]
 
 def jockey_rank_letter_by_name(name: Optional[str]) -> str:
-    if not name: return "—"
-    base = _normalize_name(_clean_jockey_name(name))
-    rank = _JOCKEY_NAME_TO_RANK.get(base) or _best_match_rank(base)
-    if rank is None: return "C"
-    return "A" if 1<=rank<=70 else ("B" if 71<=rank<=200 else "C")
+    """表示ランク: A=1〜70 / B=71〜200 / C=その他 / —=名前なし"""
+    if not name:
+        return "—"
+    base_raw = _clean_jockey_name(name)
+    base = _normalize_name(base_raw)
+    rank = _JOCKEY_NAME_TO_RANK.get(base)
+    if rank is None and base:
+        rank = _best_match_rank(base)
+    if rank is None:
+        _log_rank_miss(base_raw, base)
+        return "C"
+    return "A" if 1 <= rank <= 70 else ("B" if 71 <= rank <= 200 else "C")
 
 # ========= 共通 =========
 def now_jst() -> datetime: return datetime.now(JST)
@@ -930,7 +982,7 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     p=pathlib.Path(__file__).resolve()
     sha=hashlib.sha1(p.read_bytes()).hexdigest()[:12]
-    logging.info(f"[BUILD] file={p} sha1={sha} v2025-08-15A")
+    logging.info(f"[BUILD] file={p} sha1={sha} v2025-08-15B")
 
     if KILL_SWITCH:
         logging.info("[INFO] KILL_SWITCH=True"); return
@@ -1016,9 +1068,10 @@ def main():
                 logging.info("[TRACE] odds rid=%s result=SKIP reason=too_few_horses len=%d", rid, len(horses))
                 time.sleep(random.uniform(*SLEEP_BETWEEN)); continue
 
-            # オッズスナップ
+            # オッズスナップ（安全化：括弧対応）
             top3=sorted(horses, key=lambda x:int(x.get("pop",999)))[:3]
-            logging.info("[TRACE] odds_top3 rid=%s %s", rid, [(h.get("pop"), h.get("odds")) for h in top3])
+            snapshot = [(int(h.get("pop", 0)), float(h.get("odds", 0.0))) for h in top3 if "pop" in h and "odds" in h]
+            logging.info("[TRACE] odds_top3 rid=%s %s", rid, snapshot)
 
             hits+=1
             strategy=eval_strategy(horses, logger=logging)
