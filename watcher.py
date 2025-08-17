@@ -161,7 +161,7 @@ def _clean_jockey_name(s: str) -> str:
 
 # 1〜200位ランク表（抜粋先頭。※野畑凌=ランク6 → A）
 JOCKEY_RANK_TABLE_RAW: Dict[int, str] = json.loads(os.getenv("JOCKEY_RANKS_JSON", "{}"))
-JOCKEY_RANK_TABLE_RAW: Dict[int, str] = {
+JOCKEY_RANK_TABLE_RAW: Dict[int, str] = {}
 _JOCKEY_NAME_TO_RANK: Dict[str, int] = { _normalize_name(v): k for k, v in JOCKEY_RANK_TABLE_RAW.items() }
 
 def _split_family_given(n: str) -> Tuple[str, str]:
