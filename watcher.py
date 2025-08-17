@@ -125,7 +125,8 @@ IGNORE_NEAR_PAT   = re.compile(r"(現在|更新|発売|確定|払戻|実況)")
 POST_LABEL_PAT    = re.compile(r"(発走|発走予定|発走時刻|発送|出走)")
 CUTOFF_LABEL_PAT  = re.compile(r"(投票締切|発売締切|締切)")
 
-# ========= 騎手ランク（1〜200位を内蔵） =========
+
+# ========= 騎手ランク（ENVから読込・堅牢化） =========
 _RANKMISS_SEEN: Set[str] = set()
 
 def _log_rank_miss(orig: str, norm: str):
@@ -151,62 +152,51 @@ def _normalize_name(s: str) -> str:
 def _clean_jockey_name(s: str) -> str:
     """括弧/斤量/印/接尾辞(J/Ｊ/騎手)を除去し素の氏名へ"""
     if not s: return ""
-    s = re.sub(r"[（(].*?[）)]", "", s)                           # 括弧内
-    s = re.sub(r"[▲△☆★◇◆⊙◎○◯◉⚪︎＋+＊*]", "", s)                # 印
-    s = re.sub(r"\d+(?:\.\d+)?\s*(?:kg|斤)?", "", s)               # 斤量
+    s = re.sub(r"[（(].*?[）)]", "", s)
+    s = re.sub(r"[▲△☆★◇◆⊙◎○◯◉⚪︎＋+＊*]", "", s)
+    s = re.sub(r"\d+(?:\.\d+)?\s*(?:kg|斤)?", "", s)
     s = s.replace("斤量", "")
-    s = s.replace("騎手", "").replace("J", "").replace("Ｊ", "")   # 接尾辞
+    s = s.replace("騎手", "").replace("J", "").replace("Ｊ", "")
     s = re.sub(r"\s+", "", s)
     return s
 
-# 1〜200位ランク表（抜粋先頭。※野畑凌=ランク6 → A）
-JOCKEY_RANK_TABLE_RAW: Dict[int, str] = json.loads(os.getenv("JOCKEY_RANKS_JSON", "{}"))
-JOCKEY_RANK_TABLE_RAW: Dict[int, str] = {}
-_JOCKEY_NAME_TO_RANK: Dict[str, int] = { _normalize_name(v): k for k, v in JOCKEY_RANK_TABLE_RAW.items() }
+def _load_jockey_ranks_from_env() -> Dict[int, str]:
+    raw = os.getenv("JOCKEY_RANKS_JSON", "")
+    if not raw:
+        logging.warning("[WARN] JOCKEY_RANKS_JSON が未設定です（全員C扱い）")
+        return {}
+    # ダッシュボードに '...' / "..." で貼った時の外側クォートを剥がす
+    raw = raw.strip()
+    if (raw.startswith("'") and raw.endswith("'")) or (raw.startswith('"') and raw.endswith('"')):
+        raw = raw[1:-1]
+    try:
+        obj = json.loads(raw)
+    except Exception as e:
+        logging.exception("[WARN] JOCKEY_RANKS_JSON の JSON 解析に失敗: %s", e)
+        return {}
+    out: Dict[int, str] = {}
+    for k, v in obj.items():
+        try:
+            out[int(k)] = str(v)
+        except Exception:
+            continue
+    return out
 
-def _split_family_given(n: str) -> Tuple[str, str]:
-    """姓・名（名は連結）を返す。空白が無ければ全体を姓として扱う。"""
-    if not n: return "", ""
-    parts = re.split(r"[\s\u3000]", n)
-    if len(parts) >= 2:
-        return parts[0], "".join(parts[1:])
-    return n, ""
+# ① rank->name をENVから構築
+JOCKEY_RANK_TABLE_RAW: Dict[int, str] = _load_jockey_ranks_from_env()
 
-def _best_match_rank(name_norm: str) -> Optional[int]:
-    """
-    直接一致がない場合のフォールバック：
-      1) 前方一致/逆前方一致
-      2) 姓完全一致＋名頭文字一致
-      3) 姓完全一致
-      → tie はランク上位を優先
-    """
-    cands=[]
-    fam, given = _split_family_given(name_norm)
-    for n2, rank in _JOCKEY_NAME_TO_RANK.items():
-        if n2.startswith(name_norm) or name_norm.startswith(n2):
-            cands.append((0, rank)); continue
-        f2, g2 = _split_family_given(n2)
-        if fam and fam == f2:
-            if given and g2 and given[0] == g2[0]:
-                cands.append((1, rank))
-            else:
-                cands.append((2, rank))
-    if not cands: return None
-    cands.sort(key=lambda x:(x[0], x[1]))
-    return cands[0][1]
+# ② 正規化名 -> 最上位(=数値ランクが最小) を逆引き
+_name_to_best_rank: Dict[str, int] = {}
+for rk, name in JOCKEY_RANK_TABLE_RAW.items():
+    norm = _normalize_name(name)
+    if not norm:
+        continue
+    if norm not in _name_to_best_rank or rk < _name_to_best_rank[norm]:
+        _name_to_best_rank[norm] = rk
 
-def jockey_rank_letter_by_name(name: Optional[str]) -> str:
-    """表示ランク: A=1〜70 / B=71〜200 / C=その他 / —=名前なし"""
-    if not name: return "—"
-    base_raw = _clean_jockey_name(name)
-    base = _normalize_name(base_raw)
-    rank = _JOCKEY_NAME_TO_RANK.get(base)
-    if rank is None and base:
-        rank = _best_match_rank(base)
-    if rank is None:
-        _log_rank_miss(base_raw, base)
-        return "C"
-    return "A" if 1<=rank<=70 else ("B" if 71<=rank<=200 else "C")
+# ③ 他の処理が参照する逆引きマップ
+_JOCKEY_NAME_TO_RANK: Dict[str, int] = _name_to_best_rank
+
 
 # ========= 共通 =========
 def now_jst() -> datetime: return datetime.now(JST)
