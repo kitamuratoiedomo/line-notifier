@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Rakuten競馬 監視・通知バッチ（完全差し替え版 v2025-08-17F4 / 3分割貼り付け版）
+Rakuten競馬 監視・通知バッチ（完全差し替え版 v2025-08-17F5 / 3分割貼り付け版）
 - 締切時刻：単複/一覧ページから“締切”を直接抽出（最優先）
 - 発走時刻：一覧ページ優先＋フォールバック（発走-オフセット）
 - 窓判定：ターゲット時刻（締切 or 発走-オフセット）±GRACE_SECONDS
 - 通知：窓内1回 / 429時はクールダウン / Google SheetでTTL永続
 - 送信先：シート「1」のH列から userId を収集
-- 騎手ランク：ENVの200位表＋表記ゆれ耐性
+- 騎手ランク：ENVの200位表＋表記ゆれ耐性＋姓一致フォールバック
 - 日次サマリ：JST 21:02、1日1回・内容つき・重複防止
 """
 
@@ -85,7 +85,7 @@ TIME_PATS = [
 ]
 CUTOFF_LABEL_PAT  = re.compile(r"(投票締切|発売締切|締切)")
 
-# ========= 騎手ランク =========
+# ========= 騎手ランク（表記ゆれ + 姓フォールバック）=========
 _RANKMISS_SEEN: Set[str] = set()
 def _log_rank_miss(orig, norm):
     key=f"{orig}|{norm}"
@@ -126,16 +126,34 @@ def _load_jockey_ranks_from_env() -> Dict[int,str]:
         except: pass
     return out
 
+# env → 厳密名/姓インデックスを構築
 JOCKEY_RANK_TABLE_RAW=_load_jockey_ranks_from_env()
-_name_to_rank={}
+_name_to_rank: Dict[str,int] = {}
+_surname_to_best_rank: Dict[str,int] = {}
+_SURNAME_RE = re.compile(r"^[\u4E00-\u9FFF]+")  # 先頭の連続する漢字を姓とみなす
+
+def _surname(norm_name: str) -> str:
+    m=_SURNAME_RE.match(norm_name or "")
+    return m.group(0) if m else ""
+
 for rk, nm in JOCKEY_RANK_TABLE_RAW.items():
     norm=_normalize_name(nm)
-    if norm and (norm not in _name_to_rank or rk < _name_to_rank[norm]):
+    if not norm: continue
+    # 氏名で最良順位
+    if norm not in _name_to_rank or rk < _name_to_rank[norm]:
         _name_to_rank[norm]=rk
+    # 姓でも最良順位
+    s=_surname(norm)
+    if s:
+        if s not in _surname_to_best_rank or rk < _surname_to_best_rank[s]:
+            _surname_to_best_rank[s]=rk
 
 def jockey_rank_letter_by_name(raw: Optional[str]) -> str:
     norm=_normalize_name(_clean_jockey_name(str(raw or "")))
     rk=_name_to_rank.get(norm)
+    if rk is None:
+        s=_surname(norm)
+        rk=_surname_to_best_rank.get(s)
     if rk is None:
         _log_rank_miss(raw,norm)
         return "C"
@@ -474,6 +492,7 @@ def parse_odds_table(soup: BeautifulSoup) -> Tuple[List[Dict[str,float]], Option
         if num is not None: rec["num"]=num
         if jockey: rec["jockey"]=jockey
         horses.append(rec)
+    # 人気重複の排除
     uniq={}
     for h in sorted(horses, key=lambda x:x["pop"]): uniq[h["pop"]]=h
     horses=[uniq[k] for k in sorted(uniq.keys())]
@@ -562,7 +581,7 @@ def is_within_window(target_dt: datetime) -> bool:
     start = target_dt - timedelta(minutes=WINDOW_BEFORE_MIN)
     end   = target_dt + timedelta(minutes=WINDOW_AFTER_MIN)
     return (start - timedelta(seconds=GRACE_SECONDS)) <= now <= (end + timedelta(seconds=GRACE_SECONDS))
-
+    
 # ========= LINE通知 / 表示 / 日次サマリ =========
 def push_line_text(to_user_ids: List[str], message: str) -> Tuple[int, str]:
     if DRY_RUN or not NOTIFY_ENABLED:
@@ -615,6 +634,7 @@ def append_bet_trace(race_id: str, note: str=""):
     except Exception as e:
         logging.warning("[WARN] bets追記失敗: %s", e)
 
+# ---- 日次サマリ ----
 def _daily_summary_due(now: datetime) -> bool:
     hhmm=DAILY_SUMMARY_HHMM.strip()
     if not re.match(r"^\d{1,2}:\d{2}$", hhmm): return False
@@ -663,27 +683,24 @@ def summarize_today_and_notify():
     if not ALWAYS_NOTIFY_DAILY_SUMMARY: return
     now=now_jst()
     if not _daily_summary_due(now): return
-
     key = f"DAILY_SUMMARY:{now.strftime('%Y%m%d')}"
     notified = sheet_load_notified()
     if key in notified:
         logging.info("[INFO] 日次サマリは既送信: %s", key)
         return
-
     try:
         svc=_sheet_service(); title=_resolve_sheet_title(svc, GOOGLE_SHEET_TAB)
         values=_sheet_get_range_values(svc, title, "A:C") or []
     except Exception as e:
         logging.warning("[WARN] サマリ集計失敗: %s", e)
         values=[]
-
     body=_build_summary_body(values, now.strftime("%Y%m%d"))
     msg=f"【日次サマリ】{now.strftime('%Y-%m-%d')}\n{body}"
     uids=load_user_ids_from_simple_col()
     push_line_text(uids, msg)
     sheet_upsert_notified(key, time.time(), body)
 
-# ========= スキャン本体 / エントリーポイント =========
+# ========= スキャン本体（TTLキーを strat_id まで拡張） =========
 def _scan_and_notify_once() -> Tuple[int,int]:
     """
     return: (HITS, MATCHES)
@@ -710,11 +727,7 @@ def _scan_and_notify_once() -> Tuple[int,int]:
         if not in_window and not FORCE_RUN:
             continue
 
-        key=f"{rid}:{target_dt.strftime('%H%M')}"
-        last_ts=notified.get(key, 0)
-        if (time.time() - last_ts) < NOTIFY_TTL_SEC and not FORCE_RUN:
-            continue
-
+        # 単複ページを見て戦略判定（ここで strat_id を取得）
         tanfuku = check_tanfuku_page(rid)
         if not tanfuku:
             continue
@@ -728,6 +741,13 @@ def _scan_and_notify_once() -> Tuple[int,int]:
 
         if not strat or not strat.get("match"):
             logging.info("[TRACE] judge rid=%s result=FAIL reason=no_strategy_match", rid)
+            continue
+
+        # === 重複防止: strat_id を含めた TTL キー ===
+        strat_id = str(strat.get("id", "X"))
+        key=f"{rid}:{target_dt.strftime('%H%M')}:{strat_id}"
+        last_ts=notified.get(key, 0)
+        if (time.time() - last_ts) < NOTIFY_TTL_SEC and not FORCE_RUN:
             continue
 
         matches += 1
@@ -770,4 +790,3 @@ def run_watcher_forever(sleep_sec: int = 60):
         except Exception as e:
             logging.exception("[FATAL] ループ例外: %s", e)
         time.sleep(max(10, sleep_sec))
-
