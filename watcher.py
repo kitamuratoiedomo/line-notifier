@@ -1,29 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-Rakuten競馬 監視・通知バッチ（完全差し替え版 v2025-08-15E）
+Rakuten競馬 監視・通知バッチ（完全差し替え版 v2025-08-17F）
 - 締切時刻：単複オッズ/一覧ページから“締切”を直接抽出（最優先）
 - 発走時刻：一覧ページ優先＋オッズ詳細のフォールバック
 - 窓判定：ターゲット時刻（締切 or 発走）基準、±GRACE_SECONDS の許容
 - 通知：窓内1回 / 429時はクールダウン / Google SheetでTTL永続
 - 送信先：Googleシート(タブA=名称「1」)のH列から userId を収集
 - 戦略③：専用フォーマット（1軸・相手10〜20倍・候補最大4頭・点数表示）
-- 騎手ランク：内蔵200位＋表記ゆれ耐性（強化クレンジング＋前方一致＋姓一致フォールバック）
+- 騎手ランク：ENVの200位表＋表記ゆれ耐性（強化クレンジング＋前方一致＋姓一致フォールバック）
 - ★通知本文：買い目を「馬番＋オッズ＋騎手ランク」で表示
-  例：3番（1人気／1.7倍／A）- 5番（3人気／6.0倍／B）
-  ※戦略1/2/4の表示は『人気優先→馬番へ変換』に統一（11人気混入対策）
-- 未一致の騎手名は [RANKMISS] ログに記録（重複抑止）＋ [RANKDBG] で突合過程を出力
-- betsシート：馬番ベースで記録（仕様は従来通り）
-- 日次サマリ：JST 21:02 に当日1回だけ送信（0件でも送信） ← FIX
-- 券種は STRATEGY_BET_KIND_JSON で設定（既定: ①馬連, ②馬単, ③三連単, ④三連複）
-
-★締切基準で運用する場合：
-  - 環境変数 CUTOFF_OFFSET_MIN を 5（推奨）に設定
-  - 本版は “締切そのもの” を抽出できたらそれを採用。取れない場合のみ「発走-5分」を代用。
-
-★本版の変更点（E）：
-  - 日次サマリ実行を 21:02 で確実にトリガ（>= 判定・重複抑止はシートの summary フラグ）
-  - サマリ作成中の払戻ページ404等はレース単位で捕捉してスキップ（処理全体を落とさない）
-  - サマリ開始・結果・スキップ理由などログを強化
+- betsシート：馬番ベースで記録
+- 日次サマリ：JST 21:02 に当日1回だけ送信（0件でも送信）
 """
 
 import os, re, json, time, random, logging, pathlib, hashlib, unicodedata
@@ -125,7 +112,6 @@ IGNORE_NEAR_PAT   = re.compile(r"(現在|更新|発売|確定|払戻|実況)")
 POST_LABEL_PAT    = re.compile(r"(発走|発走予定|発走時刻|発送|出走)")
 CUTOFF_LABEL_PAT  = re.compile(r"(投票締切|発売締切|締切)")
 
-
 # ========= 騎手ランク（ENVから読込・堅牢化） =========
 _RANKMISS_SEEN: Set[str] = set()
 
@@ -165,7 +151,6 @@ def _load_jockey_ranks_from_env() -> Dict[int, str]:
     if not raw:
         logging.warning("[WARN] JOCKEY_RANKS_JSON が未設定です（全員C扱い）")
         return {}
-    # ダッシュボードに '...' / "..." で貼った時の外側クォートを剥がす
     raw = raw.strip()
     if (raw.startswith("'") and raw.endswith("'")) or (raw.startswith('"') and raw.endswith('"')):
         raw = raw[1:-1]
@@ -228,6 +213,26 @@ def _best_match_rank(name_norm: str) -> Optional[int]:
     cands.sort(key=lambda x:(x[0], x[1]))
     return cands[0][1]
 
+def jockey_rank_letter_by_name(name: Optional[str]) -> str:
+    """
+    騎手名(表記ゆれ含む) → ランク文字 A/B/C
+    A: 1〜70位, B: 71〜200位, C: それ以外 or 不明
+    """
+    if not name:
+        return "C"
+    raw = _clean_jockey_name(name)
+    norm = _normalize_name(raw)
+    if not norm:
+        return "C"
+    rk = _JOCKEY_NAME_TO_RANK.get(norm)
+    if rk is None:
+        rk = _best_match_rank(norm)
+        if rk is None:
+            _log_rank_miss(raw, norm)
+            return "C"
+    if 1 <= rk <= 70:   return "A"
+    if 71 <= rk <= 200: return "B"
+    return "C"
 
 # ========= 共通 =========
 def now_jst() -> datetime: return datetime.now(JST)
@@ -280,32 +285,6 @@ def _sheet_update_range_values(svc, title: str, a1: str, values: List[List[str]]
     svc.spreadsheets().values().update(
         spreadsheetId=GOOGLE_SHEET_ID, range=f"'{title}'!{a1}",
         valueInputOption="RAW", body={"values": values}).execute()
-
-def sheet_load_notified() -> Dict[str, float]:
-    svc=_sheet_service(); title=_resolve_sheet_title(svc, GOOGLE_SHEET_TAB)
-    values=_sheet_get_range_values(svc, title, "A:C")
-    start = 1 if values and values[0] and str(values[0][0]).upper() in ("KEY","RACEID","RID","ID") else 0
-    d={}
-    for row in values[start:]:
-        if not row or len(row)<2: continue
-        key=str(row[0]).strip()
-        try: d[key]=float(row[1])
-        except: pass
-    return d
-
-def sheet_upsert_notified(key: str, ts: float, note: str = "") -> None:
-    svc=_sheet_service(); title=_resolve_sheet_title(svc, GOOGLE_SHEET_TAB)
-    values=_sheet_get_range_values(svc, title, "A:C")
-    header=["KEY","TS_EPOCH","NOTE"]
-    if not values:
-        _sheet_update_range_values(svc, title, "A:C", [header, [key, ts, note]]); return
-    start_row=1 if values and values[0] and values[0][0] in header else 0
-    found=None
-    for i,row in enumerate(values[start_row:], start=start_row):
-        if row and str(row[0]).strip()==key: found=i; break
-    if found is None: values.append([key, ts, note])
-    else: values[found]=[key, ts, note]
-    _sheet_update_range_values(svc, title, "A:C", values)
 
 # ========= 送信先ユーザー =========
 def load_user_ids_from_simple_col() -> List[str]:
@@ -741,7 +720,7 @@ def notify_strategy_hit_to_many(message_text: str, targets: List[str]):
         time.sleep(0.2)
     return all_ok, last
 
-# ========= 表示用マップ =========
+# ========= 表示用マップ & 表示整形 =========
 def _map_pop_info(horses: List[Dict[str,float]]) -> Dict[int, Dict[str, Optional[float]]]:
     m={}
     for h in horses:
@@ -766,15 +745,12 @@ def _map_umaban_info(horses: List[Dict[str,float]]) -> Dict[int, Dict[str, Optio
         except: pass
     return out
 
-# === 人気優先で表示（戦略1/2/4） ===
 def _format_single_leg_prefer_pop(n:int, pop2:Dict[int,Dict], uma2:Dict[int,Dict]) -> Optional[str]:
-    # まず『人気』として解釈 → 馬番へ
     pinf = pop2.get(n)
     if pinf and (pinf.get("umaban") is not None) and (pinf.get("odds") is not None):
         uma=int(pinf["umaban"]); odds=float(pinf["odds"]); jk=pinf.get("jockey")
         rank=jockey_rank_letter_by_name(jk) if jk else "—"
         return f"{uma}番（{n}人気／{odds:.1f}倍／{rank}）"
-    # ダメなら『馬番』として解釈
     uinf = uma2.get(n)
     if uinf and (uinf.get("pop") is not None) and (uinf.get("odds") is not None):
         pop=int(uinf["pop"]); odds=float(uinf["odds"]); jk=uinf.get("jockey")
@@ -797,13 +773,14 @@ def _format_bet_display_line(ticket: str, horses: List[Dict[str,float]], prefer:
 def _format_bets_umaban_odds_rank(bets: List[str], horses: List[Dict[str,float]], prefer:str="pop") -> List[str]:
     return [_format_bet_display_line(b, horses, prefer=prefer) for b in bets]
 
-# ========= 通知本文（①②④ 共通） =========
 _CIRCLED="①②③④⑤⑥⑦⑧⑨"
 def _circled(n:int)->str: return _CIRCLED[n-1] if 1<=n<=9 else f"{n}."
+
 def _extract_hhmm_label(s:str)->Optional[str]:
     got=_norm_hhmm_from_text(s)
     if not got: return None
     hh,mm,_=got; return f"{hh:02d}:{mm:02d}"
+
 def _infer_pattern_no(strategy_text: str) -> int:
     if not strategy_text: return 0
     m=re.match(r"\s*([①-⑨])", strategy_text)
@@ -813,9 +790,11 @@ def _infer_pattern_no(strategy_text: str) -> int:
         try: return int(m.group(1))
         except: return 0
     return 0
+
 def _strip_pattern_prefix(strategy_text: str) -> str:
     s=re.sub(r"^\s*[①-⑨]\s*", "", strategy_text or "")
     s=re.sub(r"^\s*\d+\s*", "", s); return s.strip()
+
 def _split_venue_race(venue_race: str) -> Tuple[str,str]:
     if not venue_race: return "地方競馬",""
     m=re.search(r"^\s*([^\s\d]+)\s*(\d{1,2}R)\b", venue_race)
@@ -843,7 +822,6 @@ def build_line_notification(pattern_no:int, venue:str, race_no:str, time_label:s
     ]
     return "\n".join(lines)
 
-# ========= ③専用 =========
 def build_line_notification_strategy3(strategy:Dict, venue:str, race_no:str, time_label:str, time_hm:str,
                                       odds_timestamp_hm:Optional[str], odds_url:str,
                                       horses:List[Dict[str,float]]) -> str:
@@ -1037,7 +1015,7 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     p=pathlib.Path(__file__).resolve()
     sha=hashlib.sha1(p.read_bytes()).hexdigest()[:12]
-    logging.info(f"[BUILD] file={p} sha1={sha} v2025-08-15E")
+    logging.info(f"[BUILD] file={p} sha1={sha} v2025-08-17F")
 
     if KILL_SWITCH:
         logging.info("[INFO] KILL_SWITCH=True"); return
@@ -1216,7 +1194,6 @@ def main():
                 try:
                     summarize_today_and_notify(targets)
                 except Exception as e:
-                    # ここで握りつぶさないと「判定に失敗」で全体が終了して再送機会を失う
                     logging.exception("[SUMMARY] サマリ作成/送信中に未捕捉例外: %s", e)
                     # 失敗時はフラグを書かずに次回以降の再試行に委ねる
                 else:
@@ -1241,3 +1218,4 @@ def run_watcher_forever(interval_sec: int = int(os.getenv("WATCHER_INTERVAL_SEC"
         except Exception as e:
             logging.exception("[FATAL] watcherループ例外: %s", e)
         time.sleep(interval_sec)
+
