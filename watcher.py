@@ -197,6 +197,37 @@ for rk, name in JOCKEY_RANK_TABLE_RAW.items():
 # ③ 他の処理が参照する逆引きマップ
 _JOCKEY_NAME_TO_RANK: Dict[str, int] = _name_to_best_rank
 
+def _split_family_given(n: str) -> Tuple[str, str]:
+    """姓・名（名は連結）を返す。空白が無ければ全体を姓として扱う。"""
+    if not n: return "", ""
+    parts = re.split(r"[\s\u3000]", n)
+    if len(parts) >= 2:
+        return parts[0], "".join(parts[1:])
+    return n, ""
+
+def _best_match_rank(name_norm: str) -> Optional[int]:
+    """
+    直接一致がない場合のフォールバック：
+      1) 前方一致/逆前方一致
+      2) 姓完全一致＋名頭文字一致
+      3) 姓完全一致
+      → tie はランク上位を優先
+    """
+    cands=[]
+    fam, given = _split_family_given(name_norm)
+    for n2, rank in _JOCKEY_NAME_TO_RANK.items():
+        if n2.startswith(name_norm) or name_norm.startswith(n2):
+            cands.append((0, rank)); continue
+        f2, g2 = _split_family_given(n2)
+        if fam and fam == f2:
+            if given and g2 and given[0] == g2[0]:
+                cands.append((1, rank))
+            else:
+                cands.append((2, rank))
+    if not cands: return None
+    cands.sort(key=lambda x:(x[0], x[1]))
+    return cands[0][1]
+
 
 # ========= 共通 =========
 def now_jst() -> datetime: return datetime.now(JST)
