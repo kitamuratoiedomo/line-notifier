@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Rakuten競馬 監視・通知バッチ（完全差し替え版 v2025-08-17F5 / 3分割貼り付け版）
+Rakuten競馬 監視・通知バッチ（完全差し替え版 v2025-08-18G1 / 3分割貼り付け版）
 - 締切時刻：単複/一覧ページから“締切”を直接抽出（最優先）
 - 発走時刻：一覧ページ優先＋フォールバック（発走-オフセット）
 - 窓判定：ターゲット時刻（締切 or 発走-オフセット）±GRACE_SECONDS
@@ -8,6 +8,7 @@ Rakuten競馬 監視・通知バッチ（完全差し替え版 v2025-08-17F5 / 3
 - 送信先：シート「1」のH列から userId を収集
 - 騎手ランク：ENVの200位表＋表記ゆれ耐性＋姓一致フォールバック
 - 日次サマリ：JST 21:02、1日1回・内容つき・重複防止
+- 追加: ENABLE_FETCH_CARD_FOR_JOCKEY（デフォルトOFFでrace_card 404抑止）
 """
 
 import os, re, json, time, random, logging, unicodedata
@@ -76,6 +77,9 @@ ALWAYS_NOTIFY_DAILY_SUMMARY = os.getenv("ALWAYS_NOTIFY_DAILY_SUMMARY", "1") == "
 
 DEBUG_RACEIDS = [s.strip() for s in os.getenv("DEBUG_RACEIDS", "").split(",") if s.strip()]
 
+# NEW: race_card からの騎手補完を抑止するトグル（既定: OFF）
+ENABLE_FETCH_CARD_FOR_JOCKEY = os.getenv("ENABLE_FETCH_CARD_FOR_JOCKEY", "0") == "1"
+
 RACEID_RE   = re.compile(r"/RACEID/(\d{18})")
 PLACEHOLDER = re.compile(r"\d{8}0000000000$")
 TIME_PATS = [
@@ -126,7 +130,6 @@ def _load_jockey_ranks_from_env() -> Dict[int,str]:
         except: pass
     return out
 
-# env → 厳密名/姓インデックスを構築
 JOCKEY_RANK_TABLE_RAW=_load_jockey_ranks_from_env()
 _name_to_rank: Dict[str,int] = {}
 _surname_to_best_rank: Dict[str,int] = {}
@@ -139,14 +142,16 @@ def _surname(norm_name: str) -> str:
 for rk, nm in JOCKEY_RANK_TABLE_RAW.items():
     norm=_normalize_name(nm)
     if not norm: continue
-    # 氏名で最良順位
     if norm not in _name_to_rank or rk < _name_to_rank[norm]:
         _name_to_rank[norm]=rk
-    # 姓でも最良順位
     s=_surname(norm)
     if s:
         if s not in _surname_to_best_rank or rk < _surname_to_best_rank[s]:
             _surname_to_best_rank[s]=rk
+
+# 起動時にENVの充足度を可視化
+logging.info("[RANK] env_rows=%d mapped_full=%d mapped_surn=%d",
+             len(JOCKEY_RANK_TABLE_RAW), len(_name_to_rank), len(_surname_to_best_rank))
 
 def jockey_rank_letter_by_name(raw: Optional[str]) -> str:
     norm=_normalize_name(_clean_jockey_name(str(raw or "")))
@@ -255,7 +260,7 @@ def load_user_ids_from_simple_col() -> List[str]:
         if v not in user_ids: user_ids.append(v)
     logging.info("[INFO] usersシート読込: %d件 from tab=%s", len(user_ids), title)
     return user_ids if user_ids else ([LINE_USER_ID] if LINE_USER_ID else [])
-
+    
 # ========= HTMLユーティリティ / 時刻抽出 =========
 def _rid_date_parts(rid: str) -> Tuple[int,int,int]:
     return int(rid[0:4]), int(rid[4:6]), int(rid[6:8])
@@ -526,6 +531,13 @@ def fetch_jockey_map_from_card(race_id: str) -> Dict[int, str]:
     return result
 
 def _enrich_horses_with_jockeys(horses: List[Dict[str,float]], race_id: str) -> None:
+    # NEW: デフォルトで race_card を見に行かない（404抑止）
+    if not ENABLE_FETCH_CARD_FOR_JOCKEY:
+        for h in horses:
+            if h.get("jockey"):
+                h["jockey"]=_clean_jockey_name(h["jockey"])
+        return
+
     need=any((h.get("jockey") is None) and isinstance(h.get("num"), int) for h in horses)
     num2jockey=fetch_jockey_map_from_card(race_id) if need else {}
     for h in horses:
@@ -541,6 +553,15 @@ def check_tanfuku_page(race_id: str) -> Optional[Dict]:
     if not horses: return None
     if not venue_race: venue_race="地方競馬"
     _enrich_horses_with_jockeys(horses, race_id)
+
+    # NEW: 上位状況を軽く可視化
+    try:
+        top_log="; ".join([f"#{h.get('pop','?')}:odds={h.get('odds','?')},num={h.get('num','-')},j={h.get('jockey','')}"
+                           for h in sorted(horses, key=lambda x:x.get('pop',999))[:5]])
+        logging.info("[METRIC] tanfuku rid=%s top=%s", race_id, top_log)
+    except Exception:
+        pass
+
     return {"race_id": race_id, "url": url, "horses": horses, "venue_race": venue_race, "now": now_label or ""}
 
 # ========= レース列挙・時刻解決 / 窓判定 =========
@@ -581,7 +602,7 @@ def is_within_window(target_dt: datetime) -> bool:
     start = target_dt - timedelta(minutes=WINDOW_BEFORE_MIN)
     end   = target_dt + timedelta(minutes=WINDOW_AFTER_MIN)
     return (start - timedelta(seconds=GRACE_SECONDS)) <= now <= (end + timedelta(seconds=GRACE_SECONDS))
-    
+
 # ========= LINE通知 / 表示 / 日次サマリ =========
 def push_line_text(to_user_ids: List[str], message: str) -> Tuple[int, str]:
     if DRY_RUN or not NOTIFY_ENABLED:
@@ -700,7 +721,7 @@ def summarize_today_and_notify():
     push_line_text(uids, msg)
     sheet_upsert_notified(key, time.time(), body)
 
-# ========= スキャン本体（TTLキーを strat_id まで拡張） =========
+# ========= スキャン本体（TTLキーに strat_id を含める） =========
 def _scan_and_notify_once() -> Tuple[int,int]:
     """
     return: (HITS, MATCHES)
@@ -717,6 +738,19 @@ def _scan_and_notify_once() -> Tuple[int,int]:
     for rid in DEBUG_RACEIDS:
         if rid not in rids: rids.append(rid)
 
+    # NEW: 窓候補とソース内訳のメトリクス
+    logging.info("[METRIC] rids=%d post_map=%d cutoff_map=%d", len(rids), len(post_map), len(cutoff_map))
+    cand_in_window=0; src_count={"cut_t":0,"cut_l":0,"off":0}
+    for _rid in rids:
+        _dt,_src = fallback_target_time(_rid, post_map, cutoff_map)
+        if _src.startswith("締切:"): 
+            if "tanfuku" in _src: src_count["cut_t"]+=1
+            else:                 src_count["cut_l"]+=1
+        elif _src=="発走-オフセット": src_count["off"]+=1
+        if _dt and is_within_window(_dt): cand_in_window+=1
+    logging.info("[METRIC] in_window=%d src={締切:tanfuku:%d, 締切:list:%d, 発走-オフセット:%d}",
+                 cand_in_window, src_count["cut_t"], src_count["cut_l"], src_count["off"])
+
     for rid in rids:
         target_dt, src = fallback_target_time(rid, post_map, cutoff_map)
         if not target_dt: 
@@ -727,7 +761,7 @@ def _scan_and_notify_once() -> Tuple[int,int]:
         if not in_window and not FORCE_RUN:
             continue
 
-        # 単複ページを見て戦略判定（ここで strat_id を取得）
+        # 単複ページで戦略判定
         tanfuku = check_tanfuku_page(rid)
         if not tanfuku:
             continue
@@ -740,7 +774,13 @@ def _scan_and_notify_once() -> Tuple[int,int]:
             strat = {"match": False}
 
         if not strat or not strat.get("match"):
-            logging.info("[TRACE] judge rid=%s result=FAIL reason=no_strategy_match", rid)
+            # NEW: 不一致時に上位3の素性を出す
+            try:
+                top3="; ".join([f"#{h.get('pop')}/odds{h.get('odds')}" 
+                                for h in sorted(tanfuku['horses'], key=lambda x:x.get('pop',999))[:3]])
+            except Exception:
+                top3="N/A"
+            logging.info("[TRACE] judge rid=%s result=FAIL reason=no_strategy_match top3=%s", rid, top3)
             continue
 
         # === 重複防止: strat_id を含めた TTL キー ===
