@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-Rakuten競馬 監視・通知バッチ（完全差し替え版 v2025-08-18R1）
+Rakuten競馬 監視・通知バッチ（完全差し替え版 v2025-08-19R2）
 - 締切時刻：単複/一覧ページから“締切”を直接抽出（最優先）
 - 発走時刻：一覧ページ優先＋フォールバック（発走-オフセット）
 - 窓判定：ターゲット時刻（締切 or 発走-オフセット）±GRACE_SECONDS
 - 通知：窓内1回 / 429時はクールダウン / Google SheetでTTL永続
 - 送信先：シート「1」のH列から userId を収集
 - 騎手ランク：ENVの200位表＋表記ゆれ耐性＋姓一致フォールバック
-- ★NEW: eval_strategy へ渡す前に各馬へ rank / rank_score を埋め込み
+- eval_strategy に logger を渡してデバッグ内訳ログを必ず出力
+- 通知本文：戦略ラベル＋買い目（人気/馬番 or ③の馬番）＋注意書き を表示
 - 日次サマリ：JST 21:02、1日1回・内容つき・重複防止
 """
 
@@ -530,7 +531,7 @@ def _enrich_horses_with_jockeys(horses: List[Dict[str,float]], race_id: str) -> 
     """
     - 馬番→騎手名の補完（カード）
     - 騎手名の再正規化
-    - ★ rank / rank_score の埋め込み（eval_strategy が参照できるように）
+    - rank / rank_score の埋め込み（eval_strategy が参照できるように）
     """
     need=any((h.get("jockey") is None) and isinstance(h.get("num"), int) for h in horses)
     num2jockey=fetch_jockey_map_from_card(race_id) if need else {}
@@ -541,7 +542,7 @@ def _enrich_horses_with_jockeys(horses: List[Dict[str,float]], race_id: str) -> 
         if h.get("jockey"):
             h["jockey"]=_clean_jockey_name(h["jockey"])  # 再正規化
 
-        # ---- ここが今回の肝 ----
+        # ランク付与
         jname = h.get("jockey") or ""
         rk_letter = jockey_rank_letter_by_name(jname) if jname else "C"
         h["rank"] = rk_letter
@@ -626,15 +627,75 @@ def _fmt_horse_line(h) -> str:
     rank = h.get("rank") or (jockey_rank_letter_by_name(jname) if jname else "C")
     return f"  馬番{num}  単勝{odds}倍  騎手:{jname}（{rank}）"
 
-def build_line_notification(result: Dict, race_id: str, target_dt: datetime, target_src: str, venue_race: str, now_label: str) -> str:
-    header = f"{venue_race} / RID:{race_id[-6:]} / ターゲット={target_dt.strftime('%H:%M')}（{target_src}）"
-    body_lines=[]
+def build_line_notification(result: Dict, strat: Dict, race_id: str, target_dt: datetime, target_src: str, venue_race: str, now_label: str) -> str:
+    """
+    result: tanfukuパース結果（horses, url, now, venue_race）
+    strat : eval_strategy の返却（match=True, id, label, tickets, axis?, candidates?）
+    """
     horses = result.get("horses", [])
-    for h in sorted(horses, key=lambda x:x.get("pop", 999))[:5]:
-        body_lines.append(_fmt_horse_line(h))
-    tail = (f"\n更新:{now_label}" if now_label else "")
-    url = result.get("url","")
-    return f"{header}\n" + "\n".join(body_lines) + tail + (f"\n{url}" if url else "")
+    url    = result.get("url", "")
+
+    # 人気→馬番マップ
+    pop2num = {}
+    for h in horses:
+        if isinstance(h.get("pop"), int) and isinstance(h.get("num"), int):
+            pop2num[h["pop"]] = h["num"]
+
+    def _fmt_ticket_umaban(tk: str) -> str:
+        """'1-2-3'等の人気表記を馬番に変換。変換不能時は'-'"""
+        try:
+            a, b, c = [int(x) for x in tk.split("-")]
+            return f"{pop2num.get(a, '-')}-{pop2num.get(b, '-')}-{pop2num.get(c, '-')}"
+        except Exception:
+            return tk  # ③など既に馬番表記ならそのまま
+
+    # 見出し
+    header = f"{venue_race} / RID:{race_id[-6:]} / ターゲット={target_dt.strftime('%H:%M')}（{target_src}）"
+    lines = [header, f"【{strat.get('label','戦略')}】"]
+
+    # 買い目
+    tickets = strat.get("tickets", []) or []
+    n = len(tickets)
+
+    if strat.get("id") == "S3":
+        # ③は馬番生成済み（足りなければ人気フォールバック）
+        head = " / ".join(tickets[:8]) + (" …" if n > 8 else "")
+        lines.append(f"買い目（馬番）: {head}（全{n}点）")
+
+        # ③の補足（軸・相手）
+        axis = strat.get("axis") or {}
+        axis_umaban = axis.get("umaban") or "-"
+        axis_odds   = axis.get("odds")
+        lines.append(f"軸: 馬番{axis_umaban}（単勝{axis_odds:.1f}倍）" if isinstance(axis_odds,(int,float)) else f"軸: 馬番{axis_umaban}")
+        cands = strat.get("candidates") or []
+        if cands:
+            cand_s = " / ".join([f"{c.get('umaban','-')}({c.get('odds',0):.1f})" if isinstance(c.get('odds'),(int,float)) else str(c.get('umaban','-')) for c in cands])
+            lines.append(f"相手候補: {cand_s}")
+    else:
+        # ①②④は人気→馬番の両方
+        head_pop = " / ".join(tickets[:8]) + (" …" if n > 8 else "")
+        head_num = " / ".join([_fmt_ticket_umaban(tk) for tk in tickets[:8]]) + (" …" if n > 8 else "")
+        lines.append(f"買い目（人気）: {head_pop}（全{n}点）")
+        lines.append(f"買い目（馬番）: {head_num}")
+
+    # 上位オッズ（従来表示）
+    lines.append("")  # 空行
+    lines.append("上位オッズ:")
+    for h in sorted(horses, key=lambda x: x.get("pop", 999))[:5]:
+        lines.append(_fmt_horse_line(h))
+
+    # 更新時刻・URL
+    if now_label:
+        lines.append(f"更新:{now_label}")
+    if url:
+        lines.append(url)
+
+    # 注意書き（仕様で必須）
+    lines.append("")
+    lines.append("※オッズは締切直前まで変化しますので、ご注意ください。")
+    lines.append("※馬券の的中を保証するものではありません。余裕資金の範囲内で馬券購入をお願いします。")
+
+    return "\n".join(lines)
 
 def append_bet_trace(race_id: str, note: str=""):
     try:
@@ -756,9 +817,9 @@ def _scan_and_notify_once() -> Tuple[int,int]:
         except Exception:
             pass
 
-        # 戦略判定
+        # 戦略判定（デバッグ内訳ログを出す）
         try:
-            strat = eval_strategy(tanfuku["horses"])
+            strat = eval_strategy(tanfuku["horses"], logger=logging)
         except Exception as e:
             logging.warning("[WARN] eval_strategy 例外: %s", e)
             strat = {"match": False}
@@ -780,7 +841,8 @@ def _scan_and_notify_once() -> Tuple[int,int]:
 
         venue_race = tanfuku.get("venue_race","")
         now_label  = tanfuku.get("now","")
-        message = build_line_notification(tanfuku, rid, target_dt, src, venue_race, now_label)
+        # ★ strat を渡す：買い目表示を含めて本文を生成
+        message = build_line_notification(tanfuku, strat, rid, target_dt, src, venue_race, now_label)
 
         status, last = push_line_text(user_ids, message)
         logging.info("[INFO] LINE push status=%s detail=%s", status, str(last)[:120])
