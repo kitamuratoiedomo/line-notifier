@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Rakuten競馬 監視・通知バッチ（完全差し替え版 v2025-08-19R3 / ROI入りサマリ）
+Rakuten競馬 監視・通知バッチ（完全差し替え版 v2025-08-19R3-fix1 / ROI入りサマリ）
 - 締切時刻：単複/一覧ページから“締切”を直接抽出（最優先）
 - 発走時刻：一覧ページ優先＋フォールバック（発走-オフセット）
 - 窓判定：ターゲット時刻（締切 or 発走-オフセット）±GRACE_SECONDS
@@ -444,7 +444,7 @@ def _find_popular_odds_table(soup: BeautifulSoup) -> Tuple[Optional[BeautifulSou
             if h in ("人気","順位") or ("人気" in h and "順" not in h): pop_idx=i; break
         win_c=[]
         for i,h in enumerate(headers):
-            if ("複" in h) or ("率" in h) or ("%" in h): continue
+            if ("複"に) or ("率" in h) or ("%" in h): continue
             if   h=="単勝": win_c.append((0,i))
             elif "単勝" in h: win_c.append((1,i))
             elif "オッズ" in h: win_c.append((2,i))
@@ -500,8 +500,8 @@ def parse_odds_table(soup: BeautifulSoup) -> Tuple[List[Dict[str,float]], Option
         rec={"pop":pop,"odds":float(odds)}
         if num is not None: rec["num"]=num
         if jockey: rec["jockey"]=jockey
-        horses.append(rec)
     # 人気重複の排除
+        horses.append(rec)
     uniq={}
     for h in sorted(horses, key=lambda x:x["pop"]): uniq[h["pop"]]=h
     horses=[uniq[k] for k in sorted(uniq.keys())]
@@ -655,7 +655,13 @@ def build_line_notification(result: Dict, strat: Dict, race_id: str, target_dt: 
             lines.append(f"軸: 馬番{axis.get('umaban','-')}（単勝{ao:.1f}倍）" if isinstance(ao,(int,float)) else f"軸: 馬番{axis.get('umaban','-')}")
         cands=strat.get("candidates") or []
         if cands:
-            cand_s=" / ".join([f\"{c.get('umaban','-')}({c.get('odds',0):.1f})\" if isinstance(c.get('odds'),(int,float)) else str(c.get('umaban','-')) for c in cands])
+            # ★ SyntaxError修正（f\"...\" → f"...")
+            cand_s = " / ".join([
+                f"{c.get('umaban','-')}({c.get('odds',0):.1f})"
+                if isinstance(c.get('odds'),(int,float))
+                else str(c.get('umaban','-'))
+                for c in cands
+            ])
             lines.append(f"相手候補: {cand_s}")
     else:
         head_pop=" / ".join(tickets[:8])+(" …" if n>8 else "")
@@ -912,7 +918,6 @@ def _scan_and_notify_once() -> Tuple[int,int]:
         sheet_upsert_notified(ttl_key, time.time(), f"{venue_race} {target_dt.strftime('%H:%M')} {src}")
 
         # bets 追記（ROI用）
-        # 馬番変換（①②④）
         pop2num = {h["pop"]:h["num"] for h in meta["horses"] if isinstance(h.get("pop"),int) and isinstance(h.get("num"),int)}
         def _to_umaban(tk:str)->str:
             try:
@@ -921,7 +926,6 @@ def _scan_and_notify_once() -> Tuple[int,int]:
             except: return tk
         raw_tickets = strat.get("tickets",[]) or []
         tickets_umaban = raw_tickets if strat_id=="S3" else [_to_umaban(t) for t in raw_tickets]
-        # race_no抽出
         m=re.search(r"\b(\d{1,2})R\b", venue_race); race_no = (m.group(1)+"R") if m else ""
         bet_kind = STRATEGY_BET_KIND.get(strat_id, "三連単")
         try:
@@ -929,7 +933,6 @@ def _scan_and_notify_once() -> Tuple[int,int]:
         except Exception as e:
             logging.warning("[WARN] bets記録失敗 rid=%s: %s", rid, e)
 
-        # 実行間隔
         time.sleep(0.5)
 
     return hits, matches
