@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Rakuten競馬 監視・通知バッチ（完全差し替え版 v2025-08-19R3-fix1 / ROI入りサマリ）
+Rakuten競馬 監視・通知バッチ（完全差し替え版 v2025-08-19R3-fix2 / ROI入りサマリ）
 - 締切時刻：単複/一覧ページから“締切”を直接抽出（最優先）
 - 発走時刻：一覧ページ優先＋フォールバック（発走-オフセット）
 - 窓判定：ターゲット時刻（締切 or 発走-オフセット）±GRACE_SECONDS
@@ -444,7 +444,8 @@ def _find_popular_odds_table(soup: BeautifulSoup) -> Tuple[Optional[BeautifulSou
             if h in ("人気","順位") or ("人気" in h and "順" not in h): pop_idx=i; break
         win_c=[]
         for i,h in enumerate(headers):
-            if ("複"に) or ("率" in h) or ("%" in h): continue
+            # ★ここを修正（に → in）
+            if ("複" in h) or ("率" in h) or ("%" in h): continue
             if   h=="単勝": win_c.append((0,i))
             elif "単勝" in h: win_c.append((1,i))
             elif "オッズ" in h: win_c.append((2,i))
@@ -500,8 +501,8 @@ def parse_odds_table(soup: BeautifulSoup) -> Tuple[List[Dict[str,float]], Option
         rec={"pop":pop,"odds":float(odds)}
         if num is not None: rec["num"]=num
         if jockey: rec["jockey"]=jockey
-    # 人気重複の排除
         horses.append(rec)
+    # 人気重複の排除
     uniq={}
     for h in sorted(horses, key=lambda x:x["pop"]): uniq[h["pop"]]=h
     horses=[uniq[k] for k in sorted(uniq.keys())]
@@ -655,7 +656,6 @@ def build_line_notification(result: Dict, strat: Dict, race_id: str, target_dt: 
             lines.append(f"軸: 馬番{axis.get('umaban','-')}（単勝{ao:.1f}倍）" if isinstance(ao,(int,float)) else f"軸: 馬番{axis.get('umaban','-')}")
         cands=strat.get("candidates") or []
         if cands:
-            # ★ SyntaxError修正（f\"...\" → f"...")
             cand_s = " / ".join([
                 f"{c.get('umaban','-')}({c.get('odds',0):.1f})"
                 if isinstance(c.get('odds'),(int,float))
