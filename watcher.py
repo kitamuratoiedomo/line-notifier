@@ -485,15 +485,14 @@ def list_raceids_today_and_next() -> Tuple[List[str], Dict[str, datetime], Dict[
             cutoff_map[rid] = got
     return sorted(rids), post_map, cutoff_map
 
+
+
 def fallback_target_time(rid: str, post_map: Dict[str, datetime], cutoff_map: Dict[str, Tuple[datetime,str]]) -> Tuple[Optional[datetime], str]:
-    tup = cutoff_map.get(rid)
-    if tup:
-        dt, src = tup
-        return dt, f"締切:{src}"
     post = post_map.get(rid)
     if post:
-        return post - timedelta(minutes=CUTOFF_OFFSET_MIN), "発走-オフセット"
+        return post - timedelta(minutes=CUTOFF_OFFSET_MIN), "発走-オフセット固定"
     return None, "-"
+
 
 def is_within_window(target_dt: datetime) -> bool:
     now = jst_now()
