@@ -551,5 +551,21 @@ def main():
     logging.info("[INFO] HITS=%d / MATCHES=%d", hits, matches)
     logging.info("[INFO] ジョブ終了")
 
+# --- add: run_watcher_forever for main.py import compatibility ---
+def run_watcher_forever(sleep_sec: int = 60):
+    """
+    main.py が呼ぶ連続実行ループ。1分ごとにスキャン+日次サマリを試みます。
+    例外はログに残してループ継続します。
+    """
+    import logging, time
+    logging.info("[INFO] watcher.run_watcher_forever start (sleep=%ss)", sleep_sec)
+    while True:
+        try:
+            # watcher.py の単発実行関数が main() ならそれを呼ぶ
+            main()
+        except Exception as e:
+            logging.exception("[FATAL] run_watcher_forever loop error: %s", e)
+        time.sleep(max(10, sleep_sec))
+
 if __name__ == "__main__":
     main()
