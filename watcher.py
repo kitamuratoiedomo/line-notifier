@@ -701,3 +701,21 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
+
+# === ここから追記 ===
+def run_watcher_forever(sleep_sec: int = 60):
+    """一定間隔で main() を回す常駐ループ。cron ではなく常駐で使う場合に呼ぶ。"""
+    import time, logging
+    logging.info("[INFO] run_watcher_forever start (sleep=%ss)", sleep_sec)
+    while True:
+        try:
+            main()
+        except Exception as e:
+            logging.exception("[FATAL] run_watcher_forever loop error: %s", e)
+        time.sleep(max(10, sleep_sec))
+
+if __name__ == "__main__":
+    # 単体実行時は1回だけ
+    main()
+# === ここまで追記 ===
