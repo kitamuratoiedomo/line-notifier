@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Rakuten競馬 監視・通知バッチ（締切優先ターゲット版 v2025-08-28C）
+Rakuten競馬 監視・通知バッチ（締切優先ターゲット版 v2025-08-28C + BigChance banner）
 - 締切時刻：単複/一覧ページから“締切”を直接抽出（最優先）
 - 発走時刻：一覧ページ優先＋フォールバック（発走-オフセット）
 - 窓判定：ターゲット時刻（締切 or 発走-オフセット）±GRACE_SECONDS
@@ -8,6 +8,7 @@ Rakuten競馬 監視・通知バッチ（締切優先ターゲット版 v2025-08
 - 送信先：シート「1」のH列から userId を収集
 - 通知本文：戦略ラベル＋買い目（人気/馬番）＋上位オッズ
 - 日次サマリ：betsシートの投資/払戻に基づく【戦略別 ROI / 的中率】
+- 追加：①/②/④かつ4番人気の単勝>=15.0で「★★ビッグチャンスレース★★」を先頭に付与
 """
 
 import os, re, json, time, random, logging
@@ -43,7 +44,7 @@ NOTIFY_COOLDOWN_SEC   = int(os.getenv("NOTIFY_COOLDOWN_SEC", "1800"))
 
 WINDOW_BEFORE_MIN     = int(os.getenv("WINDOW_BEFORE_MIN", "0"))
 WINDOW_AFTER_MIN      = int(os.getenv("WINDOW_AFTER_MIN",  "0"))
-CUTOFF_OFFSET_MIN     = int(os.getenv("CUTOFF_OFFSET_MIN", "12"))  # ← 通知目標: 発走の12分前
+CUTOFF_OFFSET_MIN     = int(os.getenv("CUTOFF_OFFSET_MIN", "12"))
 GRACE_SECONDS         = int(os.getenv("GRACE_SECONDS",     "60"))
 
 LINE_ACCESS_TOKEN = os.getenv("LINE_ACCESS_TOKEN", "")
@@ -126,7 +127,7 @@ def sheet_upsert_notified(key: str, ts: float, note: str="") -> None:
     if found is None: values.append([key, ts, note])
     else:             values[found]=[key, ts, note]
     _sheet_put(svc, title, "A:C", values)
-
+    
 # ===== users（送信先）読み込み =====
 def load_user_ids_from_simple_col() -> List[str]:
     svc=_sheet_service(); title=USERS_SHEET_NAME; col=(USERS_USERID_COL or "H").upper()
@@ -343,22 +344,19 @@ def list_raceids_today_and_next()->Tuple[List[str], Dict[str,datetime], Dict[str
         if got: cutoff_map[rid]=got
     return sorted(rids), post_map, cutoff_map
 
-# ====== ★ ここが今回の本題：締切優先のターゲット決定 ======
+# ====== 締切優先のターゲット決定 ======
 def fallback_target_time(
     rid: str,
     post_map: Dict[str, datetime],
     cutoff_map: Dict[str, Tuple[datetime,str]]
 ) -> Tuple[Optional[datetime], str]:
-    # 1) 締切が取れていれば最優先で使う
     tup = cutoff_map.get(rid)
     if tup:
         dt, src = tup
         return dt, f"締切:{src}"
-    # 2) それが無ければ 発走 - CUTOFF_OFFSET_MIN（例: 12分前）
     post = post_map.get(rid)
     if post:
         return post - timedelta(minutes=CUTOFF_OFFSET_MIN), "発走-オフセット"
-    # 3) どちらも無ければ通知対象外
     return None, "-"
 
 def is_within_window(target_dt: datetime) -> bool:
@@ -401,7 +399,6 @@ def _find_popular_odds_table(soup:BeautifulSoup)->Tuple[Optional[BeautifulSoup],
                 if ("馬" in h) and ("馬名" not in h) and (i!=pop_idx):
                     num_idx=i; break
         if pop_idx is None or win_idx is None: continue
-        # 妥当性チェック
         body=table.find("tbody") or table
         rows=body.find_all("tr")
         seq,last=0,0
@@ -534,8 +531,25 @@ def _scan_and_notify_once()->Tuple[int,int]:
         last_ts=notified.get(ttl_key, 0.0)
         if (time.time()-last_ts) < NOTIFY_TTL_SEC and not FORCE_RUN: continue
 
+        # --- 追加：ビッグチャンス判定（①/②/④×4番人気>=15.0） ---
+        banner = ""
+        try:
+            if strat_id in ("S1", "S2", "S4"):
+                pop2odds = {}
+                for h in meta.get("horses", []):
+                    try:
+                        p = int(h.get("pop")); o = float(h.get("odds"))
+                        if p not in pop2odds: pop2odds[p] = o
+                    except: pass
+                if pop2odds.get(4, 0.0) >= 15.0:
+                    banner = "★★ビッグチャンスレース★★\n"
+        except Exception:
+            pass
+
         matches += 1
-        msg = build_line_notification(meta, strat, rid, target_dt, src, meta.get("venue_race",""), meta.get("now",""))
+        msg_core = build_line_notification(meta, strat, rid, target_dt, src, meta.get("venue_race",""), meta.get("now",""))
+        msg = banner + msg_core
+
         ok,last = push_line_text(user_ids, msg)
         logging.info("[INFO] LINE push ok=%s last=%s", ok, last[:120])
         sheet_upsert_notified(ttl_key, time.time(), f"{meta.get('venue_race','')} {target_dt.strftime('%H:%M')} {src}")
@@ -551,17 +565,12 @@ def main():
     logging.info("[INFO] HITS=%d / MATCHES=%d", hits, matches)
     logging.info("[INFO] ジョブ終了")
 
-# --- add: run_watcher_forever for main.py import compatibility ---
+# --- 互換: main.pyが import するループ関数 ---
 def run_watcher_forever(sleep_sec: int = 60):
-    """
-    main.py が呼ぶ連続実行ループ。1分ごとにスキャン+日次サマリを試みます。
-    例外はログに残してループ継続します。
-    """
     import logging, time
     logging.info("[INFO] watcher.run_watcher_forever start (sleep=%ss)", sleep_sec)
     while True:
         try:
-            # watcher.py の単発実行関数が main() ならそれを呼ぶ
             main()
         except Exception as e:
             logging.exception("[FATAL] run_watcher_forever loop error: %s", e)
