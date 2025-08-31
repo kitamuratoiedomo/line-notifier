@@ -97,6 +97,23 @@ def fetch(url: str) -> str:
     # すべて失敗したら最後の例外を投げる
     raise last
 
+# HTTPフェッチ（リトライ付き）
+def fetch(url: str) -> str:
+    last = None
+    for i in range(1, RETRY + 1):
+        try:
+            r = SESSION.get(url, timeout=TIMEOUT)
+            r.raise_for_status()
+            r.encoding = "utf-8"
+            return r.text
+        except Exception as e:
+            last = e
+            time.sleep(random.uniform(*SLEEP_BETWEEN))
+    # すべて失敗したら最後の例外を投げる
+    raise last
+
+
+
 # ===== JSTユーティリティ =====
 JST = timezone(timedelta(hours=9))
 def jst_now() -> datetime: return datetime.now(JST)
