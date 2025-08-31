@@ -1,13 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Rakuten競馬 監視・通知バッチ（発走-オフセット固定版 v2025-08-30F）
-- ターゲット = 発走時刻 - CUTOFF_OFFSET_MIN（締切は使わない / window-only）
-- 窓判定 = ターゲット ± (WINDOW_BEFORE_MIN/AFTER_MIN, GRACE_SECONDS)
-- 通知：窓内1回 / 429クールダウン / Google SheetでTTL永続
-- 送信先：シート「1」のH列などから userId を収集（環境変数フォールバックあり）
-- 払戻：払戻ページと買い目（馬番）を厳密突合して ROI/的中率（bets を日次サマリで集計）
-- 追加：S1/S2/S4 かつ 4番人気の単勝>=15.0 のとき通知に「★★ビッグチャンスレース★★」見出し
-- 戦略判定：strategy_rules.eval_strategy(horses, logger) をフック（horsesは人気・単勝・馬番）
+Rakuten競馬 監視・通知バッチ（発走-オフセット固定 フォールバック付き v2025-08-31A）
+- 発走時刻 = race_card/list or detail ページから抽出
+- 通知基準 = 発走時刻 - CUTOFF_OFFSET_MIN
+- 窓判定 = ±(WINDOW_BEFORE/AFTER_MIN) と GRACE_SECONDS
+- 通知: 窓内1回のみ（TTL管理）/ Google Sheets 永続化 / 日次サマリ
+- ログ: GET/発走取得/窓判定を強化
 """
 
 import os, re, json, time, random, logging, socket
@@ -18,22 +16,21 @@ import requests
 from bs4 import BeautifulSoup, Tag
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
-
-# 外部戦略ロジック（ユーザー提供のものをインポート）
 from strategy_rules import eval_strategy
 
-# ===== JST / 日付ユーティリティ =====
+# ===== JSTユーティリティ =====
 JST = timezone(timedelta(hours=9))
-def jst_now()    -> datetime: return datetime.now(JST)
-def jst_today()  -> str:      return jst_now().strftime("%Y%m%d")
-def jst_ymd_dash()-> str:     return jst_now().strftime("%Y-%m-%d")
+def jst_now() -> datetime: return datetime.now(JST)
+def jst_today() -> str: return jst_now().strftime("%Y%m%d")
 
-# ===== ENV / 既定 =====
+# ===== ENV =====
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "Mozilla/5.0", "Accept-Language": "ja,en-US;q=0.9"})
-TIMEOUT = (10, 25)      # connect, read
-RETRY   = 3
-SLEEP_BETWEEN = (0.6, 1.2)
+SESSION.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept-Language": "ja,en-US;q=0.9",
+})
+TIMEOUT = (10, 25); RETRY = 3; SLEEP_BETWEEN = (0.6, 1.2)
 
 LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
 
@@ -42,34 +39,30 @@ END_HOUR   = int(os.getenv("END_HOUR",   "22"))
 DRY_RUN    = os.getenv("DRY_RUN", "False").lower() == "true"
 FORCE_RUN  = os.getenv("FORCE_RUN", "0") == "1"
 
-NOTIFY_ENABLED        = os.getenv("NOTIFY_ENABLED", "1") == "1"
-NOTIFY_TTL_SEC        = int(os.getenv("NOTIFY_TTL_SEC", "3600"))
-NOTIFY_COOLDOWN_SEC   = int(os.getenv("NOTIFY_COOLDOWN_SEC", "1800"))
+NOTIFY_ENABLED      = os.getenv("NOTIFY_ENABLED", "1") == "1"
+NOTIFY_TTL_SEC      = int(os.getenv("NOTIFY_TTL_SEC", "3600"))
+NOTIFY_COOLDOWN_SEC = int(os.getenv("NOTIFY_COOLDOWN_SEC", "1800"))
 
-# ※発走の“12分前”を狙うなら CUTOFF_OFFSET_MIN=12 を推奨
-CUTOFF_OFFSET_MIN     = int(os.getenv("CUTOFF_OFFSET_MIN", "12"))
-WINDOW_BEFORE_MIN     = int(os.getenv("WINDOW_BEFORE_MIN", "0"))   # 0でちょうど
-WINDOW_AFTER_MIN      = int(os.getenv("WINDOW_AFTER_MIN",  "0"))   # 0でちょうど
-GRACE_SECONDS         = int(os.getenv("GRACE_SECONDS",     "45"))  # 計測誤差/cronズレ緩衝
+CUTOFF_OFFSET_MIN   = int(os.getenv("CUTOFF_OFFSET_MIN", "12"))
+WINDOW_BEFORE_MIN   = int(os.getenv("WINDOW_BEFORE_MIN", "1"))
+WINDOW_AFTER_MIN    = int(os.getenv("WINDOW_AFTER_MIN", "1"))
+GRACE_SECONDS       = int(os.getenv("GRACE_SECONDS", "0"))
 
 LINE_ACCESS_TOKEN = os.getenv("LINE_ACCESS_TOKEN", "")
 LINE_USER_ID      = os.getenv("LINE_USER_ID", "")
-LINE_USER_IDS     = [s.strip() for s in os.getenv("LINE_USER_IDS", "").split(",") if s.strip()]
+LINE_USER_IDS     = [s.strip() for s in os.getenv("LINE_USER_IDS","").split(",") if s.strip()]
 
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "")
 GOOGLE_SHEET_ID   = os.getenv("GOOGLE_SHEET_ID", "")
-GOOGLE_SHEET_TAB  = os.getenv("GOOGLE_SHEET_TAB", "notified")  # TTL/フラグ保管タブ
-
+GOOGLE_SHEET_TAB  = os.getenv("GOOGLE_SHEET_TAB", "notified")
 USERS_SHEET_NAME  = os.getenv("USERS_SHEET_NAME", "1")
 USERS_USERID_COL  = os.getenv("USERS_USERID_COL", "H")
-
 BETS_SHEET_TAB    = os.getenv("BETS_SHEET_TAB", "bets")
 
 DAILY_SUMMARY_HHMM = os.getenv("DAILY_SUMMARY_HHMM", "21:02")
 ALWAYS_NOTIFY_DAILY_SUMMARY = os.getenv("ALWAYS_NOTIFY_DAILY_SUMMARY", "1") == "1"
 
 UNIT_STAKE_YEN = int(os.getenv("UNIT_STAKE_YEN", "100"))
-
 DEBUG_RACEIDS  = [s.strip() for s in os.getenv("DEBUG_RACEIDS","").split(",") if s.strip()]
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -77,7 +70,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 # ===== Google Sheets 基本 =====
 def _sheet_service():
     if not GOOGLE_CREDENTIALS_JSON or not GOOGLE_SHEET_ID:
-        raise RuntimeError("Google Sheets の環境変数不足")
+        raise RuntimeError("Google Sheets 環境変数不足")
     info  = json.loads(GOOGLE_CREDENTIALS_JSON)
     creds = Credentials.from_service_account_info(info, scopes=["https://www.googleapis.com/auth/spreadsheets"])
     return build("sheets","v4",credentials=creds, cache_discovery=False)
@@ -90,7 +83,6 @@ def _resolve_sheet_title(svc, tab_or_gid: str) -> str:
         for s in sheets:
             if s["properties"]["sheetId"] == gid:
                 return s["properties"]["title"]
-        raise RuntimeError(f"指定gidのシートが見つかりません: {gid}")
     for s in sheets:
         if s["properties"]["title"] == tab_or_gid:
             return tab_or_gid
@@ -136,38 +128,8 @@ def sheet_upsert_notified(key: str, ts: float, note: str="") -> None:
     if found is None: values.append([key, ts, note])
     else:             values[found]=[key, ts, note]
     _sheet_put(svc, title, "A:C", values)
-
-# ===== users（送信先）読み込み =====
-def load_user_ids_from_simple_col() -> List[str]:
-    svc=_sheet_service(); title=USERS_SHEET_NAME; col=(USERS_USERID_COL or "H").upper()
-    values=_sheet_get(svc, title, f"{col}:{col}")
-    out=[]
-    for i,row in enumerate(values):
-        v=(row[0].strip() if row and row[0] else "")
-        if not v: continue
-        low=v.replace(" ","").lower()
-        if i==0 and ("userid" in low or "line" in low): continue
-        if v.startswith("U") and v not in out: out.append(v)
-    if not out:
-        fb=[s.strip() for s in os.getenv("LINE_USER_IDS","").split(",") if s.strip()]
-        if not fb and LINE_USER_ID: fb=[LINE_USER_ID]
-        out = fb
-    logging.info("[INFO] 送信ターゲット数: %d", len(out))
-    return out
-
-# ===== HTTPフェッチ（リトライ付き） =====
-def fetch(url: str) -> str:
-    last=None
-    for i in range(1, RETRY+1):
-        try:
-            r=SESSION.get(url, timeout=TIMEOUT); r.raise_for_status()
-            r.encoding="utf-8"
-            return r.text
-        except Exception as e:
-            last=e; time.sleep(random.uniform(*SLEEP_BETWEEN))
-    raise last
     
-# ===== RACEIDと発走時刻の取得（一覧ページ由来のみ / cutoffは使わない） =====
+# ===== RACEIDと発走時刻の取得（一覧ページ由来 / cutoffは使わない） =====
 RACEID_RE   = re.compile(r"/RACEID/(\d{18})")
 PLACEHOLDER = re.compile(r"\d{8}0000000000$")
 
@@ -197,6 +159,7 @@ def _mk_dt(rid:str, hh:int, mm:int)->Optional[datetime]:
     except: return None
 
 def _find_time_nearby(el: Tag) -> Tuple[Optional[str], str]:
+    # timeタグや近傍の属性・テキストから HH:MM を拾う
     t = el.find("time")
     if t:
         for attr in ("datetime","data-time","title","aria-label"):
@@ -232,7 +195,7 @@ def _extract_rids(soup: BeautifulSoup)->List[str]:
 
 def parse_post_times_from_list(root: Tag) -> Dict[str, datetime]:
     post_map={}
-    # table
+    # 表形式
     for table in root.find_all("table"):
         thead=table.find("thead")
         if thead:
@@ -251,7 +214,7 @@ def parse_post_times_from_list(root: Tag) -> Dict[str, datetime]:
             hh,mm=map(int, hhmm.split(":"))
             dt=_mk_dt(rid, hh, mm)
             if dt: post_map[rid]=dt
-    # card
+    # カード形式
     for a in root.find_all("a", href=True):
         m=RACEID_RE.search(a["href"])
         if not m: continue
@@ -282,12 +245,65 @@ def collect_post_time_map(ymd:str, ymd_next:str)->Dict[str,datetime]:
         f"https://keiba.rakuten.co.jp/race_card/list/RACEID/{ymd_next}0000000000",
     ]:
         try:
-            soup=BeautifulSoup(fetch(url),"lxml")
+            html=fetch(url)
+            logging.info("[GET] %s http=200 bytes=%s", url, len(html))
+            soup=BeautifulSoup(html,"lxml")
             post_map.update(parse_post_times_from_list(soup))
         except Exception as e:
-            logging.warning(f"[WARN] 発走一覧読み込み失敗: {e} ({url})")
+            logging.warning(f"[WARN] 発走一覧取得失敗: {e} ({url})")
     logging.info(f"[INFO] 発走時刻取得: {len(post_map)}件")
     return post_map
+
+# ===== per-RID 発走取得（フォールバック） =====
+def _parse_start_hhmm_from_text(text: str) -> Optional[str]:
+    for pat in (r"発走\s*([0-2]?\d:[0-5]\d)", r"([0-2]?\d:[0-5]\d)\s*発走"):
+        m = re.search(pat, text)
+        if m: return m.group(1)
+    return None
+
+def _parse_start_hhmm_from_html(html: str) -> Optional[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    # timeタグ優先
+    for t in soup.select("time"):
+        hhmm = _parse_start_hhmm_from_text(t.get_text(strip=True))
+        if hhmm: return hhmm
+    # 全文から
+    return _parse_start_hhmm_from_text(soup.get_text(" ", strip=True))
+
+def get_start_time_hhmm(rid: str) -> Dict[str, str]:
+    # A: list
+    url_list = f"https://keiba.rakuten.co.jp/race_card/list/RACEID/{rid}"
+    try:
+        html=fetch(url_list)
+        logging.info("[GET] %s http=200 bytes=%s", url_list, len(html))
+        hhmm=_parse_start_hhmm_from_html(html)
+        if hhmm: return {"start": hhmm, "source": "list"}
+    except Exception as e:
+        logging.info("[TIME] list-fail rid=%s err=%s", rid, e)
+    # B: detail
+    url_detail = f"https://keiba.rakuten.co.jp/race/detail/RACEID/{rid}"
+    try:
+        html=fetch(url_detail)
+        logging.info("[GET] %s http=200 bytes=%s", url_detail, len(html))
+        hhmm=_parse_start_hhmm_from_html(html)
+        if hhmm: return {"start": hhmm, "source": "detail"}
+    except Exception as e:
+        logging.info("[TIME] detail-fail rid=%s err=%s", rid, e)
+    logging.info("[TIME] miss rid=%s", rid)
+    return {}
+
+# ===== 通知窓 =====
+def fallback_target_time(rid: str, post_map: Dict[str, datetime]) -> Tuple[Optional[datetime], str]:
+    post = post_map.get(rid)
+    if post:
+        return post - timedelta(minutes=CUTOFF_OFFSET_MIN), "post_map"
+    return None, "-"
+
+def is_within_window(target_dt: datetime) -> bool:
+    now = jst_now()
+    start = target_dt - timedelta(minutes=WINDOW_BEFORE_MIN)
+    end   = target_dt + timedelta(minutes=WINDOW_AFTER_MIN)
+    return (start - timedelta(seconds=GRACE_SECONDS)) <= now <= (end + timedelta(seconds=GRACE_SECONDS))
 
 # ==== オッズ解析（人気/馬番） ====
 def _clean(s:str)->str: return re.sub(r"\s+","", s or "")
@@ -318,12 +334,7 @@ def _find_popular_odds_table(soup:BeautifulSoup)->Tuple[Optional[BeautifulSoup],
         win_idx = sorted(c, key=lambda x:x[0])[0][1] if c else None
         for i,h in enumerate(headers):
             if "馬番" in h: num_idx=i; break
-        if num_idx is None:
-            for i,h in enumerate(headers):
-                if ("馬" in h) and ("馬名" not in h) and (i!=pop_idx):
-                    num_idx=i; break
         if pop_idx is None or win_idx is None: continue
-        # 妥当性
         body=table.find("tbody") or table
         rows=body.find_all("tr")
         seq,last=0,0
@@ -368,7 +379,9 @@ def parse_odds_table(soup:BeautifulSoup)->Tuple[List[Dict[str,float]], Optional[
 
 def check_tanfuku_page(race_id: str)->Optional[Dict[str, Any]]:
     url=f"https://keiba.rakuten.co.jp/odds/tanfuku/RACEID/{race_id}"
-    soup=BeautifulSoup(fetch(url),"lxml")
+    html=fetch(url)
+    logging.info("[GET] %s http=200 bytes=%s", url, len(html))
+    soup=BeautifulSoup(html,"lxml")
     horses, venue_race, now_label = parse_odds_table(soup)
     if not horses: return None
     if not venue_race: venue_race="地方競馬"
@@ -421,7 +434,6 @@ def build_line_notification(result:Dict, strat:Dict, rid:str, target_dt:datetime
     url=result.get("url","")
     strat_id=str(strat.get("id","S3"))
 
-    # 人気→馬番
     pop2num={h["pop"]:h.get("num") for h in horses if isinstance(h.get("pop"),int)}
     def _to_num(tk:str)->str:
         try:
@@ -435,11 +447,8 @@ def build_line_notification(result:Dict, strat:Dict, rid:str, target_dt:datetime
     head_num=" / ".join([_to_num(t) for t in tickets[:8]])+(" …" if n>8 else "")
 
     lines=[f"{venue_race} / RID:{rid[-6:]} / ターゲット={target_dt.strftime('%H:%M')}（{target_src}）"]
-
-    # ★ビッグチャンスレース装飾
     if _is_big_chance(strat_id, horses):
         lines.append("★★ビッグチャンスレース★★")
-
     lines += [
         f"{strat.get('label','戦略')}",
         f"買い目（人気）: {head_pop}（全{n}点）",
@@ -460,6 +469,11 @@ def build_line_notification(result:Dict, strat:Dict, rid:str, target_dt:datetime
 def _bets_header() -> List[str]:
     return ["date","race_id","venue","race_no","strategy_id","bet_kind","tickets_umaban_csv","points","unit_stake","total_stake"]
 
+def _normalize_ticket_for_kind(ticket:str, kind:str) -> str:
+    parts=[int(x) for x in ticket.split("-") if x.strip().isdigit()]
+    if kind in ("馬連","三連複"): parts=sorted(parts)
+    return "-".join(str(x) for x in parts)
+
 def sheet_append_bet_record(date_ymd:str, race_id:str, venue:str, race_no:str, strategy_id:str, bet_kind:str, tickets_umaban:List[str]):
     svc=_sheet_service(); title=_resolve_sheet_title(svc, BETS_SHEET_TAB)
     values=_sheet_get(svc, title, "A:J")
@@ -468,31 +482,6 @@ def sheet_append_bet_record(date_ymd:str, race_id:str, venue:str, race_no:str, s
     values.append([date_ymd, race_id, venue, race_no, strategy_id, bet_kind, ",".join(tickets_umaban), str(points), str(unit), str(total)])
     _sheet_put(svc, title, "A:J", values)
 
-# ===== 払戻取得 =====
-_PAYOUT_KIND_KEYS = ["単勝","複勝","枠連","馬連","ワイド","馬単","三連複","三連単"]
-
-def fetch_payoff_map(race_id:str) -> Dict[str, List[Tuple[str,int]]]:
-    url = f"https://keiba.rakuten.co.jp/race/payoff/RACEID/{race_id}"
-    html=fetch(url); soup=BeautifulSoup(html,"lxml")
-    result: Dict[str, List[Tuple[str,int]]] = {}
-    for kind in _PAYOUT_KIND_KEYS:
-        blocks = soup.find_all(string=re.compile(kind))
-        if not blocks: continue
-        items=[]
-        for b in blocks:
-            box=getattr(b,"parent",None) or soup
-            text=" ".join((box.get_text(" ", strip=True) or "").split())
-            for m in re.finditer(r"(\d+(?:-\d+){0,2})\s*([\d,]+)\s*円", text):
-                comb=m.group(1); pay=int(m.group(2).replace(",",""))
-                items.append((comb, pay))
-        if items: result[kind] = items
-    return result
-
-def _normalize_ticket_for_kind(ticket:str, kind:str) -> str:
-    parts=[int(x) for x in ticket.split("-") if x.strip().isdigit()]
-    if kind in ("馬連","三連複"): parts=sorted(parts)
-    return "-".join(str(x) for x in parts)
-    
 # ===== RACEID一覧と発走時刻マップ =====
 def list_raceids_today_and_next()->Tuple[List[str], Dict[str,datetime]]:
     today=jst_today()
@@ -504,26 +493,17 @@ def list_raceids_today_and_next()->Tuple[List[str], Dict[str,datetime]]:
         f"https://keiba.rakuten.co.jp/race_card/list/RACEID/{ymd_next}0000000000",
     ]:
         try:
-            soup=BeautifulSoup(fetch(url),"lxml")
+            html=fetch(url)
+            logging.info("[GET] %s http=200 bytes=%s", url, len(html))
+            soup=BeautifulSoup(html,"lxml")
             rids.update(_extract_rids(soup))
         except Exception as e:
             logging.warning(f"[WARN] RID一覧取得失敗: {e} ({url})")
-    post_map   = collect_post_time_map(today, ymd_next)
+    post_map = collect_post_time_map(today, ymd_next)
+    logging.info("[DEBUG] rids(today+next)=%d post_map=%d", len(rids), len(post_map))
     return sorted(rids), post_map
 
-def fallback_target_time(rid: str, post_map: Dict[str, datetime]) -> Tuple[Optional[datetime], str]:
-    post = post_map.get(rid)
-    if post:
-        return post - timedelta(minutes=CUTOFF_OFFSET_MIN), "発走-オフセット固定"
-    return None, "-"
-
-def is_within_window(target_dt: datetime) -> bool:
-    now = jst_now()
-    start = target_dt - timedelta(minutes=WINDOW_BEFORE_MIN)
-    end   = target_dt + timedelta(minutes=WINDOW_AFTER_MIN)
-    return (start - timedelta(seconds=GRACE_SECONDS)) <= now <= (end + timedelta(seconds=GRACE_SECONDS))
-
-# ===== スキャン本体 =====
+# ===== スキャン（一覧0件→per-RIDフォールバック） =====
 def _scan_and_notify_once()->Tuple[int,int]:
     if not (START_HOUR <= jst_now().hour < END_HOUR) and not FORCE_RUN:
         logging.info("[INFO] 運用時間外: %02d-%02d", START_HOUR, END_HOUR); return 0,0
@@ -533,18 +513,53 @@ def _scan_and_notify_once()->Tuple[int,int]:
 
     hits=0; matches=0
     rids, post_map = list_raceids_today_and_next()
-    # デバッグRIDを強制注入
+
+    # フォールバック：post_mapが空なら per-RIDで発走取得
+    if not post_map:
+        logging.info("[FALLBACK] post_map=0 → per-RID 取得に切替")
+        for rid in rids:
+            info = get_start_time_hhmm(rid)
+            if info and "start" in info:
+                hhmm = info["start"]
+                y,m,d = int(rid[:4]), int(rid[4:6]), int(rid[6:8])
+                dt = datetime(y, m, d, int(hhmm[:2]), int(hhmm[3:]), tzinfo=JST)
+                post_map[rid] = dt
+        logging.info("[FALLBACK] per-RID 取得結果: %d件", len(post_map))
+
+    # デバッグRIDを強制注入（任意）
     for rid in DEBUG_RACEIDS:
         if rid and rid not in rids: rids.append(rid)
 
     for rid in rids:
-        target_dt, src = fallback_target_time(rid, post_map)
-        if not target_dt: continue
-        if not is_within_window(target_dt) and not FORCE_RUN: continue
+        post_dt = post_map.get(rid)
+        if not post_dt:
+            # 念のため個別取得
+            info = get_start_time_hhmm(rid)
+            if info and "start" in info:
+                hhmm = info["start"]
+                y,m,d = int(rid[:4]), int(rid[4:6]), int(rid[6:8])
+                post_dt = datetime(y, m, d, int(hhmm[:2]), int(hhmm[3:]), tzinfo=JST)
 
-        meta = check_tanfuku_page(rid)  # horses / venue_race / now / url
-        if not meta: continue
-        hits += 1
+        if not post_dt: 
+            logging.info("[SKIP] 発走時刻不明 rid=%s", rid)
+            continue
+
+        target_dt = post_dt - timedelta(minutes=CUTOFF_OFFSET_MIN)
+        now = jst_now()
+        lo = target_dt - timedelta(minutes=WINDOW_BEFORE_MIN, seconds=GRACE_SECONDS)
+        hi = target_dt + timedelta(minutes=WINDOW_AFTER_MIN,  seconds=GRACE_SECONDS)
+        ok = lo <= now <= hi
+        logging.info("[WIND] rid=%s start=%s target=%s window=%s~%s ok=%s",
+                     rid, post_dt.strftime("%H:%M"), target_dt.strftime("%H:%M"),
+                     lo.strftime("%H:%M:%S"), hi.strftime("%H:%M:%S"), ok)
+        if not ok and not FORCE_RUN:
+            continue
+
+        # オッズページ（単・複）を取得→人気/オッズ/馬番を構築
+        meta = check_tanfuku_page(rid)
+        if not meta:
+            logging.info("[SKIP] tanfukuパース失敗 rid=%s", rid)
+            continue
 
         # 戦略判定
         try:
@@ -558,18 +573,39 @@ def _scan_and_notify_once()->Tuple[int,int]:
         ttl_key=f"{rid}:{target_dt.strftime('%H%M')}:{strat_id}"
         last_ts=notified.get(ttl_key, 0.0)
         if (time.time()-last_ts) < NOTIFY_TTL_SEC and not FORCE_RUN:
+            logging.info("[DEDUP] TTL内スキップ: %s", ttl_key)
             continue
 
         # 通知本文
         venue_race = meta.get("venue_race","")
         now_label  = meta.get("now","")
-        msg = build_line_notification(meta, strat, rid, target_dt, src, venue_race, now_label)
-        ok,last = push_line_text(user_ids, msg)
-        logging.info("[INFO] LINE push ok=%s last=%s", ok, str(last)[:120])
+        msg = build_line_notification(meta, strat, rid, target_dt, "map|fallback", venue_race, now_label)
+        ok_count,last = push_line_text(user_ids, msg)
+        logging.info("[INFO] LINE push ok=%s last=%s", ok_count, str(last)[:120])
 
         # TTLフラグ保存
-        sheet_upsert_notified(ttl_key, time.time(), f"{venue_race} {target_dt.strftime('%H:%M')} {src}")
+        sheet_upsert_notified(ttl_key, time.time(), f"{venue_race} {target_dt.strftime('%H:%M')}")
+
+        # bets 記録（ROI集計用）
+        try:
+            pop2num={h["pop"]:h.get("num") for h in meta["horses"] if isinstance(h.get("pop"),int)}
+            def _to_umaban(tk:str)->str:
+                try:
+                    a,b,c=[int(x) for x in tk.split("-")]
+                    return f"{pop2num.get(a,'-')}-{pop2num.get(b,'-')}-{pop2num.get(c,'-')}"
+                except: return tk
+            raw_tickets = strat.get("tickets",[]) or []
+            tickets_umaban = raw_tickets if strat_id=="S3" else [_to_umaban(t) for t in raw_tickets]
+            # 券種は戦略→固定（必要に応じて変更）
+            BET_KIND_MAP = {"S1":"馬連","S2":"馬単","S3":"三連単","S4":"三連複"}
+            bet_kind = BET_KIND_MAP.get(strat_id, "三連単")
+            m=re.search(r"\b(\d{1,2})R\b", venue_race or ""); race_no = (m.group(1)+"R") if m else ""
+            sheet_append_bet_record(jst_today(), rid, (venue_race or "").split()[0], race_no, strat_id, bet_kind, tickets_umaban)
+        except Exception as e:
+            logging.warning("[WARN] bets記録失敗 rid=%s: %s", rid, e)
+
         matches += 1
+        hits    += 1
         time.sleep(0.4)
 
     logging.info("[INFO] HITS=%d / MATCHES=%d", hits, matches)
@@ -611,10 +647,8 @@ def summarize_today_and_notify():
             seen.add((race_id, sid))
         tickets=[t for t in (t_csv or "").split(",") if t]
         per[sid]["bets"]  += len(tickets)
-        try:
-            per[sid]["stake"] += int(total)
-        except:
-            per[sid]["stake"] += len(tickets)*UNIT_STAKE_YEN
+        try: per[sid]["stake"] += int(total)
+        except: per[sid]["stake"] += len(tickets)*UNIT_STAKE_YEN
 
         # 払戻照合
         try:
@@ -642,22 +676,18 @@ def summarize_today_and_notify():
                 f"　的中率 {pct(v['hits'], v['bets'])} / 回収率 {pct(v['return'], v['stake'])} / "
                 f"投資 {v['stake']:,}円 / 払戻 {v['return']:,}円")
 
-    # 送信
     msg="\n".join([
-        f"【日次サマリ】{jst_ymd_dash()}",
-        _fmt_line("S1","①"),
-        _fmt_line("S2","②"),
-        _fmt_line("S3","③"),
-        _fmt_line("S4","④"),
-        "",
-        f"合計：投資 {total_stake:,}円 / 払戻 {total_return:,}円",
+        f"【日次サマリ】{jst_now().strftime('%Y-%m-%d')}",
+        _fmt_line("S1","①"), _fmt_line("S2","②"),
+        _fmt_line("S3","③"), _fmt_line("S4","④"),
+        "", f"合計：投資 {total_stake:,}円 / 払戻 {total_return:,}円",
         f"　的中率 {pct(sum(per[s]['hits'] for s in per), sum(per[s]['bets'] for s in per))} / 回収率 {pct(total_return, total_stake)}",
     ])
     uids=load_user_ids_from_simple_col()
     push_line_text(uids, msg)
     sheet_upsert_notified(key, time.time(), "daily summary")
 
-# ===== main / ループ =====
+# ===== main / watcher =====
 def main():
     logging.info("[BOOT] host=%s pid=%s", socket.gethostname(), os.getpid())
     logging.info("[BOOT] now(JST)=%s CUT=%s", jst_now().strftime("%Y-%m-%d %H:%M:%S %z"), CUTOFF_OFFSET_MIN)
