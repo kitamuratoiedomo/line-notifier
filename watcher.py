@@ -18,6 +18,71 @@ from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from strategy_rules import eval_strategy
 
+# --- 追記ここから ---
+import os
+import json
+import logging
+
+def load_user_ids_from_simple_col():
+    """
+    LINE宛先の解決フォールバック：
+      1) env LINE_USER_IDS (カンマ区切り)
+      2) env LINE_USER_ID（単独）
+      3) Google Sheets（設定がある場合のみ）
+    どれも無ければ空配列を返す。
+    """
+    # 1) 複数（環境変数）
+    env_ids = [s.strip() for s in os.getenv("LINE_USER_IDS","").split(",") if s.strip()]
+    if env_ids:
+        logging.info("[USERS] from env LINE_USER_IDS: %d", len(env_ids))
+        return env_ids
+
+    # 2) 単独（環境変数）
+    uid = os.getenv("LINE_USER_ID","").strip()
+    if uid.startswith("U"):
+        logging.info("[USERS] from env LINE_USER_ID: 1")
+        return [uid]
+
+    # 3) Google Sheets（任意）
+    try:
+        GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON","")
+        GOOGLE_SHEET_ID   = os.getenv("GOOGLE_SHEET_ID","")
+        USERS_SHEET_NAME  = os.getenv("USERS_SHEET_NAME","1")
+        USERS_USERID_COL  = (os.getenv("USERS_USERID_COL","H") or "H").upper()
+
+        if not (GOOGLE_CREDENTIALS_JSON and GOOGLE_SHEET_ID):
+            logging.info("[USERS] no GOOGLE_* env → skip Sheets")
+            return []
+
+        from google.oauth2.service_account import Credentials
+        from googleapiclient.discovery import build
+
+        info  = json.loads(GOOGLE_CREDENTIALS_JSON)
+        creds = Credentials.from_service_account_info(info, scopes=["https://www.googleapis.com/auth/spreadsheets"])
+        svc   = build("sheets","v4",credentials=creds, cache_discovery=False)
+
+        res   = svc.spreadsheets().values().get(
+                    spreadsheetId=GOOGLE_SHEET_ID,
+                    range=f"'{USERS_SHEET_NAME}'!{USERS_USERID_COL}:{USERS_USERID_COL}"
+                ).execute()
+        values = res.get("values", [])
+        out=[]
+        for i,row in enumerate(values):
+            val=(row[0].strip() if row and row[0] else "")
+            if not val: continue
+            low=val.replace(" ","").lower()
+            if i==0 and ("userid" in low or "line" in low):  # ヘッダ除外
+                continue
+            if val.startswith("U") and val not in out:
+                out.append(val)
+        logging.info("[USERS] from Google Sheets: %d", len(out))
+        return out
+    except Exception as e:
+        logging.warning("[USERS] Sheets fallback failed: %s", e)
+        return []
+# --- 追記ここまで ---
+
+
 # ===== JSTユーティリティ =====
 JST = timezone(timedelta(hours=9))
 def jst_now() -> datetime: return datetime.now(JST)
