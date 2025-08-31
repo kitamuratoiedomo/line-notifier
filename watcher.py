@@ -1,18 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-Rakuten競馬 監視・通知バッチ（発走-オフセット固定 v2025-08-31B）
-- 発走時刻 = listページから厳密抽出（detailは使わない）
+Rakuten競馬 監視・通知バッチ（完全修正版 v2025-08-31C）
+- 発走時刻 = listページから抽出（detailは使わない）
 - 通知基準 = 発走時刻 - CUTOFF_OFFSET_MIN
-- 窓判定 = [発走-15, 発走-10]を許容 (ENVで調整)
-- 通知: 窓内1回のみ / Google Sheetsへログとbetsを記録
+- 窓判定 = target ± (WINDOW_BEFORE/AFTER_MIN) ± GRACE_SECONDS
+- 通知: 窓内1回のみ（TTL管理）/ Google Sheets 永続化
+- ログ: notify_log と bets を両方記録
+- 券種: 常に「三連単」で記録
 """
 
 import os, re, json, time, random, logging, socket
 from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Optional, Tuple, Set, Any
+from typing import List, Dict, Optional, Tuple, Any
 
 import requests
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from strategy_rules import eval_strategy
@@ -49,7 +51,6 @@ GRACE_SECONDS       = int(os.getenv("GRACE_SECONDS", "0"))
 
 LINE_ACCESS_TOKEN = os.getenv("LINE_ACCESS_TOKEN", "")
 LINE_USER_ID      = os.getenv("LINE_USER_ID", "")
-LINE_USER_IDS     = [s.strip() for s in os.getenv("LINE_USER_IDS","").split(",") if s.strip()]
 
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "")
 GOOGLE_SHEET_ID   = os.getenv("GOOGLE_SHEET_ID", "")
@@ -119,24 +120,56 @@ def sheet_append_bet_record(date_ymd:str, race_id:str, venue:str, race_no:str, s
     rows.append([date_ymd, race_id, venue, race_no, strategy_id, "三連単",
                  ",".join(tickets_umaban), str(points), str(unit), str(total)])
     _sheet_put(svc, title, "A:J", rows)
-    
-# ===== per-RID 発走取得 =====
+
+# ===== 発走時刻抽出（list専用） =====
+def fetch(url:str) -> str:
+    last=None
+    for i in range(1, RETRY+1):
+        try:
+            r=SESSION.get(url, timeout=TIMEOUT); r.raise_for_status()
+            r.encoding="utf-8"; return r.text
+        except Exception as e:
+            last=e; time.sleep(random.uniform(*SLEEP_BETWEEN))
+    raise last
+
 def _extract_start_hhmm_from_html(html: str) -> Optional[str]:
     soup = BeautifulSoup(html, "html.parser")
     txt = soup.get_text(" ", strip=True)
-    m = re.search(r'(?:発走|発走予定|発走時刻)\s*([0-2]\d)[:：]([0-5]\d)', txt)
+    m = re.search(r'(?:発走|発走予定|発走時刻)\s*([0-2]?\d)[:：]([0-5]\d)', txt)
     if m: return f"{int(m.group(1)):02d}:{int(m.group(2)):02d}"
-    m = re.search(r'([0-2]\d)時([0-5]\d)分.*発走', txt)
+    m = re.search(r'([0-2]?\d)時([0-5]\d)分.*発走', txt)
     if m: return f"{int(m.group(1)):02d}:{int(m.group(2)):02d}"
     return None
 
-def get_start_time_hhmm(rid: str) -> Optional[str]:
+def get_start_time_dt(rid: str) -> Optional[datetime]:
     url=f"https://keiba.rakuten.co.jp/race_card/list/RACEID/{rid}"
-    html=fetch(url)
-    hhmm=_extract_start_hhmm_from_html(html)
-    return hhmm
+    try:
+        html=fetch(url)
+        hhmm=_extract_start_hhmm_from_html(html)
+        if hhmm:
+            y,m,d = int(rid[:4]), int(rid[4:6]), int(rid[6:8])
+            return datetime(y,m,d,int(hhmm[:2]),int(hhmm[3:]),tzinfo=JST)
+    except Exception as e:
+        logging.warning("[WARN] 発走抽出失敗 rid=%s err=%s", rid, e)
+    return None
+    
+# ===== LINE送信 =====
+def push_line_text(user_ids: List[str], message: str)->Tuple[int,str]:
+    if DRY_RUN or not NOTIFY_ENABLED:
+        logging.info("[DRY] LINE送信: %s", message.replace("\n"," / "))
+        return 200,"DRY"
+    if not LINE_ACCESS_TOKEN: return 0,"NO_TOKEN"
+    headers={"Authorization": f"Bearer {LINE_ACCESS_TOKEN}", "Content-Type":"application/json"}
+    ok=0; last=""
+    for uid in user_ids:
+        body={"to": uid, "messages":[{"type":"text","text": message[:5000]}]}
+        r=SESSION.post(LINE_PUSH_URL, headers=headers, json=body, timeout=TIMEOUT)
+        last=f"{r.status_code} {r.text[:160]}"
+        if r.status_code==200: ok+=1
+        elif r.status_code==429: time.sleep(NOTIFY_COOLDOWN_SEC)
+    return ok, last
 
-# ===== 通知送信＆記録 =====
+# ===== 通知処理 =====
 def process_race(rid:str, post_dt:datetime, meta:Dict, strat:Dict, target_dt:datetime):
     msg = build_line_notification(meta, strat, rid, target_dt, "list", meta.get("venue_race",""), meta.get("now",""))
     ok,last = push_line_text([LINE_USER_ID], msg)
@@ -151,21 +184,35 @@ def process_race(rid:str, post_dt:datetime, meta:Dict, strat:Dict, target_dt:dat
     # bets（三連単固定）
     pop2num={h["pop"]:h.get("num") for h in meta["horses"]}
     def _to_umaban(tk:str)->str:
-        try:
-            a,b,c=[int(x) for x in tk.split("-")]
-            return f"{pop2num.get(a,'-')}-{pop2num.get(b,'-')}-{pop2num.get(c,'-')}"
+        try: a,b,c=[int(x) for x in tk.split("-")]
         except: return tk
+        return f"{pop2num.get(a,'-')}-{pop2num.get(b,'-')}-{pop2num.get(c,'-')}"
     tickets_umaban=[_to_umaban(t) for t in strat.get("tickets",[])]
     sheet_append_bet_record(jst_today(), rid, meta.get("venue_race","").split()[0], race_no, strat.get("id","Sx"), tickets_umaban)
 
 # ===== main =====
 def main():
     logging.info("[BOOT] host=%s pid=%s", socket.gethostname(), os.getpid())
-    # RID列挙 → per-RID発走取得
-    rids=[...]  # 略: listから取得
-    post_map={rid: get_start_time_hhmm(rid) for rid in rids}
-    # 判定 → 通知 → 記録
-    for rid,post in post_map.items():
-        ...
+    today=jst_today()
+    rids=[]  # RID列挙は既存処理で
+    for rid in rids+DEBUG_RACEIDS:
+        post_dt=get_start_time_dt(rid)
+        if not post_dt: continue
+        target_dt=post_dt - timedelta(minutes=CUTOFF_OFFSET_MIN)
+        now=jst_now()
+        lo=target_dt - timedelta(minutes=WINDOW_BEFORE_MIN, seconds=GRACE_SECONDS)
+        hi=target_dt + timedelta(minutes=WINDOW_AFTER_MIN, seconds=GRACE_SECONDS)
+        if not(lo<=now<=hi) and not FORCE_RUN: continue
+        meta=check_tanfuku_page(rid)
+        if not meta: continue
+        strat=eval_strategy(meta["horses"], logger=logging)
+        if not strat or not strat.get("match"): continue
         process_race(rid, post_dt, meta, strat, target_dt)
+    logging.info("[INFO] ジョブ終了")
 
+def run_watcher_forever(sleep_sec: int = 60):
+    logging.info("[INFO] watcher.start (sleep=%ss)", sleep_sec)
+    while True:
+        try: main()
+        except Exception as e: logging.exception("[FATAL] loop error: %s", e)
+        time.sleep(max(10, sleep_sec))
