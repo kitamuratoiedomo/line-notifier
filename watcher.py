@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Rakuten競馬 監視・通知バッチ（完全修正版 v2025-08-31C）
+Rakuten競馬 監視・通知バッチ（完全修正版 v2025-09-01A）
 - 発走時刻 = listページから抽出（detailは使わない）
 - 通知基準 = 発走時刻 - CUTOFF_OFFSET_MIN
 - 窓判定 = target ± (WINDOW_BEFORE/AFTER_MIN) ± GRACE_SECONDS
@@ -11,6 +11,7 @@ Rakuten競馬 監視・通知バッチ（完全修正版 v2025-08-31C）
 
 import os, re, json, time, random, logging, socket
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Any
 
 import requests
@@ -122,6 +123,9 @@ def sheet_append_bet_record(date_ymd:str, race_id:str, venue:str, race_no:str, s
     _sheet_put(svc, title, "A:J", rows)
 
 # ===== 発走時刻抽出（list専用） =====
+RACEID_RE   = re.compile(r"/RACEID/(\d{18})")
+PLACEHOLDER = re.compile(r"\d{8}0000000000$")
+
 def fetch(url:str) -> str:
     last=None
     for i in range(1, RETRY+1):
@@ -131,6 +135,32 @@ def fetch(url:str) -> str:
         except Exception as e:
             last=e; time.sleep(random.uniform(*SLEEP_BETWEEN))
     raise last
+
+def _extract_rids_from_html(html: str) -> list[str]:
+    rids=set()
+    soup=BeautifulSoup(html, "lxml")
+    for a in soup.find_all("a", href=True):
+        m=RACEID_RE.search(a["href"])
+        if m:
+            rid=m.group(1)
+            if not PLACEHOLDER.search(rid): rids.add(rid)
+    return sorted(rids)
+
+def list_raceids_today_and_next() -> list[str]:
+    today = jst_today()
+    y,m,d = int(today[:4]), int(today[4:6]), int(today[6:8])
+    t0 = datetime(y,m,d,tzinfo=JST)
+    next_ymd = (t0 + timedelta(days=1)).strftime("%Y%m%d")
+
+    rids=[]
+    for ymd in (today, next_ymd):
+        url = f"https://keiba.rakuten.co.jp/race_card/list/RACEID/{ymd}0000000000"
+        try:
+            html = fetch(url)
+            rids += _extract_rids_from_html(html)
+        except Exception as e:
+            logging.warning("[WARN] RID一覧取得失敗: %s (%s)", e, url)
+    return sorted(set(rids))
 
 def _extract_start_hhmm_from_html(html: str) -> Optional[str]:
     soup = BeautifulSoup(html, "html.parser")
@@ -193,21 +223,43 @@ def process_race(rid:str, post_dt:datetime, meta:Dict, strat:Dict, target_dt:dat
 # ===== main =====
 def main():
     logging.info("[BOOT] host=%s pid=%s", socket.gethostname(), os.getpid())
-    today=jst_today()
-    rids=[]  # RID列挙は既存処理で
-    for rid in rids+DEBUG_RACEIDS:
+    rids = list_raceids_today_and_next()
+
+    # candidates.json / ENV RIDS / DEBUG_RACEIDS も追加
+    extra=[]
+    try:
+        p=Path("/var/data/candidates.json")
+        if p.exists():
+            data=json.loads(p.read_text())
+            cand=[str(x.get("rid")).strip() for x in data if isinstance(x,dict) and x.get("rid")]
+            extra += [rid for rid in cand if rid]
+    except Exception as e:
+        logging.warning("[CAND] file read fail: %s", e)
+    env_rids=[s.strip() for s in (os.getenv("RIDS","") or "").split(",") if s.strip()]
+    if env_rids: extra+=env_rids
+    if DEBUG_RACEIDS: extra+=DEBUG_RACEIDS
+    if extra: rids=sorted(set(rids+extra))
+
+    if not rids:
+        logging.info("[INFO] RIDが0件のため終了")
+        return
+
+    for rid in rids:
         post_dt=get_start_time_dt(rid)
         if not post_dt: continue
         target_dt=post_dt - timedelta(minutes=CUTOFF_OFFSET_MIN)
         now=jst_now()
         lo=target_dt - timedelta(minutes=WINDOW_BEFORE_MIN, seconds=GRACE_SECONDS)
-        hi=target_dt + timedelta(minutes=WINDOW_AFTER_MIN, seconds=GRACE_SECONDS)
+        hi=target_dt + timedelta(minutes=WINDOW_AFTER_MIN,  seconds=GRACE_SECONDS)
         if not(lo<=now<=hi) and not FORCE_RUN: continue
+
         meta=check_tanfuku_page(rid)
         if not meta: continue
         strat=eval_strategy(meta["horses"], logger=logging)
         if not strat or not strat.get("match"): continue
+
         process_race(rid, post_dt, meta, strat, target_dt)
+
     logging.info("[INFO] ジョブ終了")
 
 def run_watcher_forever(sleep_sec: int = 60):
