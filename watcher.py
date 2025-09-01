@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Rakuten競馬 監視・通知バッチ（完全修正版 v2025-09-01D）
+Rakuten競馬 監視・通知バッチ（完全修正版 v2025-09-01F）
 - 発走時刻 = listページから抽出（detailは使わない）
-- 通知基準 = 発走時刻 - CUTOFF_OFFSET_MIN
+- 抽出できないRIDは開催一覧(YYYYMMDD0000000000)から RID近傍の「発走HH:MM」をフォールバック抽出
+- 通知基準 = 発走 - CUTOFF_OFFSET_MIN
 - 窓判定 = target ± (WINDOW_BEFORE/AFTER_MIN) ± GRACE_SECONDS
 - RID列挙 = 当日/翌日 + /var/data/candidates.json + ENV RIDS + DEBUG_RACEIDS
 - 通知: 窓内1回のみ（TTL管理: Google Sheets 'notified'）
@@ -78,13 +79,11 @@ def _sheet_service():
 def _resolve_sheet_title(svc, tab_or_gid: str) -> str:
     meta = svc.spreadsheets().get(spreadsheetId=GOOGLE_SHEET_ID).execute()
     sheets = meta.get("sheets", [])
-    # gid指定にも対応
     if tab_or_gid.isdigit() and len(tab_or_gid)>3:
         gid = int(tab_or_gid)
         for s in sheets:
             if s["properties"]["sheetId"] == gid:
                 return s["properties"]["title"]
-    # title で探す。無ければ作る
     for s in sheets:
         if s["properties"]["title"] == tab_or_gid:
             return tab_or_gid
@@ -205,7 +204,7 @@ def list_raceids_today_and_next() -> list[str]:
     logging.info("[RIDS] today+next=%d", len(rids))
     return rids
 
-# ===== 発走時刻抽出（list専用） =====
+# ===== 発走時刻抽出（list専用 + 開催一覧近傍フォールバック） =====
 def _extract_start_hhmm_from_html(html: str) -> Optional[str]:
     soup = BeautifulSoup(html, "html.parser")
     txt = soup.get_text(" ", strip=True)
@@ -215,16 +214,51 @@ def _extract_start_hhmm_from_html(html: str) -> Optional[str]:
     if m: return f"{int(m.group(1)):02d}:{int(m.group(2)):02d}"
     return None
 
+def _extract_start_hhmm_near_rid_from_daylist(html: str, rid: str) -> Optional[str]:
+    soup = BeautifulSoup(html, "lxml")
+    a = soup.find("a", href=re.compile(re.escape(rid)))
+    if not a: return None
+    for parent in [a, a.parent, getattr(a.parent, "parent", None), getattr(getattr(a.parent, "parent", None), "parent", None)]:
+        if not parent: continue
+        for t in parent.find_all("time"):
+            for attr in ("datetime","data-time","title","aria-label"):
+                v=t.get(attr)
+                if not v: continue
+                m = re.search(r'([0-2]?\d)\s*[:：]\s*([0-5]\d)', str(v))
+                if m: return f"{int(m.group(1)):02d}:{int(m.group(2)):02d}"
+            m = re.search(r'(?:発走|発走予定|発走時刻)\s*([0-2]?\d)\s*[:：]\s*([0-5]\d)', t.get_text(" ", strip=True))
+            if m: return f"{int(m.group(1)):02d}:{int(m.group(2)):02d}"
+        txt = parent.get_text(" ", strip=True)
+        m = re.search(r'(?:発走|発走予定|発走時刻)\s*([0-2]?\d)\s*[:：]\s*([0-5]\d)', txt)
+        if m: return f"{int(m.group(1)):02d}:{int(m.group(2)):02d}"
+        m = re.search(r'([0-2]?\d)\s*時\s*([0-5]\d)\s*分.*?(?:発走|発走予定|発走時刻)', txt)
+        if m: return f"{int(m.group(1)):02d}:{int(m.group(2)):02d}"
+    return None
+
 def get_start_time_dt(rid: str) -> Optional[datetime]:
-    url=f"https://keiba.rakuten.co.jp/race_card/list/RACEID/{rid}"
+    # A) 直接 list ページ
+    url_list = f"https://keiba.rakuten.co.jp/race_card/list/RACEID/{rid}"
     try:
-        html=fetch(url)
-        hhmm=_extract_start_hhmm_from_html(html)
+        html = fetch(url_list)
+        hhmm = _extract_start_hhmm_from_html(html)
         if hhmm:
             y,m,d = int(rid[:4]), int(rid[4:6]), int(rid[6:8])
-            return datetime(y,m,d,int(hhmm[:2]),int(hhmm[3:]),tzinfo=JST)
+            return datetime(y,m,d,int(hhmm[:2]),int(hhmm[3:]), tzinfo=JST)
     except Exception as e:
-        logging.warning("[WARN] 発走抽出失敗 rid=%s err=%s", rid, e)
+        logging.warning("[WARN] list抽出失敗 rid=%s err=%s", rid, e)
+
+    # B) 開催一覧（RID近傍の時刻）
+    ymd = rid[:8]
+    url_day = f"https://keiba.rakuten.co.jp/race_card/list/RACEID/{ymd}0000000000"
+    try:
+        day_html = fetch(url_day)
+        hhmm2 = _extract_start_hhmm_near_rid_from_daylist(day_html, rid)
+        if hhmm2:
+            y,m,d = int(ymd[:4]), int(ymd[4:6]), int(ymd[6:8])
+            return datetime(y,m,d,int(hhmm2[:2]),int(hhmm2[3:]), tzinfo=JST)
+    except Exception as e:
+        logging.warning("[WARN] daylist近傍抽出失敗 rid=%s err=%s", rid, e)
+
     return None
 
 # ===== オッズ（単勝）解析 =====
@@ -238,7 +272,6 @@ def _as_int(text:str)->Optional[int]:
     m=re.search(r"\d+", text); return int(m.group(0)) if m else None
 
 def _find_popular_odds_table(soup:BeautifulSoup):
-    # ヘッダに「人気」「単勝」「馬番」が揃うtableを探す
     for table in soup.find_all("table"):
         thead=table.find("thead"); 
         if not thead: continue
@@ -277,7 +310,6 @@ def parse_odds_table(soup:BeautifulSoup)->Tuple[List[Dict[str,float]], Optional[
             num=_as_int(tds[num_idx].get_text(" ", strip=True))
             if num is not None: rec["num"]=num
         horses.append(rec)
-    # 人気重複の解消
     uniq={}; 
     for h in sorted(horses, key=lambda x:x["pop"]): uniq[h["pop"]]=h
     horses=[uniq[k] for k in sorted(uniq.keys())]
@@ -291,7 +323,7 @@ def check_tanfuku_page(race_id: str)->Optional[Dict[str, Any]]:
     if not horses: return None
     if not venue_race: venue_race="地方競馬"
     return {"race_id":race_id,"url":url,"horses":horses,"venue_race":venue_race,"now":now_label or ""}
-    
+
 # ===== LINE送信 =====
 def push_line_text(user_ids: List[str], message: str)->Tuple[int,str]:
     if DRY_RUN or not NOTIFY_ENABLED:
@@ -308,7 +340,7 @@ def push_line_text(user_ids: List[str], message: str)->Tuple[int,str]:
         elif r.status_code==429: time.sleep(NOTIFY_COOLDOWN_SEC)
     return ok, last
 
-# ===== 通知本文（必要に応じてカスタム可） =====
+# ===== 通知本文 =====
 def build_line_notification(meta:Dict, strat:Dict, rid:str, target_dt:datetime, via:str, venue_race:str, now_label:str)->str:
     horses=meta.get("horses", [])
     url=meta.get("url","")
@@ -365,16 +397,16 @@ def process_race(rid:str, post_dt:datetime, meta:Dict, strat:Dict, target_dt:dat
 def main():
     logging.info("[BOOT] host=%s pid=%s", socket.gethostname(), os.getpid())
 
-    # 1) 範囲外はスキップ
+    # 時間帯外スキップ
     hour = jst_now().hour
     if not (START_HOUR <= hour <= END_HOUR) and not FORCE_RUN:
         logging.info("[INFO] 運用時間外: %02d-%02d", START_HOUR, END_HOUR)
         return
 
-    # 2) RID列挙
+    # RID列挙
     rids = list_raceids_today_and_next()
 
-    # candidates.json / ENV RIDS / DEBUG_RACEIDS をマージ
+    # candidates.json / ENV RIDS / DEBUG_RACEIDS もマージ
     extra=[]
     try:
         p=Path("/var/data/candidates.json")
@@ -397,15 +429,14 @@ def main():
     if not rids:
         logging.info("[INFO] RIDが0件のため終了"); return
 
-    # 3) TTL読み込み
+    # TTL読み込み
     notified = sheet_load_notified()
 
-    # 4) 各RID処理
+    # 各RID処理
     for rid in rids:
-        # 発走（list専用）→ target = 発走 - オフセット
         post_dt = get_start_time_dt(rid)
         if not post_dt:
-            logging.info("[SKIP] 発走時刻不明 rid=%s", rid); 
+            logging.info("[SKIP] 発走時刻不明 rid=%s", rid)
             continue
 
         target_dt = post_dt - timedelta(minutes=CUTOFF_OFFSET_MIN)
@@ -419,20 +450,17 @@ def main():
         if not ok:
             continue
 
-        # TTL（再送抑止）
-        ttl_key=f"{rid}:{target_dt.strftime('%H%M')}:*"
+        # TTL（同じtarget分で既送はスキップ）
         recent = [k for k in notified if k.startswith(f"{rid}:{target_dt.strftime('%H%M')}")]
         if recent and not FORCE_RUN:
-            logging.info("[DEDUP] TTL内スキップ: %s", recent[0]); 
+            logging.info("[DEDUP] TTL内スキップ: %s", recent[0])
             continue
 
-        # 単勝オッズ（人気・馬番）
         meta = check_tanfuku_page(rid)
         if not meta:
             logging.info("[SKIP] tanfukuパース失敗 rid=%s", rid)
             continue
 
-        # 戦略判定
         try:
             strat = eval_strategy(meta["horses"], logger=logging)
         except Exception as e:
@@ -441,7 +469,7 @@ def main():
         if not strat or not strat.get("match"):
             continue
 
-        # 通知＆記録
         process_race(rid, post_dt, meta, strat, target_dt)
 
     logging.info("[INFO] ジョブ終了")
+
