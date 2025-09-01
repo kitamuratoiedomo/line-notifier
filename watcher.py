@@ -1,26 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-Rakuten競馬 監視・通知バッチ（完全修正版 v2025-09-01F）
-- 発走時刻 = listページから抽出（detailは使わない）
-- 抽出できないRIDは開催一覧(YYYYMMDD0000000000)から RID近傍の「発走HH:MM」をフォールバック抽出
-- 通知基準 = 発走 - CUTOFF_OFFSET_MIN
-- 窓判定 = target ± (WINDOW_BEFORE/AFTER_MIN) ± GRACE_SECONDS
-- RID列挙 = 当日/翌日 + /var/data/candidates.json + ENV RIDS + DEBUG_RACEIDS
-- 通知: 窓内1回のみ（TTL管理: Google Sheets 'notified'）
-- 記録: notify_log と bets（betsは常に「三連単」）
+Rakuten競馬 監視・通知バッチ（発走-オフセット固定＋オッズ表フォールバック v2025-09-01）
+- 発走時刻 = race_card/list or detail ページから抽出
+- 通知基準 = 発走時刻 - CUTOFF_OFFSET_MIN
+- 窓判定 = ±(WINDOW_BEFORE/AFTER_MIN) と GRACE_SECONDS
+- 通知: 窓内1回のみ（TTL管理）/ Google Sheets 永続化 / 日次サマリ
+- オッズ取得: tanfuku → 失敗時 win にフォールバック
 """
 
 import os, re, json, time, random, logging, socket
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from typing import List, Dict, Optional, Tuple, Any
+from typing import List, Dict, Optional, Tuple, Set, Any
 
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
-
-from strategy_rules import eval_strategy  # horses -> {match,id,label,tickets,...}
+from strategy_rules import eval_strategy
 
 # ===== JSTユーティリティ =====
 JST = timezone(timedelta(hours=9))
@@ -48,8 +44,8 @@ NOTIFY_TTL_SEC      = int(os.getenv("NOTIFY_TTL_SEC", "3600"))
 NOTIFY_COOLDOWN_SEC = int(os.getenv("NOTIFY_COOLDOWN_SEC", "1800"))
 
 CUTOFF_OFFSET_MIN   = int(os.getenv("CUTOFF_OFFSET_MIN", "12"))
-WINDOW_BEFORE_MIN   = int(os.getenv("WINDOW_BEFORE_MIN", "3"))
-WINDOW_AFTER_MIN    = int(os.getenv("WINDOW_AFTER_MIN", "2"))
+WINDOW_BEFORE_MIN   = int(os.getenv("WINDOW_BEFORE_MIN", "1"))
+WINDOW_AFTER_MIN    = int(os.getenv("WINDOW_AFTER_MIN", "1"))
 GRACE_SECONDS       = int(os.getenv("GRACE_SECONDS", "0"))
 
 LINE_ACCESS_TOKEN = os.getenv("LINE_ACCESS_TOKEN", "")
@@ -58,9 +54,10 @@ LINE_USER_IDS     = [s.strip() for s in os.getenv("LINE_USER_IDS","").split(",")
 
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "")
 GOOGLE_SHEET_ID   = os.getenv("GOOGLE_SHEET_ID", "")
-SHEET_NOTIFY_LOG_TAB  = os.getenv("SHEET_NOTIFY_LOG_TAB", "notify_log")
+GOOGLE_SHEET_TAB  = os.getenv("GOOGLE_SHEET_TAB", "notified")
+USERS_SHEET_NAME  = os.getenv("USERS_SHEET_NAME", "1")
+USERS_USERID_COL  = os.getenv("USERS_USERID_COL", "H")
 BETS_SHEET_TAB    = os.getenv("BETS_SHEET_TAB", "bets")
-GOOGLE_SHEET_TAB  = os.getenv("GOOGLE_SHEET_TAB", "notified")  # TTL保存先（タブ名 or gid）
 
 DAILY_SUMMARY_HHMM = os.getenv("DAILY_SUMMARY_HHMM", "21:02")
 ALWAYS_NOTIFY_DAILY_SUMMARY = os.getenv("ALWAYS_NOTIFY_DAILY_SUMMARY", "1") == "1"
@@ -70,8 +67,24 @@ DEBUG_RACEIDS  = [s.strip() for s in os.getenv("DEBUG_RACEIDS","").split(",") if
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
+# ===== fetchユーティリティ =====
+def fetch(url: str) -> str:
+    for i in range(RETRY):
+        try:
+            r = SESSION.get(url, timeout=TIMEOUT)
+            if r.status_code == 200:
+                return r.text
+            else:
+                logging.warning("[WARN] fetch %s code=%s", url, r.status_code)
+        except Exception as e:
+            logging.warning("[WARN] fetch %s err=%s", url, e)
+        time.sleep(random.uniform(*SLEEP_BETWEEN))
+    raise RuntimeError(f"fetch失敗: {url}")
+
 # ===== Google Sheets 基本 =====
 def _sheet_service():
+    if not GOOGLE_CREDENTIALS_JSON or not GOOGLE_SHEET_ID:
+        raise RuntimeError("Google Sheets 環境変数不足")
     info  = json.loads(GOOGLE_CREDENTIALS_JSON)
     creds = Credentials.from_service_account_info(info, scopes=["https://www.googleapis.com/auth/spreadsheets"])
     return build("sheets","v4",credentials=creds, cache_discovery=False)
@@ -92,9 +105,12 @@ def _resolve_sheet_title(svc, tab_or_gid: str) -> str:
         body={"requests":[{"addSheet":{"properties":{"title": tab_or_gid}}}]}
     ).execute()
     return tab_or_gid
-
+    
+# ===== Sheets: 共通ヘルパ =====
 def _sheet_get(svc, title: str, a1: str) -> List[List[str]]:
-    res = svc.spreadsheets().values().get(spreadsheetId=GOOGLE_SHEET_ID, range=f"'{title}'!{a1}").execute()
+    res = svc.spreadsheets().values().get(
+        spreadsheetId=GOOGLE_SHEET_ID, range=f"'{title}'!{a1}"
+    ).execute()
     return res.get("values", [])
 
 def _sheet_put(svc, title: str, a1: str, values: List[List[str]]):
@@ -147,7 +163,7 @@ def sheet_append_notify_log(date_ymd:str, ts:float, race_id:str, venue:str, race
                  target, win_from, win_to, str(send_ok), (send_last or "")[:160], url or ""])
     _sheet_put(svc, title, "A:L", rows)
 
-# ===== bets 追記（常に三連単） =====
+# ===== bets 追記（常に三連単で記録） =====
 def _bets_header():
     return ["date","race_id","venue","race_no","strategy_id","bet_kind","tickets_umaban_csv","points","unit_stake","total_stake"]
 
@@ -159,17 +175,6 @@ def sheet_append_bet_record(date_ymd:str, race_id:str, venue:str, race_no:str, s
     rows.append([date_ymd, race_id, venue, race_no, strategy_id, "三連単",
                  ",".join(tickets_umaban), str(points), str(unit), str(total)])
     _sheet_put(svc, title, "A:J", rows)
-
-# ===== HTTP fetch =====
-def fetch(url:str) -> str:
-    last=None
-    for _ in range(RETRY):
-        try:
-            r=SESSION.get(url, timeout=TIMEOUT); r.raise_for_status()
-            r.encoding="utf-8"; return r.text
-        except Exception as e:
-            last=e; time.sleep(random.uniform(*SLEEP_BETWEEN))
-    raise last
 
 # ===== RID列挙（当日/翌日） =====
 RACEID_RE   = re.compile(r"/RACEID/(\d{18})")
@@ -218,8 +223,13 @@ def _extract_start_hhmm_near_rid_from_daylist(html: str, rid: str) -> Optional[s
     soup = BeautifulSoup(html, "lxml")
     a = soup.find("a", href=re.compile(re.escape(rid)))
     if not a: return None
-    for parent in [a, a.parent, getattr(a.parent, "parent", None), getattr(getattr(a.parent, "parent", None), "parent", None)]:
-        if not parent: continue
+    # 近傍（親3段まで）を走査
+    parents = [a]
+    if a.parent: parents.append(a.parent)
+    if a.parent and a.parent.parent: parents.append(a.parent.parent)
+    if a.parent and a.parent.parent and a.parent.parent.parent: parents.append(a.parent.parent.parent)
+    for parent in parents:
+        # timeタグ属性
         for t in parent.find_all("time"):
             for attr in ("datetime","data-time","title","aria-label"):
                 v=t.get(attr)
@@ -228,6 +238,7 @@ def _extract_start_hhmm_near_rid_from_daylist(html: str, rid: str) -> Optional[s
                 if m: return f"{int(m.group(1)):02d}:{int(m.group(2)):02d}"
             m = re.search(r'(?:発走|発走予定|発走時刻)\s*([0-2]?\d)\s*[:：]\s*([0-5]\d)', t.get_text(" ", strip=True))
             if m: return f"{int(m.group(1)):02d}:{int(m.group(2)):02d}"
+        # テキスト
         txt = parent.get_text(" ", strip=True)
         m = re.search(r'(?:発走|発走予定|発走時刻)\s*([0-2]?\d)\s*[:：]\s*([0-5]\d)', txt)
         if m: return f"{int(m.group(1)):02d}:{int(m.group(2)):02d}"
@@ -260,69 +271,130 @@ def get_start_time_dt(rid: str) -> Optional[datetime]:
         logging.warning("[WARN] daylist近傍抽出失敗 rid=%s err=%s", rid, e)
 
     return None
-
-# ===== オッズ（単勝）解析 =====
+    
+# ===== オッズ（単勝）抽出：自動推論パーサ =====
 def _as_float(text:str)->Optional[float]:
     if not text: return None
-    t=text.replace(",","").strip()
-    if "%" in t or "-" in t or "～" in t or "~" in t: return None
-    m=re.search(r"\d+(?:\.\d+)?", t); return float(m.group(0)) if m else None
-def _as_int(text:str)->Optional[int]:
-    if not text: return None
-    m=re.search(r"\d+", text); return int(m.group(0)) if m else None
+    t=text.replace(","," ").strip()
+    m=re.search(r"\d+(?:\.\d+)?", t)
+    return float(m.group(0)) if m else None
 
 def _find_popular_odds_table(soup:BeautifulSoup):
+    """ヘッダ名に依存せず、行パターンから(人気, 単勝, 馬番)列を自動推論。"""
     for table in soup.find_all("table"):
-        thead=table.find("thead"); 
-        if not thead: continue
-        headers=["".join(th.stripped_strings) for th in thead.find_all(["th","td"])]
-        if not headers: continue
-        pop_idx=win_idx=num_idx=None
-        for i,h in enumerate(headers):
-            if "人気" in h and "順" not in h: pop_idx=i; break
-        for i,h in enumerate(headers):
-            if "単勝"==h or "単勝" in h or "オッズ" in h: win_idx=i; break
-        for i,h in enumerate(headers):
-            if "馬番" in h or (("馬" in h) and ("馬名" not in h)): num_idx=i; break
-        if pop_idx is None or win_idx is None: continue
-        return table, {"pop":pop_idx,"win":win_idx,"num":num_idx if num_idx is not None else -1}
+        rows = table.find_all("tr")
+        if len(rows) < 2: 
+            continue
+        body = table.find("tbody") or table
+        cand_rows = [tr for tr in body.find_all("tr") if tr.find_all(["td","th"])]
+        cand_rows = cand_rows[:8]
+        if len(cand_rows) < 2: 
+            continue
+        max_cols = max(len(r.find_all(["td","th"])) for r in cand_rows)
+        numeric_hits = [0]*max_cols
+        float_hits   = [0]*max_cols
+        for r in cand_rows:
+            tds=r.find_all(["td","th"])
+            for ci in range(max_cols):
+                if ci>=len(tds): continue
+                txt = tds[ci].get_text(" ", strip=True)
+                if txt.isdigit(): numeric_hits[ci]+=1
+                if re.search(r"\d+\.\d+", txt.replace(",","")): float_hits[ci]+=1
+
+        # 人気列：数字が連番的に増える列を優先
+        pop_idx=None; best_seq=-1
+        for ci in range(max_cols):
+            last=0; ok=0
+            for r in cand_rows:
+                tds=r.find_all(["td","th"])
+                if ci>=len(tds): continue
+                txt=tds[ci].get_text(" ", strip=True)
+                if txt.isdigit():
+                    v=int(txt)
+                    if v>last: ok+=1; last=v
+            if ok>best_seq: best_seq=ok; pop_idx=ci
+
+        # 単勝列：小数点が多い列を優先
+        win_idx=None
+        if any(float_hits):
+            win_idx=max(range(max_cols), key=lambda i: float_hits[i])
+        else:
+            # 数値が多い列から人気列以外を
+            order=sorted(range(max_cols), key=lambda i: numeric_hits[i], reverse=True)
+            for ci in order:
+                if ci!=pop_idx: win_idx=ci; break
+
+        # 馬番列：数値の多い列から人気/単勝以外
+        num_idx=None
+        order=sorted(range(max_cols), key=lambda i: numeric_hits[i], reverse=True)
+        for ci in order:
+            if ci!=pop_idx and ci!=win_idx:
+                num_idx=ci; break
+
+        if pop_idx is None or win_idx is None: 
+            continue
+        return table, {"pop":pop_idx, "win":win_idx, "num":num_idx if num_idx is not None else -1}
     return None, {}
 
 def parse_odds_table(soup:BeautifulSoup)->Tuple[List[Dict[str,float]], Optional[str], Optional[str]]:
     venue_race=(soup.find("h1").get_text(strip=True) if soup.find("h1") else None)
     nowtime=soup.select_one(".withUpdate .nowTime") or soup.select_one(".nowTime")
     now_label=nowtime.get_text(strip=True) if nowtime else None
+
     table, idx=_find_popular_odds_table(soup)
     if not table: return [], venue_race, now_label
+
     pop_idx=idx["pop"]; win_idx=idx["win"]; num_idx=idx.get("num",-1)
     horses=[]; body=table.find("tbody") or table
     for tr in body.find_all("tr"):
         tds=tr.find_all(["td","th"])
         if len(tds)<=max(pop_idx,win_idx): continue
-        pop_txt=tds[pop_idx].get_text(strip=True)
+        pop_txt=tds[pop_idx].get_text(" ", strip=True)
+        win_txt=tds[win_idx].get_text(" ", strip=True)
         if not pop_txt.isdigit(): continue
-        pop=int(pop_txt); 
-        if not (1<=pop<=30): continue
-        odds=_as_float(tds[win_idx].get_text(" ", strip=True))
-        if odds is None: continue
+        pop=int(pop_txt)
+        odds=_as_float(win_txt)
+        if odds is None: 
+            continue
         rec={"pop":pop, "odds":float(odds)}
         if 0<=num_idx<len(tds):
-            num=_as_int(tds[num_idx].get_text(" ", strip=True))
-            if num is not None: rec["num"]=num
+            num_txt=tds[num_idx].get_text(" ", strip=True)
+            m=re.search(r"\d+", num_txt)
+            if m: rec["num"]=int(m.group(0))
         horses.append(rec)
-    uniq={}; 
+    # 人気重複解消
+    uniq={}
     for h in sorted(horses, key=lambda x:x["pop"]): uniq[h["pop"]]=h
     horses=[uniq[k] for k in sorted(uniq.keys())]
     return horses, venue_race, now_label
 
 def check_tanfuku_page(race_id: str)->Optional[Dict[str, Any]]:
-    url=f"https://keiba.rakuten.co.jp/odds/tanfuku/RACEID/{race_id}"
-    html=fetch(url)
-    soup=BeautifulSoup(html,"lxml")
-    horses, venue_race, now_label = parse_odds_table(soup)
-    if not horses: return None
-    if not venue_race: venue_race="地方競馬"
-    return {"race_id":race_id,"url":url,"horses":horses,"venue_race":venue_race,"now":now_label or ""}
+    """tanfuku → 失敗なら win にフォールバックして horses を構築"""
+    # A) tanfuku
+    url1=f"https://keiba.rakuten.co.jp/odds/tanfuku/RACEID/{race_id}"
+    try:
+        html=fetch(url1)
+        soup=BeautifulSoup(html,"lxml")
+        horses, venue_race, now_label = parse_odds_table(soup)
+        if horses:
+            if not venue_race: venue_race="地方競馬"
+            return {"race_id":race_id,"url":url1,"horses":horses,"venue_race":venue_race,"now":now_label or ""}
+    except Exception as e:
+        logging.warning("[ODDS] tanfuku失敗 rid=%s err=%s", race_id, e)
+
+    # B) win（単勝のみの表でもparse可能）
+    url2=f"https://keiba.rakuten.co.jp/odds/win/RACEID/{race_id}"
+    try:
+        html=fetch(url2)
+        soup=BeautifulSoup(html,"lxml")
+        horses, venue_race, now_label = parse_odds_table(soup)
+        if horses:
+            if not venue_race: venue_race="地方競馬"
+            return {"race_id":race_id,"url":url2,"horses":horses,"venue_race":venue_race,"now":now_label or ""}
+    except Exception as e:
+        logging.warning("[ODDS] win失敗 rid=%s err=%s", race_id, e)
+
+    return None
 
 # ===== LINE送信 =====
 def push_line_text(user_ids: List[str], message: str)->Tuple[int,str]:
@@ -332,7 +404,8 @@ def push_line_text(user_ids: List[str], message: str)->Tuple[int,str]:
     if not LINE_ACCESS_TOKEN: return 0,"NO_TOKEN"
     headers={"Authorization": f"Bearer {LINE_ACCESS_TOKEN}", "Content-Type":"application/json"}
     ok=0; last=""
-    for uid in (user_ids or [LINE_USER_ID]):
+    targets = user_ids or [LINE_USER_ID]
+    for uid in targets:
         body={"to": uid, "messages":[{"type":"text","text": message[:5000]}]}
         r=SESSION.post(LINE_PUSH_URL, headers=headers, json=body, timeout=TIMEOUT)
         last=f"{r.status_code} {r.text[:160]}"
@@ -397,18 +470,17 @@ def process_race(rid:str, post_dt:datetime, meta:Dict, strat:Dict, target_dt:dat
 def main():
     logging.info("[BOOT] host=%s pid=%s", socket.gethostname(), os.getpid())
 
-    # 時間帯外スキップ
     hour = jst_now().hour
     if not (START_HOUR <= hour <= END_HOUR) and not FORCE_RUN:
         logging.info("[INFO] 運用時間外: %02d-%02d", START_HOUR, END_HOUR)
         return
 
-    # RID列挙
     rids = list_raceids_today_and_next()
 
     # candidates.json / ENV RIDS / DEBUG_RACEIDS もマージ
     extra=[]
     try:
+        from pathlib import Path
         p=Path("/var/data/candidates.json")
         if p.exists():
             data=json.loads(p.read_text())
@@ -417,22 +489,16 @@ def main():
             logging.info("[CAND] file=%d", len(cand))
     except Exception as e:
         logging.warning("[CAND] file read fail: %s", e)
-
     env_rids=[s.strip() for s in (os.getenv("RIDS","") or "").split(",") if s.strip()]
     if env_rids: extra+=env_rids; logging.info("[CAND] env=%d", len(env_rids))
     if DEBUG_RACEIDS: extra+=DEBUG_RACEIDS; logging.info("[CAND] debug=%d", len(DEBUG_RACEIDS))
-
     if extra:
-        rids = sorted(set(rids + extra))
-        logging.info("[RIDS] merged=%d", len(rids))
-
+        rids = sorted(set(rids + extra)); logging.info("[RIDS] merged=%d", len(rids))
     if not rids:
         logging.info("[INFO] RIDが0件のため終了"); return
 
-    # TTL読み込み
     notified = sheet_load_notified()
 
-    # 各RID処理
     for rid in rids:
         post_dt = get_start_time_dt(rid)
         if not post_dt:
@@ -450,7 +516,7 @@ def main():
         if not ok:
             continue
 
-        # TTL（同じtarget分で既送はスキップ）
+        # TTL（同じターゲット分に既送があればスキップ）
         recent = [k for k in notified if k.startswith(f"{rid}:{target_dt.strftime('%H%M')}")]
         if recent and not FORCE_RUN:
             logging.info("[DEDUP] TTL内スキップ: %s", recent[0])
@@ -458,13 +524,13 @@ def main():
 
         meta = check_tanfuku_page(rid)
         if not meta:
-            logging.info("[SKIP] tanfukuパース失敗 rid=%s", rid)
+            logging.info("[SKIP] tanfuku/win パース失敗 rid=%s", rid)
             continue
 
         try:
             strat = eval_strategy(meta["horses"], logger=logging)
         except Exception as e:
-            logging.warning("[WARN] eval_strategy 例外: %s", e)
+            logging.warning("[WARN] eval_strategy 例外 rid=%s: %s", rid, e)
             continue
         if not strat or not strat.get("match"):
             continue
@@ -472,4 +538,3 @@ def main():
         process_race(rid, post_dt, meta, strat, target_dt)
 
     logging.info("[INFO] ジョブ終了")
-
