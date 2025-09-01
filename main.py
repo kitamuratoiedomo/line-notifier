@@ -23,7 +23,7 @@ def show_boot_info():
 def main():
     show_boot_info()
     try:
-        # ランタイムは1回実行想定（Cron）
+        # Cron想定：1回実行
         from watcher import main as run_once
     except Exception:
         log("FATAL", "watcher の import に失敗しました。以下スタックトレース：")
@@ -36,7 +36,7 @@ def main():
     except SystemExit as e:
         log("ERROR", f"SystemExit: code={e.code}"); raise
     except Exception:
-        log("ERROR", f"WATCHER EXCEPTION")
+        log("ERROR", "WATCHER EXCEPTION")
         traceback.print_exc()
         sys.exit(1)
 
