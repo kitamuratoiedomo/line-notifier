@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-Rakuten競馬 監視・通知バッチ（完全版 v2025-09-02B）
-- 発走時刻 = listページを基準、取れなければ開催一覧(YYYYMMDD0000000000)でRID近傍を探索
+Rakuten競馬 監視・通知バッチ（近いレース優先処理版 v2025-09-04B）
+- 発走時刻 = listページ基準、取れなければ開催一覧でRID近傍から抽出
 - 通知基準 = 発走 - CUTOFF_OFFSET_MIN
 - 窓判定   = target ± (WINDOW_BEFORE/AFTER_MIN) ± GRACE_SECONDS
 - RID列挙  = 当日/翌日 + /var/data/candidates.json + ENV RIDS + DEBUG_RACEIDS
 - 通知     = 窓内1回のみ（TTL: Google Sheets 'notified'）
 - 記録     = notify_log と bets（betsは常に「三連単」）
-- オッズ   = tanfuku → 失敗なら win にフォールバック、ヘッダ無し表にも対応
+- オッズ   = tanfuku → 失敗なら win でフォールバック、ヘッダ無し表にも対応
+- ★ 近いレース（|target-now| が小さい順）を **優先処理**（取りこぼし低減）
 """
 
 import os, re, json, time, random, logging, socket
@@ -177,7 +178,7 @@ def sheet_append_bet_record(date_ymd:str, race_id:str, venue:str, race_no:str,
     rows.append([date_ymd, race_id, venue, race_no, strategy_id, "三連単",
                  ",".join(tickets_umaban), str(points), str(unit), str(total)])
     _sheet_put(svc, title, "A:J", rows)
-
+    
 # ===== RID列挙（当日/翌日） =====
 RACEID_RE   = re.compile(r"/RACEID/(\d{18})")
 PLACEHOLDER = re.compile(r"\d{8}0000000000$")
@@ -218,7 +219,6 @@ def _extract_start_hhmm_from_html(html: str) -> Optional[str]:
     if m: return f"{int(m.group(1)):02d}:{int(m.group(2)):02d}"
     m = re.search(r'([0-2]?\d)\s*時\s*([0-5]\d)\s*分.*?(?:発走|発走予定|発走時刻)', txt)
     if m: return f"{int(m.group(1)):02d}:{int(m.group(2)):02d}"
-    # ラベル無しだが時刻だけ載っている場合も最後に許容
     m = re.search(r'([0-2]?\d)\s*[:：]\s*([0-5]\d)', txt)
     if m: return f"{int(m.group(1)):02d}:{int(m.group(2)):02d}"
     return None
@@ -227,7 +227,6 @@ def _extract_start_hhmm_near_rid_from_daylist(html: str, rid: str) -> Optional[s
     soup = BeautifulSoup(html, "lxml")
     a = soup.find("a", href=re.compile(re.escape(rid)))
     if not a: return None
-    # 祖先（最大6段）＋兄弟近傍
     ancestors = []
     node = a
     for _ in range(6):
@@ -477,10 +476,9 @@ def process_race(rid:str, post_dt:datetime, meta:Dict, strat:Dict, target_dt:dat
     ttl_key=f"{rid}:{target_dt.strftime('%H%M')}:{strat.get('id','Sx')}"
     sheet_upsert_notified(ttl_key, time.time(), f"{meta.get('venue_race','')} {target_dt.strftime('%H:%M')}")
 
-# ===== main =====
+# ===== main（★近いレース優先） =====
 def main():
     logging.info("[BOOT] host=%s pid=%s", socket.gethostname(), os.getpid())
-    # 運用時間外スキップ
     hour = jst_now().hour
     if not (START_HOUR <= hour <= END_HOUR) and not FORCE_RUN:
         logging.info("[INFO] 運用時間外: %02d-%02d", START_HOUR, END_HOUR)
@@ -504,20 +502,27 @@ def main():
     if env_rids: extra+=env_rids; logging.info("[CAND] env=%d", len(env_rids))
     if DEBUG_RACEIDS: extra+=DEBUG_RACEIDS; logging.info("[CAND] debug=%d", len(DEBUG_RACEIDS))
     if extra:
-        rids = sorted(set(rids + extra)); logging.info("[RIDS] merged=%d", len(rids))
+        rids = sorted(set(rids + extra))
     if not rids:
         logging.info("[INFO] RIDが0件のため終了"); return
 
     notified = sheet_load_notified()
 
-    # 各RID処理
+    # ★ target までの距離（秒）の昇順で優先度付け
+    items = []
+    now = jst_now()
     for rid in rids:
         post_dt = get_start_time_dt(rid)
         if not post_dt:
-            logging.info("[SKIP] 発走時刻不明 rid=%s", rid); 
             continue
-
         target_dt = post_dt - timedelta(minutes=CUTOFF_OFFSET_MIN)
+        delta = abs((target_dt - now).total_seconds())
+        items.append((delta, rid, post_dt, target_dt))
+    # 近いレースから処理（取りこぼし軽減）
+    items.sort(key=lambda x: x[0])
+    logging.info("[PRIO] queue=%d (closest Δ=%.1fs)", len(items), items[0][0] if items else -1)
+
+    for _, rid, post_dt, target_dt in items:
         now = jst_now()
         lo  = target_dt - timedelta(minutes=WINDOW_BEFORE_MIN, seconds=GRACE_SECONDS)
         hi  = target_dt + timedelta(minutes=WINDOW_AFTER_MIN,  seconds=GRACE_SECONDS)
